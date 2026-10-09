@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+/// M4 lockfile flow (resolve-from-lock, update, vendor, dev, git cache).
+mod lockflow;
+
 // ---------------------------------------------------------------------------
 // CLI definition
 // ---------------------------------------------------------------------------
@@ -118,6 +121,15 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
+        /// Do not use network (cache/vendor only).
+        #[arg(long)]
+        offline: bool,
+        /// Error if the lockfile would change.
+        #[arg(long)]
+        locked: bool,
+        /// No network + error if the lockfile would change.
+        #[arg(long)]
+        frozen: bool,
         /// Arguments passed to the binary (after `--`).
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<OsString>,
@@ -153,6 +165,15 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
+        /// Do not use network (cache/vendor only).
+        #[arg(long)]
+        offline: bool,
+        /// Error if the lockfile would change.
+        #[arg(long)]
+        locked: bool,
+        /// No network + error if the lockfile would change.
+        #[arg(long)]
+        frozen: bool,
     },
     /// Syntax-check without producing binaries (M3).
     Check {},
@@ -168,9 +189,15 @@ pub enum Commands {
     },
     /// Re-resolve dependencies (M4).
     Update {
-        /// Only update this package.
+        /// Only update this package (others keep their locked entries).
         #[arg(short = 'p', long, value_name = "PKG")]
         package: Option<String>,
+        /// Pin the selected package to an exact commit SHA (requires `-p`).
+        #[arg(long, value_name = "SHA")]
+        precise: Option<String>,
+        /// No network (mirrors only).
+        #[arg(long)]
+        offline: bool,
     },
     /// Print the dependency tree (M4).
     Tree,
@@ -178,8 +205,12 @@ pub enum Commands {
     Fmt,
     /// Build documentation (stretch).
     Doc,
-    /// Copy all deps into `vendor/` for offline builds (M7).
-    Vendor,
+    /// Copy all deps into `vendor/` for offline builds (M4).
+    Vendor {
+        /// Show what would be vendored without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Publish the package to the registry (M5).
     Publish,
     /// Log in to the registry (M5).
@@ -208,6 +239,15 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
+        /// Do not use network (cache/vendor only).
+        #[arg(long)]
+        offline: bool,
+        /// Error if the lockfile would change.
+        #[arg(long)]
+        locked: bool,
+        /// No network + error if the lockfile would change.
+        #[arg(long)]
+        frozen: bool,
     },
     /// Git dependency management (M4).
     Git {
@@ -221,13 +261,17 @@ pub enum Commands {
     },
 }
 
-/// `rivet git` subcommands (all M4).
+/// `rivet git` subcommands (M4).
 #[derive(Debug, Subcommand)]
 pub enum GitCommands {
     /// Show cached remotes, checkouts, sizes, and users.
     List,
     /// Delete checkouts/mirrors unreferenced by known lockfiles.
-    Prune,
+    Prune {
+        /// Show what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Prefetch everything in the lockfile (CI warm-up).
     Fetch,
 }
@@ -298,6 +342,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             features,
             all_features,
             no_default_features,
+            offline,
+            locked,
+            frozen,
             args,
         }) => cmd_run(
             &ui,
@@ -311,6 +358,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 args: args.clone(),
                 verbose: cli.verbose,
                 json: ui.json,
+                offline: *offline,
+                locked: *locked,
+                frozen: *frozen,
             },
         ),
         Some(Commands::Test {
@@ -321,6 +371,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             features,
             all_features,
             no_default_features,
+            offline,
+            locked,
+            frozen,
         }) => cmd_test(
             &ui,
             TestFlags {
@@ -331,6 +384,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 features: feature_flags(features, *all_features, *no_default_features),
                 verbose: cli.verbose,
                 json: ui.json,
+                offline: *offline,
+                locked: *locked,
+                frozen: *frozen,
             },
         ),
         Some(Commands::CompileCommands {
@@ -339,6 +395,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             features,
             all_features,
             no_default_features,
+            offline,
+            locked,
+            frozen,
         }) => cmd_compile_commands(
             &ui,
             CompileCommandsFlags {
@@ -346,8 +405,42 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 package: package.clone(),
                 features: feature_flags(features, *all_features, *no_default_features),
                 verbose: cli.verbose,
+                offline: *offline,
+                locked: *locked,
+                frozen: *frozen,
             },
         ),
+        Some(Commands::Update {
+            package,
+            precise,
+            offline,
+        }) => cmd_update(
+            &ui,
+            lockflow::UpdateOpts {
+                package: package.clone(),
+                precise: precise.clone(),
+                offline: *offline,
+            },
+            cli.verbose,
+        ),
+        Some(Commands::Git { command }) => cmd_git(&ui, command, cli.verbose),
+        Some(Commands::Vendor { dry_run }) => {
+            let root = load_scope()?;
+            lockflow::vendor_flow(&ui, &root, *dry_run, cli.verbose)
+        }
+        Some(Commands::Dev { name }) => {
+            let root = load_scope()?;
+            lockflow::dev_flow(&ui, &root, name, cli.verbose)
+        }
+        Some(Commands::Publish) => {
+            let root = load_scope()?;
+            for (pkg, key) in lockflow::active_patches(&root)? {
+                ui.warn(&format!(
+                    "patch override active for `{key}` in {pkg}; remove it before publishing"
+                ));
+            }
+            bail!(unimplemented_message(&Commands::Publish))
+        }
         Some(Commands::Clean { package }) => cmd_clean(&ui, package.clone()),
         Some(Commands::Toolchains) => cmd_toolchains(&ui),
         Some(other) => bail!(unimplemented_message(other)),
@@ -445,17 +538,13 @@ fn unimplemented_message(cmd: &Commands) -> String {
         Commands::Check {} => ("check", "M3"),
         Commands::Add { .. } => ("add", "M4/M5"),
         Commands::Remove { .. } => ("remove", "M5"),
-        Commands::Update { .. } => ("update", "M4"),
         Commands::Tree => ("tree", "M4"),
         Commands::Fmt => ("fmt", "M8"),
         Commands::Doc => ("doc", "M8"),
-        Commands::Vendor => ("vendor", "M7"),
         Commands::Publish => ("publish", "M5"),
         Commands::Login => ("login", "M5"),
         Commands::Search { .. } => ("search", "M5"),
         Commands::Install => ("install", "M5"),
-        Commands::Git { .. } => ("git", "M4"),
-        Commands::Dev { .. } => ("dev", "M4"),
         _ => ("command", "a later milestone"),
     };
     format!("`rivet {name}` is not implemented yet (planned for {milestone}). See PLAN.md for the milestone checklist")
@@ -627,6 +716,12 @@ pub struct RunFlags {
     pub verbose: bool,
     /// JSON message format.
     pub json: bool,
+    /// No network (cache/vendor only).
+    pub offline: bool,
+    /// Error if the lockfile would change.
+    pub locked: bool,
+    /// No network + error if the lockfile would change.
+    pub frozen: bool,
 }
 
 /// Flags for [`cmd_test`].
@@ -645,6 +740,12 @@ pub struct TestFlags {
     pub verbose: bool,
     /// JSON message format.
     pub json: bool,
+    /// No network (cache/vendor only).
+    pub offline: bool,
+    /// Error if the lockfile would change.
+    pub locked: bool,
+    /// No network + error if the lockfile would change.
+    pub frozen: bool,
 }
 
 /// Flags for [`cmd_compile_commands`].
@@ -657,6 +758,12 @@ pub struct CompileCommandsFlags {
     pub features: rivet_graph::FeatureFlags,
     /// Verbose logging.
     pub verbose: bool,
+    /// No network (cache/vendor only).
+    pub offline: bool,
+    /// Error if the lockfile would change.
+    pub locked: bool,
+    /// No network + error if the lockfile would change.
+    pub frozen: bool,
 }
 
 /// One built unit: its resolution, plan, and (if it was stale) summary.
@@ -756,13 +863,19 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     }
     let root = load_scope()?;
     let profile = if flags.release { "release" } else { "dev" };
-    let mut units = rivet_graph::workspace::resolve_units_with_features(
+    let mut units = lockflow::resolve_build_units(
+        ui,
         &root,
         profile,
         flags.package.as_deref(),
         &flags.features,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+        &lockflow::LockOpts {
+            offline: flags.offline,
+            locked: flags.locked,
+            frozen: flags.frozen,
+        },
+        flags.verbose,
+    )?;
     if let Some(bin) = &flags.bin {
         units = restrict_to_bin(units, bin)?;
     }
@@ -788,6 +901,14 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     Ok(built)
 }
 
+/// Target dir for a unit: locked-materialized units redirect under the
+/// scope target dir (never into immutable checkouts/vendor copies).
+fn unit_target_dir(unit: &rivet_graph::workspace::Unit, profile: &str) -> PathBuf {
+    unit.target_dir_override
+        .clone()
+        .unwrap_or_else(|| rivet_graph::default_target_dir(&unit.manifest.dir, profile))
+}
+
 /// Build one unit (normal lib+bins plan), printing `Fresh` or `Compiling`
 /// plus `-v` detail. Returns the plan for callers that extend it (tests).
 fn build_single_unit(
@@ -800,7 +921,8 @@ fn build_single_unit(
 ) -> Result<rivet_graph::PackagePlan> {
     let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
     let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
-    let plan = rivet_graph::plan_with(&unit.manifest, profile, detection)
+    let target_dir = unit_target_dir(unit, profile);
+    let plan = rivet_graph::plan_with_target(&unit.manifest, profile, detection, &target_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     let inputs = rivet_graph::workspace::unit_inputs(unit, units, profile, detection)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -854,13 +976,19 @@ fn log_toolchain(ui: &Ui, detection: &rivet_toolchain::CxxToolchain) {
 fn cmd_test(ui: &Ui, flags: TestFlags) -> Result<()> {
     let root = load_scope()?;
     let profile = if flags.release { "release" } else { "dev" };
-    let units = rivet_graph::workspace::resolve_units_with_features(
+    let units = lockflow::resolve_build_units(
+        ui,
         &root,
         profile,
         flags.package.as_deref(),
         &flags.features,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+        &lockflow::LockOpts {
+            offline: flags.offline,
+            locked: flags.locked,
+            frozen: flags.frozen,
+        },
+        flags.verbose,
+    )?;
 
     let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
     log_toolchain(ui, &detection);
@@ -944,20 +1072,27 @@ fn cmd_compile_commands(ui: &Ui, flags: CompileCommandsFlags) -> Result<()> {
     let root = load_scope()?;
     let scope_dir = root.dir.clone();
     let profile = if flags.release { "release" } else { "dev" };
-    let units = rivet_graph::workspace::resolve_units_with_features(
+    let units = lockflow::resolve_build_units(
+        ui,
         &root,
         profile,
         flags.package.as_deref(),
         &flags.features,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+        &lockflow::LockOpts {
+            offline: flags.offline,
+            locked: flags.locked,
+            frozen: flags.frozen,
+        },
+        flags.verbose,
+    )?;
 
     // Flag mapping needs a toolchain, but nothing is compiled.
     let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
     log_toolchain(ui, &detection);
     let mut merged: Vec<rivet_graph::compile_commands::CompileEntry> = Vec::new();
     for unit in &units {
-        let plan = rivet_graph::plan_with(&unit.manifest, profile, &detection)
+        let target_dir = unit_target_dir(unit, profile);
+        let plan = rivet_graph::plan_with_target(&unit.manifest, profile, &detection, &target_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let inputs = rivet_graph::workspace::unit_inputs(unit, &units, profile, &detection)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1002,9 +1137,9 @@ fn cmd_run(ui: &Ui, flags: RunFlags) -> Result<()> {
             target: None,
             verbose: flags.verbose,
             json: flags.json,
-            offline: false,
-            locked: false,
-            frozen: false,
+            offline: flags.offline,
+            locked: flags.locked,
+            frozen: flags.frozen,
         },
     )?;
     // Select the binary: `--bin` narrows (already unique), else the single
@@ -1105,6 +1240,30 @@ fn cmd_clean(ui: &Ui, package: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Re-resolve branch deps and rewrite the lockfile.
+///
+/// Resolution covers every optional dependency (`--all-features`
+/// semantics) so later `--features` builds never need to extend the lock.
+fn cmd_update(ui: &Ui, opts: lockflow::UpdateOpts, verbose: bool) -> Result<()> {
+    let root = load_scope()?;
+    let flags = rivet_graph::FeatureFlags {
+        features: Vec::new(),
+        all: true,
+        no_default: false,
+    };
+    lockflow::update_flow(ui, &root, &flags, &opts, verbose)
+}
+
+/// Git cache management.
+fn cmd_git(ui: &Ui, command: &GitCommands, verbose: bool) -> Result<()> {
+    let root = load_scope()?;
+    match command {
+        GitCommands::List => lockflow::git_list_flow(ui, &root, verbose),
+        GitCommands::Prune { dry_run } => lockflow::git_prune_flow(ui, &root, *dry_run, verbose),
+        GitCommands::Fetch => lockflow::git_fetch_flow(ui, &root, verbose),
+    }
+}
+
 fn cmd_toolchains(ui: &Ui) -> Result<()> {
     let infos = rivet_toolchain::list_toolchains();
     if infos.is_empty() {
@@ -1157,9 +1316,8 @@ mod tests {
     fn unimplemented_commands_point_at_milestones() {
         let msg = unimplemented_message(&Commands::Check {});
         assert!(msg.contains("M3"), "got: {msg}");
-        let msg = unimplemented_message(&Commands::Git {
-            command: GitCommands::List,
-        });
+        // Tree is the remaining M4 stub; update/git/vendor/dev are implemented.
+        let msg = unimplemented_message(&Commands::Tree);
         assert!(msg.contains("M4"), "got: {msg}");
         let msg = unimplemented_message(&Commands::Publish);
         assert!(msg.contains("M5"), "got: {msg}");

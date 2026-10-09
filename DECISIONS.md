@@ -48,6 +48,61 @@ simpler option that preserves Cargo's mental model, then continue.
   `dev` → directory `debug`. Cargo compatibility wins over the literal
   reading; `Finished dev profile in …` still prints the profile name.
 
+## M2
+
+- **D13: `sha2` for content hashing.**
+  Justified: the spec mandates content-hash rebuilds; SHA-256 is the standard
+  choice (also used for future checksum verification in M5). Hex via
+  `format!("{:x}")`, no `hex` crate needed.
+- **D14: Hand-rolled parallel scheduler (work queue + scoped threads), no rayon.**
+  Compile tasks are independent within a package (link/archive run after, in
+  topo order), so a ~70-line FIFO queue with a poison flag for fail-fast is
+  sufficient. rayon would pull in 6+ transitive deps for no structural win.
+  Jobs default to `std::thread::available_parallelism()`, overridable with
+  `-j/--jobs`; `--keep-going` disables fail-fast. Static work-stealing is
+  deferred to M8 if the 200-file benchmark needs it.
+- **D15: Always-hash (no mtime fast path) for staleness.**
+  Every incremental check hashes source + recorded header contents. This is
+  slower than a stat fast-path but trivially correct, and fast enough until
+  the M8 benchmark. A `size+mtime` shortcut is explicitly deferred, not
+  forgotten.
+- **D16: Depfiles via `-MMD -MF` (GCC/Clang) and `/showIncludes` + `VSLANG=1033` (MSVC-like).**
+  `-MMD` excludes system headers (toolchain upgrades are covered by the
+  fingerprint instead). MSVC `/showIncludes` notes are locale-dependent, so
+  every MSVC-spawned command sets `VSLANG=1033` to force the English
+  `Note: including file:` prefix. clang-cl follows the MSVC path.
+- **D17: Bin/lib source partition rule.**
+  Helpers are `src/**/*.cpp` minus all target roots. A lib (explicit, or
+  `src/lib.cpp`) owns the helpers; bins then compile only their entry file
+  and link the archive. Without a lib, each bin compiles entry + all helpers
+  (multi-file bin). `include/` headers imply a header-only lib only when the
+  package has no bins at all — otherwise a bin package with headers would
+  lose its helpers to a phantom lib. Leftover `src/` sources without bins
+  form a static lib. Explicit directory `bin` entries keep M1 semantics
+  (whole directory, no merging). Bin root == lib root is an error, not a
+  silent pick.
+- **D18: `static` + `header-only` libs in M2; `shared` is an actionable error (M7).**
+  Shared needs an export/SONAME story that belongs with cross-compile and
+  adapters. Static archives (`.lib`/`.a`) plus header-only include
+  propagation cover the M2 acceptance (`lib + bin targets`).
+- **D19: Only `include/` propagates across path deps (public vs private).**
+  `src/` headers are private to their package by convention. A path dep
+  contributes its archive (if any) + its `include/` dir, transitively.
+  Static link order is reversed-topo (dependents first), correct for GNU `ld`
+  and harmless for MSVC.
+- **D20: Virtual workspace manifests (`workspace` without `package`).**
+  `package` becomes optional; a virtual root must not define `bin`/`lib`.
+  Inside a workspace, bare `build` covers the whole workspace (Cargo
+  behavior); `-p` narrows, `--bin` selects. Each package keeps its own
+  `target/` dir (a shared target dir waits for the M7 artifact cache).
+- **D21: Member globs without a `glob` crate.**
+  Only `*` (one segment), `**` (any depth), and `?` are supported — enough
+  for `crates/*` and friends, ~40 lines, zero new deps. Unmatched globs and
+  members without `rivet.json` are errors (likely typos), not warnings.
+- **D22: M1 `build_exe_command` removed in favor of split compile/link/archive.**
+  Pre-1.0 API cleanup with no external users; the M1 integration tests drive
+  the CLI binary and are unaffected.
+
 ## M3
 
 - **D23: Profile flags — MSVC `/GL`+`/LTCG`, `/fsanitize=address`;
@@ -61,9 +116,7 @@ simpler option that preserves Cargo's mental model, then continue.
   GNU/Clang names pass through (the compiler reports unknowns). Command
   builders stay infallible, so `build_unit`/`is_fresh_unit` (and
   `compile_commands_for`) call `validate_options` first — misconfiguration
-  fails fast even on a fresh tree. Fingerprint format (opaque to M4, stable
-  within a toolchain):
-  `<kind>|<version>|std=…|opt=…|debug=…|defines=…|includes=…|lto=…|sanitizers=…|features=…`.
+  fails fast even on a fresh tree.
   (PLAN.md M3 wrote `/fsanitize:address` with a colon; the real MSVC flag
   uses `=`, which is what we emit.)
 - **D24: Features — union semantics with lenient per-package activation.**
@@ -125,57 +178,93 @@ simpler option that preserves Cargo's mental model, then continue.
   (`build`, `--features extra`, `--all-features`, `--no-default-features`,
   `run`, `compile-commands`).
 
-## M2
+## M4
 
-- **D13: `sha2` for content hashing.**
-  Justified: the spec mandates content-hash rebuilds; SHA-256 is the standard
-  choice (also used for future checksum verification in M5). Hex via
-  `format!("{:x}")`, no `hex` crate needed.
-- **D14: Hand-rolled parallel scheduler (work queue + scoped threads), no rayon.**
-  Compile tasks are independent within a package (link/archive run after, in
-  topo order), so a ~70-line FIFO queue with a poison flag for fail-fast is
-  sufficient. rayon would pull in 6+ transitive deps for no structural win.
-  Jobs default to `std::thread::available_parallelism()`, overridable with
-  `-j/--jobs`; `--keep-going` disables fail-fast. Static work-stealing is
-  deferred to M8 if the 200-file benchmark needs it.
-- **D15: Always-hash (no mtime fast path) for staleness.**
-  Every incremental check hashes source + recorded header contents. This is
-  slower than a stat fast-path but trivially correct, and fast enough until
-  the M8 benchmark. A `size+mtime` shortcut is explicitly deferred, not
-  forgotten.
-- **D16: Depfiles via `-MMD -MF` (GCC/Clang) and `/showIncludes` + `VSLANG=1033` (MSVC-like).**
-  `-MMD` excludes system headers (toolchain upgrades are covered by the
-  fingerprint instead). MSVC `/showIncludes` notes are locale-dependent, so
-  every MSVC-spawned command sets `VSLANG=1033` to force the English
-  `Note: including file:` prefix. clang-cl follows the MSVC path.
-- **D17: Bin/lib source partition rule.**
-  Helpers are `src/**/*.cpp` minus all target roots. A lib (explicit, or
-  `src/lib.cpp`) owns the helpers; bins then compile only their entry file
-  and link the archive. Without a lib, each bin compiles entry + all helpers
-  (multi-file bin). `include/` headers imply a header-only lib only when the
-  package has no bins at all — otherwise a bin package with headers would
-  lose its helpers to a phantom lib. Leftover `src/` sources without bins
-  form a static lib. Explicit directory `bin` entries keep M1 semantics
-  (whole directory, no merging). Bin root == lib root is an error, not a
-  silent pick.
-- **D18: `static` + `header-only` libs in M2; `shared` is an actionable error (M7).**
-  Shared needs an export/SONAME story that belongs with cross-compile and
-  adapters. Static archives (`.lib`/`.a`) plus header-only include
-  propagation cover the M2 acceptance (`lib + bin targets`).
-- **D19: Only `include/` propagates across path deps (public vs private).**
-  `src/` headers are private to their package by convention. A path dep
-  contributes its archive (if any) + its `include/` dir, transitively.
-  Static link order is reversed-topo (dependents first), correct for GNU `ld`
-  and harmless for MSVC.
-- **D20: Virtual workspace manifests (`workspace` without `package`).**
-  `package` becomes optional; a virtual root must not define `bin`/`lib`.
-  Inside a workspace, bare `build` covers the whole workspace (Cargo
-  behavior); `-p` narrows, `--bin` selects. Each package keeps its own
-  `target/` dir (a shared target dir waits for the M7 artifact cache).
-- **D21: Member globs without a `glob` crate.**
-  Only `*` (one segment), `**` (any depth), and `?` are supported — enough
-  for `crates/*` and friends, ~40 lines, zero new deps. Unmatched globs and
-  members without `rivet.json` are errors (likely typos), not warnings.
-- **D22: M1 `build_exe_command` removed in favor of split compile/link/archive.**
-  Pre-1.0 API cleanup with no external users; the M1 integration tests drive
-  the CLI binary and are unaffected.
+- **D29: Same URL at different refs must unify to one SHA (unify-or-error).**
+  If two packages request the same git URL with different refs, both refs are
+  resolved and the SHAs compared: identical SHAs unify silently (one source),
+  divergent SHAs are `SameUrlDifferentRefs` spelling both refs and SHAs with
+  a "unify on one ref" hint. The `db/<name>-<urlhash>/` + per-SHA checkout
+  layout *could* host divergent SHAs, but building one repo twice at two
+  commits is a typo magnet, so rivet refuses it (Cargo-like strictness).
+- **D30: Shallow/partial fetch first, two-level fallback.**
+  Every fetch tries `--filter=blob:none` for the exact ref, then the same
+  refetch without the filter, then a full `fetch origin`. Rationale: partial
+  clones halve mirror traffic on modern servers, while `file://` test mirrors
+  and old gits that reject `--filter` fall through transparently. Resolution
+  always ends at `rev-parse`/`cat-file` in the local mirror, so fallback is
+  invisible to callers.
+- **D31: Cache-dir URL hash is FNV-1a-64 hex, not SHA-256.**
+  `rivet-git` stays dependency-free (no `sha2` for a directory suffix). The
+  full URL is recorded in `db/<dir>/rivet-url.txt`, so a hypothetical
+  collision surfaces as a URL mismatch, never silent confusion.
+- **D32: Registry index stub = JSON-lines `<index>/<name>`.**
+  Lines `{"version","checksum","yanked","deps":[{"name","req","optional"}]}`,
+  checksums stored verbatim into the lockfile, unknown fields ignored so M5
+  can extend the format. Yanked versions are skipped; a lock pinning a
+  yanked version is an explicit `YankedPinned` error ("run `rivet update`"),
+  never a silent keep-or-skip. Optional *index* deps are skipped in M4 (real
+  registry feature tables arrive with M5).
+- **D33: Lockfile bytes = C2 example field order, packages by name.**
+  `version` first, then `packages` (C2's literal order), each package in
+  `{name,version,source,features,checksum?}` order, features sorted; pretty
+  JSON + trailing newline. "Sorted keys" is realized as sorted packages /
+  sorted features + fixed field order (deterministic: resolve-twice yields
+  identical bytes). `GitLockRef` writes canonical `{"kind","value"}`.
+  `read` also accepts the single-key form (`{"tag":"v1"}`).
+- **D34: Feature semantics for M4 (C1 edge cases).**
+  Root: `default` (unless `--no-default-features`) + `--features`, or all
+  with `--all-features`; transitive deps: `default` (or all). `--features`
+  does not propagate to transitive deps (no `pkg/feat` syntax in M4 —
+  deferred to M5). The *whole* feature table of every resolved manifest is
+  validated eagerly (bad `dep:` / dangling chained refs error even when the
+  feature is disabled); `dep:` must name an existing `optional = true`
+  entry in `dependencies` (dev/build deps don't count in M4). Registry
+  packages record `features: []` in the stub. Lockfile `name` = dep key and
+  must equal the child manifest's `package.name` (`NameMismatch` otherwise).
+  Bare `git` URL without `tag`/`branch`/`rev` = remote default (`HEAD`).
+  Registry is always `"default"` (manifests cannot name a registry yet).
+  Frozen = offline resolve + `check_locked` (no separate flag).
+- **D35: New deps justified.**
+  `semver 1.0` (caret reqs + max-compatible selection — hand-rolling SemVer
+  is a bug farm), `serde`/`serde_json` in `rivet-resolver` (already pinned
+  via `rivet-manifest`; lockfile I/O needs them). `tempfile 3.0` dev-only
+  for hermetic tests. No git2/gitoxide (AGENTS.md forbids; system `git`
+  only). `protocol.file.allow=always` is set on every invocation so
+  `file://` submodules work in hermetic tests; network submodules are still
+  gated by the URL allowlist before init.
+- **D36: Lockfile flow is opt-in per scope (path-only scopes never lock).**
+  `build`/`test`/`run`/`compile-commands` first try plain resolution; only
+  `GitDep`/`RegistryDep` failures enter the lock flow (reuse → re-resolve →
+  rewrite unless `--locked`). Path-only projects therefore never see a
+  `rivet.lock.json`, preserving M1–M3 behavior byte-for-byte, and stay fully
+  offline without flags.
+- **D37: Locked-materialized units redirect builds under the scope target.**
+  Immutable checkouts (shared across projects) and vendor copies must never
+  gain a `target/` tree, so locked git units build into
+  `<scope>/target/<prof>/locked/<dep>/` (own objects, state, archives).
+  Path deps keep building in their own `target/` (M2 behavior — user-owned
+  dirs). Archive/include lookups follow the same rule via
+  `Unit.target_dir_override`.
+- **D38: `update` locks the world (`--all-features`) and is per-seed merged.**
+  Workspace members resolve independently and merge (same name must agree;
+  features union) so one member's optional never starves another's lock.
+  `update -p` restores non-selected entries (branches elsewhere don't move);
+  `--precise` keeps the manifest ref and overrides SHA+tree (verified via
+  `tree_hash`, so unknown SHAs fail). Moved tags abort the update before any
+  write; `head_count_between` messages are best-effort (`(? commits)` offline).
+- **D39: Patch = local paths only; builds substitute, update resolves base.**
+  The overlay order per edge is own-table patch → root patch → lock. Patch
+  entries with non-path sources are an error. `update` strips patched keys
+  before resolving (with a warning) and keeps their old lock entries; nested
+  (non-seed) patches are not traversed at update time — documented
+  limitation until M5 source replacement. `dev` clones `--local`,
+  auto-patches, and warns about `publish` (which itself warns when patch is
+  active).
+- **D40: `vendor` = full copies + `rivet-vendor.json`, consumed by tree hash.**
+  Git checkouts are copied with `.git` (tree verification needs objects);
+  path deps skip `target/`. Builds prefer the cache and fall back to vendor
+  only on cache-miss failures, accepting a vendored tree iff its
+  `HEAD^{tree}` equals the locked tree — content-addressed, so a mutated
+  vendor fails loudly (`TreeMismatch` semantics) instead of silently.
+  Registry packages cannot vend in M4 (fetching is M5) — actionable error.

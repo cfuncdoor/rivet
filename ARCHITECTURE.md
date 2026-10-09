@@ -66,6 +66,20 @@ Per-package state (`target/debug|release/`): `build/<tag>/*.o[bj]` objects
 change, source hash change, or any recorded header hash change
 (always-hash, D15).
 
+## Lockfile flow (M4)
+
+Path-only scopes never touch a lockfile. When git/registry deps exist,
+`build`/`test`/`run`/`compile-commands` resolve through
+`rivet.lock.json` (contract C2): reuse when it covers the scope, otherwise
+re-resolve + rewrite (or error under `--locked`/`--frozen`, with the
+resolver diff). Locked git deps materialize from immutable checkouts under
+`~/.rivet/git` (tree-hash verified) or tree-verified `vendor/` copies, and
+build under `<scope>/target/<prof>/locked/<dep>/` so shared trees stay
+pristine (D37). `patch` (own table, else scope root's) substitutes local
+paths at edge level in both modes (D39). `update` locks the world
+(`--all-features`), merges per-seed resolutions, supports `-p`/`--precise`,
+aborts on moved tags, and reports `name: old -> new (N commits)` (D38).
+
 ## Profiles / features (M3)
 
 Manifest `profile.dev|release` carry `opt`/`debug`/`lto`/`sanitizers`

@@ -198,7 +198,16 @@ fn json_message_format_emits_json_lines() {
 
 #[test]
 fn future_commands_fail_with_milestone_pointer() {
+    // Inside a project scope so `publish` reaches its milestone stub.
+    let dir = TempDir::new().unwrap();
     rivet()
+        .current_dir(dir.path())
+        .arg("new")
+        .arg("hello")
+        .assert()
+        .success();
+    rivet()
+        .current_dir(dir.path().join("hello"))
         .arg("publish")
         .assert()
         .failure()

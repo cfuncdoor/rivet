@@ -1,7 +1,7 @@
 # PLAN.md — rivet milestone checklist
 
-Current phase: **M3** — profiles, features, tests.
-M2 acceptance passed (see below). Do not start M4+ until M3 acceptance passes.
+Current phase: **M5** — registry.
+M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
 
 ## M1 — Manifest + CLI skeleton + toolchain detection [DONE]
 - [x] Workspace scaffold (8 crates) + root `rivet` binary (`cargo install --path .`)
@@ -24,7 +24,7 @@ M2 acceptance passed (see below). Do not start M4+ until M3 acceptance passes.
 - [x] Test: touching one header rebuilds only dependents (`header_touch_rebuilds_only_dependents` + mtime-only touch stays `Fresh`)
 - [x] Gate green + `examples/{hello,libhello,workspace}` corpus builds in CI
 
-## M3 — Profiles, features, tests [IN PROGRESS — owner: M3 agent]
+## M3 — Profiles, features, tests [DONE]
 - [x] `rivet test`: discovers `tests/*.cpp` (stem-named binaries), links vs the
       package lib + dep archives, runs each, reports `test <name> ... ok|FAILED`
       + `test result:` summary, nonzero exit on failure; `-p` selects
@@ -69,23 +69,27 @@ M2 acceptance passed (see below). Do not start M4+ until M3 acceptance passes.
   CLI integration of M4 (`update`, `git …`, `vendor`, `dev`, build-from-lock)
   is done by the coordinator after both land.
 
-## M4 — Resolver + lockfile + git deps [IN PROGRESS — crates: M4 agent; CLI integration: coordinator]
-- [ ] `rivet-git` (M4 agent, self-contained): system-git shell-out only;
-  bare mirror + immutable checkouts under `~/.rivet/git`; shallow/partial
-  with fallback; tag/branch/rev resolve; tree-hash verify; moved-tag error;
+## M4 — Resolver + lockfile + git deps [DONE]
+- [x] `rivet-git`: system-git shell-out only; bare mirror + immutable
+  checkouts under `~/.rivet/git`; shallow/partial with fallback;
+  tag/branch/rev resolve; tree-hash verify; moved-tag error;
   subdir/submodules; hooks disabled; https/ssh/file only;
   `GIT_TERMINAL_PROMPT=0`; list/prune/fetch machinery; temp-bare-repo tests
   (no network — `file://` URLs only)
-- [ ] `rivet-resolver` (M4 agent, self-contained): semver requirements,
-  resolution over path/registry-stub/git candidates honoring C1 features;
-  deterministic lockfile per C2 with checksums/SHAs; `--locked/--frozen/
-  --offline` enforcement as library functions; semver-compatible selection;
-  yank awareness in the index client stub
-- [ ] CLI integration (coordinator, after both agents): build-from-lock,
-  `update [-p] [--precise]`, `git list|prune|fetch`, `vendor`, `dev`+`patch`,
-  publish-with-patch warning, `--locked/--frozen/--offline` wiring
-- [ ] Integration tests with local bare repos: moved tag, force-pushed
-  branch, subdir deps, submodules, offline rebuild, prune, patch, `dev`
+- [x] `rivet-resolver`: semver requirements, resolution over
+  path/registry-stub/git candidates honoring C1 features; deterministic
+  lockfile per C2 with checksums/SHAs; `--locked/--frozen/--offline`
+  enforcement as library functions; semver-compatible selection; yank
+  awareness in the index client stub
+- [x] CLI integration: build-from-lock (opt-in per scope, patch overlay,
+  target redirection for immutable checkouts), `update [-p] [--precise]`
+  with movement report + moved-tag abort, `git list|prune|fetch`, `vendor`
+  (+offline consumption via tree hash), `dev`+`patch`, publish-with-patch
+  warning, `--locked/--frozen/--offline` on build/test/run/compile-commands
+- [x] Integration tests (`tests/m4.rs`, local bare repos): tag end-to-end,
+  branch update, `--precise` pin, moved-tag error, `--locked` error,
+  offline rebuild from vendor, subdir deps, submodules, prune, patch, `dev`,
+  fetch warm-up
 
 ## M5 — Registry [NOT STARTED]
 - [ ] JSON-lines index, fetch, checksum verify, publish/login/search, yank

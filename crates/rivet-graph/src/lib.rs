@@ -110,11 +110,39 @@ pub enum Error {
         /// Dependency name.
         name: String,
     },
+    /// A `patch` entry uses a non-path source (M4 supports local paths only).
+    #[error("patch for `{name}` uses a non-path source. Fix: point it at a local `path` (registry/git patches arrive later)")]
+    PatchSource {
+        /// Dependency key.
+        name: String,
+    },
     /// A path dependency points at a workspace root instead of a package.
     #[error("path dependency at {path} is a workspace root. Fix: depend on a member package directory instead")]
     WorkspaceDep {
         /// Dependency directory.
         path: String,
+    },
+    /// A locked dependency is missing or stale in `rivet.lock.json`.
+    #[error("dependency `{name}` is not covered by rivet.lock.json ({reason}). Fix: run `rivet update` (or check `patch` overrides)")]
+    NotLocked {
+        /// Dependency key.
+        name: String,
+        /// Why coverage failed.
+        reason: String,
+    },
+    /// A locked registry package cannot be fetched yet (M5).
+    #[error("registry package `{name}` is locked but fetching is not supported yet (planned for M5). See PLAN.md")]
+    RegistryFetch {
+        /// Dependency key.
+        name: String,
+    },
+    /// A locked source could not be materialized.
+    #[error("could not materialize locked source for `{name}`: {message}")]
+    Materialize {
+        /// Dependency key.
+        name: String,
+        /// What failed.
+        message: String,
     },
     /// Path dependencies form a cycle.
     #[error("dependency cycle detected: {cycle}. Fix: remove one of the `path` edges")]
@@ -366,6 +394,11 @@ fn make_target(
     }
 }
 
+/// Default target dir for a package (`<pkg>/target/debug|release`).
+pub fn default_target_dir(pkg_dir: &Path, profile: &str) -> PathBuf {
+    pkg_dir.join("target").join(profile_dir(profile))
+}
+
 /// Resolve the build plan for `profile` (`dev` or `release`).
 ///
 /// Needs a toolchain only for file extensions, not for detection: pass any
@@ -374,6 +407,20 @@ pub fn plan_with(
     manifest: &Manifest,
     profile: &str,
     toolchain: &CxxToolchain,
+) -> Result<PackagePlan, Error> {
+    let target_dir = default_target_dir(&manifest.dir, profile);
+    plan_with_target(manifest, profile, toolchain, &target_dir)
+}
+
+/// Resolve the build plan into an explicit target dir.
+///
+/// Locked-materialized units (immutable checkouts, vendor copies) build here
+/// instead of the package default so the cache/vendor trees stay pristine.
+pub fn plan_with_target(
+    manifest: &Manifest,
+    profile: &str,
+    toolchain: &CxxToolchain,
+    target_dir: &Path,
 ) -> Result<PackagePlan, Error> {
     check_profile(profile)?;
     let resolved_lib = m::resolve_lib(manifest)?;
@@ -401,7 +448,6 @@ pub fn plan_with(
             dir: manifest.dir.display().to_string(),
         });
     }
-    let target_dir = manifest.dir.join("target").join(profile_dir(profile));
     let suffix = if cfg!(windows) { ".exe" } else { "" };
     let mut plan_bins = Vec::new();
     for b in &bins {
@@ -412,7 +458,7 @@ pub fn plan_with(
             &b.name,
             sources,
             manifest,
-            &target_dir,
+            target_dir,
             toolchain,
             output,
         ));
@@ -433,7 +479,7 @@ pub fn plan_with(
                 &lib.name,
                 sources,
                 manifest,
-                &target_dir,
+                target_dir,
                 toolchain,
                 output,
             ))
@@ -445,7 +491,7 @@ pub fn plan_with(
         bins: plan_bins,
         lib: plan_lib,
         header_only,
-        target_dir,
+        target_dir: target_dir.to_path_buf(),
     })
 }
 

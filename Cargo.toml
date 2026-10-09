@@ -23,6 +23,8 @@ members = [
   "crates/rivet-graph",
   "crates/rivet-cache",
   "crates/rivet-registry",
+  "crates/rivet-adapters",
+  "crates/rivet-buildscript",
   "crates/rivet-cli",
 ]
 

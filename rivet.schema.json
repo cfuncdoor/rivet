@@ -45,6 +45,19 @@
               "subdir": { "type": "string" },
               "submodules": { "type": "boolean" },
               "optional": { "type": "boolean" },
+              "registry": { "type": "string" },
+              "adapter": {
+                "type": "object",
+                "required": ["tool"],
+                "properties": {
+                  "tool": {
+                    "type": "string",
+                    "enum": ["cmake", "meson", "make", "pkg-config", "system"]
+                  },
+                  "targets": { "type": "array", "items": { "type": "string" } },
+                  "options": { "type": "object", "additionalProperties": { "type": "string" } }
+                }
+              },
               "package": {
                 "type": "object",
                 "required": ["name"],

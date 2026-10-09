@@ -334,6 +334,32 @@ pub struct DependencyDetail {
     /// System-library fallback (M6+).
     #[serde(default)]
     pub system: Option<bool>,
+    /// Alternate registry URL for registry deps (M5; default registry when
+    /// absent). Contract C4 — frozen.
+    #[serde(default)]
+    pub registry: Option<String>,
+    /// Foreign-package adapter (M6): how to build a non-rivet dependency.
+    /// Contract C5 — frozen.
+    #[serde(default)]
+    pub adapter: Option<AdapterSpec>,
+}
+
+/// Foreign-package build adapter (contract C5 — frozen).
+///
+/// Applies to git/path deps whose sources are not rivet packages (e.g. a
+/// CMake-only library), or with `"system": true` to probe an installed
+/// system library instead of building anything.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AdapterSpec {
+    /// Adapter tool: `cmake`, `meson`, `make`, `pkg-config`, or `system`.
+    #[serde(default)]
+    pub tool: String,
+    /// Build targets (meaning is tool-specific; empty = tool default).
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// Tool-specific options (e.g. CMake `-D` definitions without the `-D`).
+    #[serde(default)]
+    pub options: BTreeMap<String, String>,
 }
 
 /// Inline package metadata for schemaless git deps.
@@ -814,6 +840,29 @@ fn validate_dependency(dep: &serde_json::Value, path: &str, stripped: &str) -> R
                 return Err(err(
                     &format!("{path}.git"),
                     format!("unsupported git URL scheme in `{git}`. Hint: use https://, ssh://, git@, or file://"),
+                ));
+            }
+        }
+    }
+    if let Some(adapter) = o.get("adapter") {
+        let obj = adapter.as_object().ok_or_else(|| {
+            err(
+                &format!("{path}.adapter"),
+                "`adapter` must be an object. Hint: `\"adapter\": {\"tool\": \"cmake\"}`".to_string(),
+            )
+        })?;
+        match obj.get("tool").and_then(|v| v.as_str()) {
+            Some(t) if ["cmake", "meson", "make", "pkg-config", "system"].contains(&t) => {}
+            Some(t) => {
+                return Err(err(
+                    &format!("{path}.adapter.tool"),
+                    format!("unknown adapter tool `{t}`. Hint: use cmake, meson, make, pkg-config, or system"),
+                ));
+            }
+            None => {
+                return Err(err(
+                    &format!("{path}.adapter.tool"),
+                    "missing `adapter.tool`. Hint: add `\"tool\": \"cmake\"`".to_string(),
                 ));
             }
         }

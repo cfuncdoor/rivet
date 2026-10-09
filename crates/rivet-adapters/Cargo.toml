@@ -1,0 +1,15 @@
+[package]
+name = "rivet-adapters"
+version = "0.1.0"
+edition = "2021"
+description = "Foreign package adapters (CMake/Meson/system libs)"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[dependencies]
+rivet-manifest = { path = "../rivet-manifest" }
+rivet-toolchain = { path = "../rivet-toolchain" }
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.0"

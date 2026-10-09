@@ -91,16 +91,72 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
   offline rebuild from vendor, subdir deps, submodules, prune, patch, `dev`,
   fetch warm-up
 
-## M5 — Registry [NOT STARTED]
-- [ ] JSON-lines index, fetch, checksum verify, publish/login/search, yank
-- [ ] Local test registry in CI, SemVer-compatible resolution
+## M5 — Registry [IN PROGRESS — owner: M5 agent (rivet-registry only)]
+- [ ] Index client: sparse-HTTPS and/or local-dir index reads (JSON-lines,
+  M4-compatible), version listing, yank filtering
+- [ ] Tarball fetch (file:// + https), SHA-256 checksum verify, safe extract
+  (no path traversal / escaping symlinks) into the cache
+- [ ] `publish` / `login` / `search` library APIs (token store, index query,
+  tarball upload packaging)
+- [ ] Registry materialize API for the CLI integrator (fetch + verify +
+  extract → source dir + include/lib info)
+- [ ] Unit + hermetic tests (local static registry dir, `file://` only);
+  semver-compatible selection incl. pre-releases per semver rules
+- [ ] New deps justified in the return message (candidate: `ureq` rustls,
+  `tar` + `flate2`; keep it minimal)
 
-## M6 — Adapters (CMake/Meson/system libs) [NOT STARTED]
-- [ ] Demo: depend on real CMake-only lib (e.g. zlib via git) from a rivet package
+## M6 — Adapters (CMake/Meson/system libs) [IN PROGRESS — owner: M6 agent]
+- [ ] `crates/rivet-adapters` (new crate, agent-owned): CMake adapter
+  (invoke system `cmake` + `cmake --build`, expose include dirs + libs),
+  Meson/Make adapters best-effort, `pkg-config`/`system` probing for
+  `system: true` deps (no sources required)
+- [ ] Adapter output model for the CLI integrator: include dirs, lib
+  dirs/files, defines, and which outputs must be linked (static vs shared)
+- [ ] Hermetic tests (skip-gated when `cmake` is missing); a real
+  CMake-only lib (zlib via git + `adapter: {tool: cmake}`) builds in
+  `examples/cmake-zlib` (agent-owned example)
+- [ ] Manifest `adapter`/`system`/`registry` fields already exist (frozen
+  C4/C5) — do NOT change `rivet-manifest`
 
-## M7 — Build scripts, artifact cache, cross-compile [NOT STARTED]
-- [ ] `build.rivet.cpp` directives, artifact cache, `vendor`, `--target`,
-      sanitizers, LTO, PCH, (stretch) C++20 modules
+## M7 — Build scripts, artifact cache, cross-compile [IN PROGRESS — owner: M7 agent]
+- [ ] `crates/rivet-buildscript` (agent-owned): compile `build.rivet.cpp`
+  with the detected toolchain, run it pre-build (sandboxed to package dirs
+  by default), parse `rivet:` directives (include dirs, link libs, defines,
+  rerun-if-changed) into a typed output model for the CLI integrator
+- [ ] `rivet-cache` (agent-owned): local artifact cache keyed by (package,
+  version, features, toolchain fingerprint, profile, flags hash) with
+  store/lookup/validate APIs for the CLI integrator
+- [ ] `rivet-toolchain` (agent-owned, flags/selection only): `--target`
+  triple parsing + toolchain selection hooks (find cross compilers, record
+  target in fingerprint); actionable errors for unsupported combos; PCH and
+  C++20-modules guidance (implement if cheap, else actionable error +
+  document)
+- [ ] Hermetic tests (tempdirs); `examples/buildscript-*` demos
+  (agent-owned examples)
+
+## M5/M6/M7 shared contracts (frozen)
+
+- **C4 — Registry manifest surface.** `DependencyDetail.registry:
+  Option<String>` (alternate registry URL; absent = default registry) is the
+  only registry surface; no other manifest changes for M5. The M4
+  `RegistryIndex` dir format stays valid (M5 extends, never breaks).
+- **C5 — Adapter manifest surface.** `DependencyDetail.adapter:
+  Option<AdapterSpec{tool, targets, options}>` + existing `system: bool`
+  are the only adapter surfaces. `tool ∈ {cmake, meson, make, pkg-config,
+  system}` is validated at parse time. Adapters apply to git/path deps
+  (foreign sources) or with `system: true` (no sources). No other manifest
+  changes for M6.
+- **C6 — File ownership (no cross-edits).** M5 owns ONLY
+  `crates/rivet-registry/**`. M6 owns ONLY `crates/rivet-adapters/**` +
+  `examples/cmake-*` (new files only). M7 owns ONLY
+  `crates/rivet-buildscript/**`, `crates/rivet-toolchain/**` (selection +
+  flags only), `crates/rivet-cache/**`, `examples/buildscript-*` (new
+  files only). NOBODY touches: `crates/rivet-manifest`, `crates/rivet-graph`,
+  `crates/rivet-cli`, `crates/rivet-git`, `crates/rivet-resolver`, docs
+  (`*.md`), `.github/`, `Cargo.toml` files outside their crates, `Cargo.lock`
+  (plain `cargo -p` runs may extend it — expected; never hand-edit, never
+  `cargo update`, never commit). The coordinator wires graph+CLI afterwards
+  and returns API summaries for DECISIONS.md.
 
 ## M8 — Polish [NOT STARTED]
 - [ ] docs/ book, shell completions, installers + release binaries,

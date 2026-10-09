@@ -2,15 +2,17 @@
 name = "rivet-graph"
 version = "0.1.0"
 edition = "2021"
-description = "Build graph of compile/link/archive steps (minimal in M1)"
+description = "Build graph of compile/link/archive steps with incremental rebuilds"
 license = "MIT OR Apache-2.0"
 rust-version = "1.74"
 
 [dependencies]
 rivet-manifest = { path = "../rivet-manifest" }
 rivet-toolchain = { path = "../rivet-toolchain" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
-walkdir = "2.5"
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -1,10 +1,11 @@
 //! `rivet` command-line interface.
 //!
 //! Argument parsing (clap), Cargo-like colored output, progress reporting,
-//! `--message-format=json` for IDEs, and `-v` verbose logging. M1 implements
-//! `new`, `init`, `build`, `run`, `clean`, and `toolchains`; every other
-//! command parses and returns an actionable "planned for M{x}" error so the
-//! CLI shape is stable from day one.
+//! `--message-format=json` for IDEs, and `-v` verbose logging. M1 delivered
+//! `new`, `init`, `build`, `run`, `clean`, and `toolchains`; M2 adds
+//! workspace scope (`-p`, `--bin`, `-j/--jobs`, `--keep-going`) and
+//! `Fresh`/`Compiling` per-package lines. Every other command parses and
+//! returns an actionable "planned for Mx" error so the CLI shape is stable.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -52,18 +53,27 @@ pub enum Commands {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Compile the current package.
+    /// Compile the current package (or workspace).
     Build {
         /// Build with the `release` profile.
         #[arg(long)]
         release: bool,
-        /// Build only the given package (workspaces, M2).
+        /// Build only the given package (plus its path deps).
         #[arg(short = 'p', long, value_name = "PKG")]
         package: Option<String>,
+        /// Build only the given binary (plus its path deps).
+        #[arg(long, value_name = "NAME")]
+        bin: Option<String>,
+        /// Parallel compile jobs (`0` = auto = cores).
+        #[arg(short = 'j', long, default_value_t = 0, value_name = "N")]
+        jobs: usize,
+        /// Keep going after a compile failure (report all errors).
+        #[arg(long)]
+        keep_going: bool,
         /// Cross-compile for the given triple (M7).
         #[arg(long, value_name = "TRIPLE")]
         target: Option<String>,
-        /// Do not use network (M4; accepted now, no network is used in M1).
+        /// Do not use network (M4; accepted now, no network is used in M2).
         #[arg(long)]
         offline: bool,
         /// Error if the lockfile would change (M4; accepted now).
@@ -73,17 +83,33 @@ pub enum Commands {
         #[arg(long)]
         frozen: bool,
     },
-    /// Build and run the current package's default binary.
+    /// Build and run a binary.
     Run {
         /// Build with the `release` profile.
         #[arg(long)]
         release: bool,
+        /// Run the given package's binary.
+        #[arg(short = 'p', long, value_name = "PKG")]
+        package: Option<String>,
+        /// Run the given binary.
+        #[arg(long, value_name = "NAME")]
+        bin: Option<String>,
+        /// Parallel compile jobs (`0` = auto = cores).
+        #[arg(short = 'j', long, default_value_t = 0, value_name = "N")]
+        jobs: usize,
+        /// Keep going after a compile failure (report all errors).
+        #[arg(long)]
+        keep_going: bool,
         /// Arguments passed to the binary (after `--`).
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<OsString>,
     },
     /// Remove `target/` build output.
-    Clean,
+    Clean {
+        /// Clean only the given package.
+        #[arg(short = 'p', long, value_name = "PKG")]
+        package: Option<String>,
+    },
     /// List detected C++ toolchains.
     Toolchains,
     /// Run tests (M3).
@@ -179,6 +205,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         Some(Commands::Build {
             release,
             package,
+            bin,
+            jobs,
+            keep_going,
             target,
             offline,
             locked,
@@ -188,6 +217,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             BuildFlags {
                 release: *release,
                 package: package.clone(),
+                bin: bin.clone(),
+                jobs: *jobs,
+                keep_going: *keep_going,
                 target: target.clone(),
                 verbose: cli.verbose,
                 json: ui.json,
@@ -195,9 +227,29 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 locked: *locked,
                 frozen: *frozen,
             },
+        )
+        .map(|_| ()),
+        Some(Commands::Run {
+            release,
+            package,
+            bin,
+            jobs,
+            keep_going,
+            args,
+        }) => cmd_run(
+            &ui,
+            RunFlags {
+                release: *release,
+                package: package.clone(),
+                bin: bin.clone(),
+                jobs: *jobs,
+                keep_going: *keep_going,
+                args: args.clone(),
+                verbose: cli.verbose,
+                json: ui.json,
+            },
         ),
-        Some(Commands::Run { release, args }) => cmd_run(&ui, *release, args, cli.verbose, ui.json),
-        Some(Commands::Clean) => cmd_clean(&ui),
+        Some(Commands::Clean { package }) => cmd_clean(&ui, package.clone()),
         Some(Commands::Toolchains) => cmd_toolchains(&ui),
         Some(other) => bail!(unimplemented_message(other)),
     }
@@ -420,15 +472,21 @@ fn cmd_init(ui: &Ui, name: Option<String>) -> Result<()> {
 pub struct BuildFlags {
     /// Use the `release` profile.
     pub release: bool,
-    /// `-p` package selector (workspaces, M2).
+    /// `-p` package selector (plus its path deps).
     pub package: Option<String>,
+    /// `--bin` binary selector (plus its path deps).
+    pub bin: Option<String>,
+    /// Parallel compile jobs (`0` = auto).
+    pub jobs: usize,
+    /// Report all compile errors instead of stopping at the first.
+    pub keep_going: bool,
     /// `--target` triple (cross-compile, M7).
     pub target: Option<String>,
     /// Verbose logging.
     pub verbose: bool,
     /// JSON message format.
     pub json: bool,
-    /// Accepted now (no network is used in M1); enforced from M4.
+    /// Accepted now (no network is used in M2); enforced from M4.
     pub offline: bool,
     /// Accepted now; enforced from M4.
     pub locked: bool,
@@ -436,30 +494,128 @@ pub struct BuildFlags {
     pub frozen: bool,
 }
 
-fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<()> {
+/// Flags for [`cmd_run`].
+pub struct RunFlags {
+    /// Use the `release` profile.
+    pub release: bool,
+    /// `-p` package selector.
+    pub package: Option<String>,
+    /// `--bin` binary selector.
+    pub bin: Option<String>,
+    /// Parallel compile jobs (`0` = auto).
+    pub jobs: usize,
+    /// Report all compile errors instead of stopping at the first.
+    pub keep_going: bool,
+    /// Arguments forwarded to the binary.
+    pub args: Vec<OsString>,
+    /// Verbose logging.
+    pub verbose: bool,
+    /// JSON message format.
+    pub json: bool,
+}
+
+/// One built unit: its resolution, plan, and (if it was stale) summary.
+struct BuiltUnit {
+    unit: rivet_graph::workspace::Unit,
+    plan: rivet_graph::PackagePlan,
+}
+
+/// Find the workspace scope root: the topmost ancestor of `nearest` that
+/// still contains a `rivet.json`. (Cargo behavior: commands run from a
+/// member operate on the whole workspace unless `-p` narrows.)
+fn find_scope_root(nearest: &Path) -> PathBuf {
+    let mut root = nearest.to_path_buf();
+    let mut cursor = nearest.parent().map(Path::to_path_buf);
+    while let Some(dir) = cursor {
+        if dir.join("rivet.json").is_file() {
+            root = dir.clone();
+            cursor = dir.parent().map(Path::to_path_buf);
+        } else {
+            break;
+        }
+    }
+    root
+}
+
+/// Load the scope root manifest for the current directory.
+fn load_scope() -> Result<rivet_manifest::Manifest> {
+    let cwd = std::env::current_dir().context("could not read current directory")?;
+    let nearest = rivet_manifest::find_manifest_dir(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let scope_root = find_scope_root(&nearest);
+    rivet_manifest::load(&scope_root).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Restrict resolved units to the `--bin` target plus its transitive path
+/// deps (topo order preserved).
+fn restrict_to_bin(
+    units: Vec<rivet_graph::workspace::Unit>,
+    bin: &str,
+) -> Result<Vec<rivet_graph::workspace::Unit>> {
+    use std::collections::BTreeSet;
+    // Candidate bins across the selection.
+    let mut hits: Vec<String> = Vec::new();
+    for unit in &units {
+        for target in rivet_manifest::resolve_bins(&unit.manifest) {
+            if target.name == *bin {
+                if let Some(name) = rivet_manifest::package_name(&unit.manifest) {
+                    hits.push(name.to_string());
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        bail!(
+            "binary `{bin}` not found in the selected packages. Fix: check `bin` entries and `src/main.cpp` files"
+        );
+    }
+    if hits.len() > 1 {
+        hits.sort();
+        hits.dedup();
+        bail!(
+            "binary `{bin}` exists in multiple packages ({}). Fix: disambiguate with `-p <package> --bin {bin}`",
+            hits.join(", ")
+        );
+    }
+    // Keep the owning unit plus its transitive deps.
+    let owner = units
+        .iter()
+        .find(|u| {
+            rivet_manifest::resolve_bins(&u.manifest)
+                .iter()
+                .any(|t| t.name == *bin)
+        })
+        .unwrap()
+        .dir
+        .clone();
+    let mut keep: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut stack = vec![owner];
+    while let Some(dir) = stack.pop() {
+        if !keep.insert(dir.clone()) {
+            continue;
+        }
+        if let Some(unit) = units.iter().find(|u| u.dir == dir) {
+            stack.extend(unit.deps.iter().cloned());
+        }
+    }
+    Ok(units
+        .into_iter()
+        .filter(|u| keep.contains(&u.dir))
+        .collect())
+}
+
+/// Build every unit in scope, returning them with their plans.
+/// Prints Cargo-like `Compiling`/`Fresh`/`Finished` lines.
+fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     if let Some(triple) = &flags.target {
         bail!("cross-compiling to `{triple}` is not implemented yet (planned for M7). See PLAN.md");
     }
-    let cwd = std::env::current_dir().context("could not read current directory")?;
-    let dir = rivet_manifest::find_manifest_dir(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let manifest = rivet_manifest::load(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    if let Some(pkg) = &flags.package {
-        if *pkg != manifest.package.name {
-            bail!(
-                "package `{pkg}` not found in this workspace. Fix: available package is `{}`",
-                manifest.package.name
-            );
-        }
-    }
+    let root = load_scope()?;
     let profile = if flags.release { "release" } else { "dev" };
-
-    ui.status(
-        "Compiling",
-        &format!(
-            "{} v{} ({profile})",
-            manifest.package.name, manifest.package.version
-        ),
-    );
+    let mut units = rivet_graph::workspace::resolve_units(&root, profile, flags.package.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(bin) = &flags.bin {
+        units = restrict_to_bin(units, bin)?;
+    }
 
     let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
     if flags.verbose {
@@ -470,53 +626,113 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<()> {
             detection.version
         ));
         ui.verbose(&format!("found via: {}", detection.found_via));
+        if let Some(ar) = &detection.ar {
+            ui.verbose(&format!("archiver: {}", ar.display()));
+        }
     }
-    let plan = rivet_graph::plan(&manifest, profile).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let build_opts = rivet_graph::BuildOptions {
+        verbose: flags.verbose,
+        jobs: flags.jobs,
+        fail_fast: !flags.keep_going,
+    };
     let started = std::time::Instant::now();
-    let summary = rivet_graph::build(
-        &plan,
-        &manifest,
-        &detection,
-        &rivet_graph::BuildOptions {
-            verbose: flags.verbose,
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let secs = started.elapsed().as_secs_f64();
-    for out in &summary.outputs {
-        ui.verbose(&format!("built {}", out.display()));
+    let mut built = Vec::new();
+    for unit in &units {
+        let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
+        let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
+        let plan = rivet_graph::plan_with(&unit.manifest, profile, &detection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let inputs = rivet_graph::workspace::unit_inputs(unit, &units, profile, &detection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if rivet_graph::is_fresh_unit(&unit.manifest, &plan, &detection, &inputs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            ui.status("Fresh", &format!("{name} v{version}"));
+        } else {
+            ui.status("Compiling", &format!("{name} v{version} ({profile})"));
+            let summary =
+                rivet_graph::build_unit(&unit.manifest, &plan, &detection, &inputs, &build_opts)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for line in &summary.log {
+                eprintln!("       {line}");
+            }
+            for (tag, rel) in &summary.recompiled {
+                ui.verbose(&format!("recompiled {tag}/{rel}"));
+            }
+            for out in &summary.relinked {
+                ui.verbose(&format!("linked {}", out.display()));
+            }
+        }
+        built.push(BuiltUnit {
+            unit: unit.clone(),
+            plan,
+        });
     }
+    let secs = started.elapsed().as_secs_f64();
     ui.status("Finished", &format!("{profile} profile in {secs:.2}s"));
-    let _ = summary;
-    Ok(())
+    Ok(built)
 }
 
-fn cmd_run(ui: &Ui, release: bool, args: &[OsString], verbose: bool, json: bool) -> Result<()> {
-    cmd_build(
+fn cmd_run(ui: &Ui, flags: RunFlags) -> Result<()> {
+    let built = cmd_build(
         ui,
         BuildFlags {
-            release,
-            package: None,
+            release: flags.release,
+            package: flags.package.clone(),
+            bin: flags.bin.clone(),
+            jobs: flags.jobs,
+            keep_going: flags.keep_going,
             target: None,
-            verbose,
-            json,
+            verbose: flags.verbose,
+            json: flags.json,
             offline: false,
             locked: false,
             frozen: false,
         },
     )?;
-    let cwd = std::env::current_dir().context("could not read current directory")?;
-    let dir = rivet_manifest::find_manifest_dir(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let manifest = rivet_manifest::load(&dir).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let profile = if release { "release" } else { "dev" };
-    let plan = rivet_graph::plan(&manifest, profile).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let Some(bin) = plan.bins.first() else {
-        bail!("no binary targets found. Fix: create src/main.cpp");
+    // Select the binary: `--bin` narrows (already unique), else the single
+    // bin in scope, else an actionable list.
+    let mut bins: Vec<(&rivet_graph::workspace::Unit, &rivet_graph::TargetBuild)> = Vec::new();
+    for b in &built {
+        for target in &b.plan.bins {
+            if let Some(want) = &flags.bin {
+                if target.name == *want {
+                    bins.push((&b.unit, target));
+                }
+            } else {
+                bins.push((&b.unit, target));
+            }
+        }
+    }
+    if bins.is_empty() {
+        bail!(
+            "no binary targets found. Fix: create src/main.cpp or add a `bin` entry to rivet.json"
+        );
+    }
+    let (unit, bin) = if bins.len() == 1 {
+        bins.into_iter().next().unwrap()
+    } else {
+        let mut candidates: Vec<String> = bins
+            .iter()
+            .map(|(u, t)| {
+                format!(
+                    "{} (-p {})",
+                    t.name,
+                    rivet_manifest::package_name(&u.manifest).unwrap_or("?")
+                )
+            })
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        bail!(
+            "multiple binaries available: {}. Fix: select one with `rivet run --bin <name>` or `rivet run -p <package>`",
+            candidates.join(", ")
+        );
     };
     ui.status("Running", &format!("{}", bin.output.display()));
     let mut cmd = std::process::Command::new(&bin.output);
-    cmd.args(args);
-    cmd.current_dir(&dir);
+    cmd.args(&flags.args);
+    cmd.current_dir(&unit.dir);
     let status = cmd.status().with_context(|| {
         format!(
             "could not execute {} (was it built? run `rivet build` with -v for detail)",
@@ -533,16 +749,41 @@ fn cmd_run(ui: &Ui, release: bool, args: &[OsString], verbose: bool, json: bool)
     Ok(())
 }
 
-fn cmd_clean(ui: &Ui) -> Result<()> {
-    let cwd = std::env::current_dir().context("could not read current directory")?;
-    let dir = rivet_manifest::find_manifest_dir(&cwd).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let target = dir.join("target");
-    if target.exists() {
-        std::fs::remove_dir_all(&target)
-            .with_context(|| format!("could not remove {}", target.display()))?;
-        ui.status("Removed", &format!("{}", target.display()));
-    } else {
-        ui.status("Removed", "nothing to clean (no target/ directory)");
+fn cmd_clean(ui: &Ui, package: Option<String>) -> Result<()> {
+    let root = load_scope()?;
+    // Scope packages without resolving deps (clean must not fail on
+    // registry/git deps it never touches).
+    let mut manifests = vec![root];
+    if manifests[0].workspace.is_some() {
+        let members = manifests[0].workspace.as_ref().unwrap().members.clone();
+        let root_dir = manifests[0].dir.clone();
+        for dir in rivet_manifest::expand_members(&root_dir, &members)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            manifests.push(rivet_manifest::load(&dir).map_err(|e| anyhow::anyhow!("{e}"))?);
+        }
+    }
+    if let Some(name) = &package {
+        manifests.retain(|m| rivet_manifest::package_name(m) == Some(name.as_str()));
+        if manifests.is_empty() {
+            bail!("package `{name}` not found in this workspace. Fix: use `-p` with an available package");
+        }
+    }
+    for manifest in &manifests {
+        let target = manifest.dir.join("target");
+        if target.exists() {
+            std::fs::remove_dir_all(&target)
+                .with_context(|| format!("could not remove {}", target.display()))?;
+            ui.status("Removed", &format!("{}", target.display()));
+        } else {
+            ui.status(
+                "Removed",
+                &format!(
+                    "nothing to clean in {} (no target/ directory)",
+                    manifest.dir.display()
+                ),
+            );
+        }
     }
     Ok(())
 }
@@ -585,7 +826,14 @@ mod tests {
     fn manifest_template_parses() {
         let text = manifest_template("hello");
         let m = rivet_manifest::parse_str(&text).unwrap();
-        assert_eq!(m.package.name, "hello");
+        assert_eq!(rivet_manifest::package_name(&m), Some("hello"));
+    }
+
+    #[test]
+    fn scope_root_stops_without_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        // No rivet.json anywhere above: scope root is the start dir itself.
+        assert_eq!(find_scope_root(dir.path()), dir.path().to_path_buf());
     }
 
     #[test]

@@ -1,8 +1,7 @@
 # PLAN.md — rivet milestone checklist
 
-Current phase: **M1** — manifest + CLI skeleton + toolchain detection.
-`rivet new hello && rivet build && rivet run` must work for single-file bin
-on Windows + Linux. Do not start M2+ until M1 acceptance passes.
+Current phase: **M3** — profiles, features, tests.
+M2 acceptance passed (see below). Do not start M4+ until M3 acceptance passes.
 
 ## M1 — Manifest + CLI skeleton + toolchain detection [DONE]
 - [x] Workspace scaffold (8 crates) + root `rivet` binary (`cargo install --path .`)
@@ -18,11 +17,12 @@ on Windows + Linux. Do not start M2+ until M1 acceptance passes.
 - [x] Gate: `cargo test --workspace`, `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`
 - [x] `examples/hello` corpus builds in CI
 
-## M2 — Build graph [NOT STARTED]
-- [ ] Multi-file, incremental, depfile tracking (`-MMD/-MF`, `/showIncludes`)
-- [ ] Content-hash rebuilds, parallel scheduler (jobs=cores), fail-fast optional
-- [ ] lib + bin targets, workspaces, path deps
-- [ ] Test: touching one header rebuilds only dependents
+## M2 — Build graph [DONE]
+- [x] Multi-file, incremental, depfile tracking (`-MMD/-MF`, `/showIncludes` + `VSLANG=1033`)
+- [x] Content-hash rebuilds (always-hash, SHA-256), parallel scheduler (jobs=cores, `-j`, `--keep-going`)
+- [x] lib + bin targets (static + header-only; shared → M7 error), workspaces, path deps (topo order, dedupe, cycle errors)
+- [x] Test: touching one header rebuilds only dependents (`header_touch_rebuilds_only_dependents` + mtime-only touch stays `Fresh`)
+- [x] Gate green + `examples/{hello,libhello,workspace}` corpus builds in CI
 
 ## M3 — Profiles, features, tests [NOT STARTED]
 - [ ] `rivet test` discovers+runs `tests/`, reports pass/fail + exit codes

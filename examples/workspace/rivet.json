@@ -1,0 +1,6 @@
+{
+  "$schema": "https://rivet.dev/schema/rivet.json",
+  "workspace": {
+    "members": ["crates/*"]
+  }
+}

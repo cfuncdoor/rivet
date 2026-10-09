@@ -60,6 +60,12 @@ impl Error {
             column,
         }
     }
+
+    /// A semantic (multi-file) error that has a JSON path but no precise
+    /// source span. Points at 1:1 with the path attached.
+    pub fn path_error(path: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::parse(path, message, 1, 1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -229,8 +235,10 @@ pub struct Manifest {
     /// JSON Schema reference (optional, but `rivet new` always emits it).
     #[serde(rename = "$schema", default)]
     pub schema: Option<String>,
-    /// Package metadata (required).
-    pub package: Package,
+    /// Package metadata (required, unless this is a virtual workspace root
+    /// that only carries `workspace` + `patch`).
+    #[serde(default)]
+    pub package: Option<Package>,
     /// Runtime dependencies (optional).
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
@@ -528,28 +536,10 @@ fn guess_path(msg: &str) -> String {
     "$".to_string()
 }
 
-fn validate_value(value: &serde_json::Value, stripped: &str) -> Result<(), Error> {
-    let loc = |path: &str| locate_key(stripped, path);
-    let err = |path: &str, message: String| {
-        let (line, column) = loc(path);
-        Error::parse(path, message, line, column)
-    };
-
-    let obj = value.as_object().ok_or_else(|| {
-        err(
-            "$",
-            "manifest must be a JSON object `{ ... }`. Hint: run `rivet init` to regenerate"
-                .to_string(),
-        )
-    })?;
-
-    // package (required object with name+version).
-    let pkg = obj.get("package").ok_or_else(|| {
-        err(
-            "package",
-            "missing `package` table. Hint: add `\"package\": { \"name\": \"...\", \"version\": \"0.1.0\" }`".to_string(),
-        )
-    })?;
+fn validate_package_table(
+    pkg: &serde_json::Value,
+    err: &impl Fn(&str, String) -> Error,
+) -> Result<(), Error> {
     let pkg_obj = pkg.as_object().ok_or_else(|| {
         err("package", "package must be an object. Hint: `\"package\": { \"name\": \"...\", \"version\": \"0.1.0\" }`".to_string())
     })?;
@@ -600,6 +590,54 @@ fn validate_value(value: &serde_json::Value, stripped: &str) -> Result<(), Error
             "package.standard",
             "standard must be a string. Hint: use e.g. `\"standard\": \"c++20\"`".to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_value(value: &serde_json::Value, stripped: &str) -> Result<(), Error> {
+    let loc = |path: &str| locate_key(stripped, path);
+    let err = |path: &str, message: String| {
+        let (line, column) = loc(path);
+        Error::parse(path, message, line, column)
+    };
+
+    let obj = value.as_object().ok_or_else(|| {
+        err(
+            "$",
+            "manifest must be a JSON object `{ ... }`. Hint: run `rivet init` to regenerate"
+                .to_string(),
+        )
+    })?;
+
+    // package (required, unless this is a virtual workspace root).
+    let has_workspace = obj.get("workspace").and_then(|v| v.as_object()).is_some();
+    let pkg = match obj.get("package") {
+        Some(p) => Some(p),
+        None if has_workspace => None,
+        None => {
+            return Err(err(
+                "package",
+                "missing `package` table. Hint: add `\"package\": { \"name\": \"...\", \"version\": \"0.1.0\" }`".to_string(),
+            ));
+        }
+    };
+    // A virtual workspace root carries no targets of its own.
+    if pkg.is_none() {
+        if obj.get("bin").is_some() {
+            return Err(err(
+                "bin",
+                "virtual workspace manifest (no `package`) must not define `bin`. Hint: move targets into member packages".to_string(),
+            ));
+        }
+        if obj.get("lib").is_some() {
+            return Err(err(
+                "lib",
+                "virtual workspace manifest (no `package`) must not define `lib`. Hint: move targets into member packages".to_string(),
+            ));
+        }
+    }
+    if let Some(pkg) = pkg {
+        validate_package_table(pkg, &err)?;
     }
 
     // dependencies (string or object; git ref exclusivity).
@@ -801,21 +839,532 @@ fn check_semver(version: &str) -> Result<(), String> {
 // Target discovery (zero-config conventions)
 // ---------------------------------------------------------------------------
 
+/// `true` when this manifest is a virtual workspace root (no `package`).
+pub fn is_virtual(manifest: &Manifest) -> bool {
+    manifest.package.is_none()
+}
+
+/// Package name, if present.
+pub fn package_name(manifest: &Manifest) -> Option<&str> {
+    manifest.package.as_ref().map(|p| p.name.as_str())
+}
+
+/// Package version, if present.
+pub fn package_version(manifest: &Manifest) -> Option<&str> {
+    manifest.package.as_ref().map(|p| p.version.as_str())
+}
+
 /// Resolve effective binary targets: explicit `bin` entries, else the
 /// `src/main.cpp` convention (if the file exists).
+///
+/// Kept for API compatibility; new code prefers [`resolve_bins`] +
+/// [`bin_full_sources`], which also partition helper sources.
 pub fn effective_bins(manifest: &Manifest) -> Vec<BinTarget> {
     if !manifest.bin.is_empty() {
         return manifest.bin.clone();
     }
     let candidate = manifest.dir.join("src").join("main.cpp");
     if candidate.is_file() {
-        vec![BinTarget {
-            name: manifest.package.name.clone(),
-            path: "src/main.cpp".to_string(),
-        }]
-    } else {
-        Vec::new()
+        if let Some(pkg) = &manifest.package {
+            return vec![BinTarget {
+                name: pkg.name.clone(),
+                path: "src/main.cpp".to_string(),
+            }];
+        }
     }
+    Vec::new()
+}
+
+/// `true` for C++ source extensions (`cpp cc cxx C`).
+pub fn is_cpp_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x, "cpp" | "cc" | "cxx" | "C"))
+}
+
+/// `true` for C/C++ header extensions.
+pub fn is_header(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x, "h" | "hpp" | "hxx" | "hh" | "H" | "tpp" | "ipp"))
+}
+
+/// All C++ sources under `<pkg>/src`, sorted, absolute.
+pub fn all_src_cpps(pkg_dir: &Path) -> Vec<PathBuf> {
+    let src = pkg_dir.join("src");
+    if !src.is_dir() {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = walkdir::WalkDir::new(&src)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| is_cpp_source(p))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Collect source files for an entry path: a file → itself; a directory →
+/// all C++ sources under it (recursive). Returns `None` when the entry does
+/// not exist or a directory holds no C++ sources.
+pub fn collect_sources(entry: &Path) -> Option<Vec<PathBuf>> {
+    if entry.is_file() {
+        return Some(vec![entry.to_path_buf()]);
+    }
+    if entry.is_dir() {
+        let mut out: Vec<PathBuf> = walkdir::WalkDir::new(entry)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| is_cpp_source(p))
+            .collect();
+        out.sort();
+        if out.is_empty() {
+            return None;
+        }
+        return Some(out);
+    }
+    None
+}
+
+/// A binary target with its entry point resolved to an absolute path.
+#[derive(Debug, Clone)]
+pub struct ResolvedBin {
+    /// Binary name.
+    pub name: String,
+    /// Absolute entry path (file or directory, as written in `bin.path`).
+    pub entry: PathBuf,
+    /// `true` when the entry is a directory (M1 whole-directory semantics).
+    pub is_dir: bool,
+}
+
+/// Resolve binary targets: explicit `bin` entries, else the `src/main.cpp`
+/// convention. Returns an empty vec when the package has no bins.
+pub fn resolve_bins(manifest: &Manifest) -> Vec<ResolvedBin> {
+    if !manifest.bin.is_empty() {
+        return manifest
+            .bin
+            .iter()
+            .map(|b| {
+                let entry = manifest.dir.join(&b.path);
+                let is_dir = entry.is_dir();
+                ResolvedBin {
+                    name: b.name.clone(),
+                    entry,
+                    is_dir,
+                }
+            })
+            .collect();
+    }
+    let candidate = manifest.dir.join("src").join("main.cpp");
+    if candidate.is_file() {
+        if let Some(pkg) = &manifest.package {
+            return vec![ResolvedBin {
+                name: pkg.name.clone(),
+                entry: candidate,
+                is_dir: false,
+            }];
+        }
+    }
+    Vec::new()
+}
+
+/// A library target with sources resolved to absolute paths.
+#[derive(Debug, Clone)]
+pub struct ResolvedLib {
+    /// Library name (explicit `lib.name`, else the package name).
+    pub name: String,
+    /// `static` | `shared` | `header-only` (as written; `shared` is rejected
+    /// at build time until M7).
+    pub lib_type: String,
+    /// Absolute root sources (empty for header-only).
+    pub roots: Vec<PathBuf>,
+    /// Public include dir, when `<pkg>/include` exists.
+    pub include_dir: Option<PathBuf>,
+}
+
+/// `true` when the resolved lib carries compiled sources.
+pub fn lib_has_sources(lib: &ResolvedLib) -> bool {
+    !lib.roots.is_empty()
+}
+
+/// Resolve the library target.
+///
+/// Precedence: explicit `lib` first; then `src/lib.cpp`; then — only when
+/// the package has no bins — a static lib from leftover `src/` sources, or
+/// a header-only lib from `include/` headers. A package WITH bins and an
+/// `include/` dir is a bin package (headers belong to its helpers), not a
+/// header-only lib: otherwise every multi-file bin would lose its helpers.
+/// Returns `Ok(None)` when the package has no lib.
+pub fn resolve_lib(manifest: &Manifest) -> Result<Option<ResolvedLib>, Error> {
+    let include_dir = {
+        let inc = manifest.dir.join("include");
+        inc.is_dir().then_some(inc)
+    };
+    let package_name = manifest.package.as_ref().map(|p| p.name.clone());
+    if let Some(lib) = &manifest.lib {
+        let name = lib.name.clone().or(package_name).ok_or_else(|| {
+            Error::path_error(
+                "lib.name",
+                "virtual manifest `lib` needs an explicit `name`. Hint: add `\"name\": \"...\"`",
+            )
+        })?;
+        if let Some(path) = &lib.path {
+            let entry = manifest.dir.join(path);
+            let roots = collect_sources(&entry).ok_or_else(|| {
+                Error::path_error(
+                    "lib.path",
+                    format!(
+                        "lib source not found: {}. Fix: create it or fix `lib.path` in rivet.json",
+                        entry.display()
+                    ),
+                )
+            })?;
+            return Ok(Some(ResolvedLib {
+                name,
+                lib_type: lib.lib_type.clone(),
+                roots,
+                include_dir,
+            }));
+        }
+        // No explicit path: `src/lib.cpp` convention, else header-only rules.
+        let candidate = manifest.dir.join("src").join("lib.cpp");
+        if candidate.is_file() {
+            return Ok(Some(ResolvedLib {
+                name,
+                lib_type: lib.lib_type.clone(),
+                roots: vec![candidate],
+                include_dir,
+            }));
+        }
+        if lib.lib_type == "header-only" {
+            return Ok(Some(ResolvedLib {
+                name,
+                lib_type: lib.lib_type.clone(),
+                roots: Vec::new(),
+                include_dir,
+            }));
+        }
+        if lib.lib_type == "shared" || lib.lib_type == "static" {
+            return Err(Error::path_error(
+                "lib.path",
+                "lib has no sources: src/lib.cpp is missing. Fix: create src/lib.cpp or set `lib.path`".to_string(),
+            ));
+        }
+        // Unreachable: `lib.type` is validated at parse time.
+        return Err(Error::path_error(
+            "lib.type",
+            "unknown lib type. Hint: use static, shared, or header-only".to_string(),
+        ));
+    }
+    // Convention: `src/lib.cpp` → static lib. Without bins, leftover
+    // `src/` sources form a static lib, else `include/` headers form a
+    // header-only lib. With bins, there is no lib (see doc comment).
+    let candidate = manifest.dir.join("src").join("lib.cpp");
+    if candidate.is_file() {
+        if let Some(name) = package_name {
+            return Ok(Some(ResolvedLib {
+                name,
+                lib_type: "static".to_string(),
+                roots: vec![candidate],
+                include_dir,
+            }));
+        }
+    }
+    if resolve_bins(manifest).is_empty() {
+        let srcs = all_src_cpps(&manifest.dir);
+        if !srcs.is_empty() {
+            if let Some(name) = package_name {
+                return Ok(Some(ResolvedLib {
+                    name,
+                    lib_type: "static".to_string(),
+                    roots: srcs,
+                    include_dir,
+                }));
+            }
+        }
+        if let Some(inc) = include_dir {
+            if has_headers(&inc) {
+                if let Some(name) = package_name {
+                    return Ok(Some(ResolvedLib {
+                        name,
+                        lib_type: "header-only".to_string(),
+                        roots: Vec::new(),
+                        include_dir: Some(inc),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `true` when `dir` (recursively) holds C/C++ headers.
+fn has_headers(dir: &Path) -> bool {
+    walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.path().to_path_buf())
+        .any(|p| is_header(&p))
+}
+
+/// Full source list for a binary target (D17).
+///
+/// Directory entries keep M1 whole-directory semantics. File entries compile
+/// the entry plus every helper (`src/**/*.cpp` minus all target roots) when
+/// the package has no lib; with a lib, the bin is just its entry file and
+/// links the archive instead.
+pub fn bin_full_sources(
+    manifest: &Manifest,
+    bin: &ResolvedBin,
+    lib: &Option<ResolvedLib>,
+) -> Result<Vec<PathBuf>, Error> {
+    if bin.is_dir {
+        return collect_sources(&bin.entry).ok_or_else(|| {
+            Error::path_error(
+                format!("bin.{}", bin.name),
+                format!(
+                    "bin source not found: {}. Fix: create it or fix the `bin` path in rivet.json",
+                    bin.entry.display()
+                ),
+            )
+        });
+    }
+    if !bin.entry.is_file() {
+        return Err(Error::path_error(
+            format!("bin.{}", bin.name),
+            format!(
+                "bin source not found: {}. Fix: create it or fix the `bin` path in rivet.json",
+                bin.entry.display()
+            ),
+        ));
+    }
+    if let Some(lib) = lib {
+        if lib.roots.iter().any(|r| r == &bin.entry) {
+            return Err(Error::path_error(
+                format!("bin.{}", bin.name),
+                format!(
+                    "bin entry {} is also a lib source. Fix: use a separate entry file (e.g. src/main.cpp) and keep lib sources in src/lib.cpp + helpers",
+                    bin.entry.display()
+                ),
+            ));
+        }
+        // The lib owns the helpers; the bin links its archive.
+        return Ok(vec![bin.entry.clone()]);
+    }
+    // No lib: multi-file bin — entry plus all helpers.
+    let mut bin_roots: Vec<PathBuf> = resolve_bins(manifest)
+        .into_iter()
+        .filter(|b| !b.is_dir)
+        .map(|b| b.entry)
+        .collect();
+    bin_roots.push(manifest.dir.join("src").join("lib.cpp"));
+    let mut sources = vec![bin.entry.clone()];
+    for cpp in all_src_cpps(&manifest.dir) {
+        if cpp != bin.entry && !bin_roots.contains(&cpp) {
+            sources.push(cpp);
+        }
+    }
+    sources.sort();
+    Ok(sources)
+}
+
+/// Full source list for a library target: roots plus helpers
+/// (`src/**/*.cpp` minus all bin entry files).
+pub fn lib_full_sources(manifest: &Manifest, lib: &ResolvedLib) -> Vec<PathBuf> {
+    if !lib_has_sources(lib) {
+        return Vec::new();
+    }
+    let bin_roots: Vec<PathBuf> = resolve_bins(manifest)
+        .into_iter()
+        .filter(|b| !b.is_dir)
+        .map(|b| b.entry)
+        .collect();
+    let mut sources = lib.roots.clone();
+    for cpp in all_src_cpps(&manifest.dir) {
+        if !bin_roots.contains(&cpp) && !sources.contains(&cpp) {
+            sources.push(cpp);
+        }
+    }
+    sources.sort();
+    sources
+}
+
+impl Dependency {
+    /// The local path of a `{"path": ...}` dependency, if any.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::Detailed(d) => d.path.as_deref(),
+            Self::Simple(_) => None,
+        }
+    }
+
+    /// `true` for registry (`Simple("11")` / `{"version": ...}`) entries.
+    pub fn is_registry(&self) -> bool {
+        match self {
+            Self::Simple(_) => true,
+            Self::Detailed(d) => d.version.is_some() && d.path.is_none() && d.git.is_none(),
+        }
+    }
+
+    /// `true` for git (`{"git": ...}`) entries.
+    pub fn is_git(&self) -> bool {
+        match self {
+            Self::Detailed(d) => d.git.is_some(),
+            Self::Simple(_) => false,
+        }
+    }
+}
+
+/// `(name, absolute dir)` for every `dependencies` entry with a `path`.
+/// Only `dependencies` are built in M2 (`devDependencies` arrive with
+/// `rivet test` in M3, `buildDependencies` with build scripts in M7).
+pub fn path_dependencies(manifest: &Manifest) -> Vec<(String, PathBuf)> {
+    manifest
+        .dependencies
+        .iter()
+        .filter_map(|(name, dep)| dep.path().map(|p| (name.clone(), manifest.dir.join(p))))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Workspace member expansion (hand-rolled globs, no new deps — D21)
+// ---------------------------------------------------------------------------
+
+/// Match `name` against a single path-segment pattern (`*` = any run,
+/// `?` = one char).
+fn match_segment(pattern: &str, name: &str) -> bool {
+    let (px, nx) = (pattern.as_bytes(), name.as_bytes());
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    let (mut i, mut j) = (0usize, 0usize);
+    while j < nx.len() {
+        if i < px.len() && (px[i] == b'?' || px[i] == nx[j]) {
+            i += 1;
+            j += 1;
+        } else if i < px.len() && px[i] == b'*' {
+            star = Some(i);
+            mark = j;
+            i += 1;
+        } else if let Some(s) = star {
+            i = s + 1;
+            mark += 1;
+            j = mark;
+        } else {
+            return false;
+        }
+    }
+    while i < px.len() && px[i] == b'*' {
+        i += 1;
+    }
+    i == px.len()
+}
+
+/// Match a `/`-separated relative path against a glob pattern with segments
+/// of literals/`*`/`?`, plus `**` (any number of segments, including zero).
+pub fn match_glob(pattern: &str, rel: &str) -> bool {
+    fn rec(pats: &[&str], segs: &[&str]) -> bool {
+        if pats.is_empty() {
+            return segs.is_empty();
+        }
+        if pats[0] == "**" {
+            return (0..=segs.len()).any(|k| rec(&pats[1..], &segs[k..]));
+        }
+        if segs.is_empty() {
+            return false;
+        }
+        match_segment(pats[0], segs[0]) && rec(&pats[1..], &segs[1..])
+    }
+    let pats: Vec<&str> = pattern.split('/').collect();
+    let segs: Vec<&str> = rel.split('/').collect();
+    rec(&pats, &segs)
+}
+
+/// Expand workspace member globs to sorted, deduped absolute package dirs.
+///
+/// Every match must be a directory containing `rivet.json`; a pattern with
+/// zero matches is an error (usually a typo).
+pub fn expand_members(root: &Path, members: &[String]) -> Result<Vec<PathBuf>, Error> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for pattern in members {
+        if pattern.is_empty() {
+            return Err(Error::path_error(
+                "workspace.members",
+                "workspace member pattern must not be empty".to_string(),
+            ));
+        }
+        let has_magic = pattern.contains('*') || pattern.contains('?');
+        if !has_magic {
+            let dir = root.join(pattern);
+            if !dir.is_dir() {
+                return Err(Error::path_error(
+                    "workspace.members",
+                    format!(
+                        "workspace member `{pattern}` not found under {}. Fix: create it or fix `workspace.members`",
+                        root.display()
+                    ),
+                ));
+            }
+            if !dir.join("rivet.json").is_file() {
+                return Err(Error::path_error(
+                    "workspace.members",
+                    format!(
+                        "workspace member `{pattern}` has no rivet.json. Fix: run `rivet init` in {}",
+                        dir.display()
+                    ),
+                ));
+            }
+            out.push(dir);
+            continue;
+        }
+        let mut hits: Vec<PathBuf> = walkdir::WalkDir::new(root)
+            .follow_links(false)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir())
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| {
+                p.strip_prefix(root)
+                    .ok()
+                    .and_then(|rel| rel.to_str())
+                    .map(|rel| match_glob(pattern, &rel.replace('\\', "/")))
+                    .unwrap_or(false)
+            })
+            .collect();
+        hits.sort();
+        if hits.is_empty() {
+            return Err(Error::path_error(
+                "workspace.members",
+                format!(
+                    "workspace pattern `{pattern}` matched nothing under {}. Fix: check `workspace.members`",
+                    root.display()
+                ),
+            ));
+        }
+        for dir in hits {
+            if !dir.join("rivet.json").is_file() {
+                return Err(Error::path_error(
+                    "workspace.members",
+                    format!(
+                        "workspace member `{}` has no rivet.json. Fix: run `rivet init` in {}",
+                        dir.strip_prefix(root).unwrap_or(&dir).display(),
+                        dir.display()
+                    ),
+                ));
+            }
+            out.push(dir);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Default C++ standard when `package.standard` is absent.
@@ -823,12 +1372,12 @@ pub fn default_standard() -> &'static str {
     "c++17"
 }
 
-/// Effective C++ standard for a manifest.
+/// Effective C++ standard for a manifest (virtual roots use the default).
 pub fn effective_standard(manifest: &Manifest) -> &str {
     manifest
         .package
-        .standard
-        .as_deref()
+        .as_ref()
+        .and_then(|p| p.standard.as_deref())
         .unwrap_or(default_standard())
 }
 
@@ -884,8 +1433,11 @@ mod tests {
           "lib": { "type": "static" },
         }"#;
         let m = parse_str(src).unwrap();
-        assert_eq!(m.package.name, "myapp");
-        assert_eq!(m.package.standard.as_deref(), Some("c++20"));
+        assert_eq!(m.package.as_ref().unwrap().name, "myapp");
+        assert_eq!(
+            m.package.as_ref().unwrap().standard.as_deref(),
+            Some("c++20")
+        );
         assert_eq!(m.dependencies.len(), 3);
         assert_eq!(m.bin.len(), 1);
     }
@@ -932,5 +1484,228 @@ mod tests {
         let src = "{\n\"package\": {\n";
         let err = parse_str(src).unwrap_err().to_string();
         assert!(err.contains("at "), "got: {err}");
+    }
+
+    fn pkg_in(dir: &Path, json: &str) -> Manifest {
+        std::fs::write(dir.join("rivet.json"), json).unwrap();
+        let mut m = parse_str(json).unwrap();
+        m.dir = dir.to_path_buf();
+        m
+    }
+
+    #[test]
+    fn virtual_manifest_parses_without_package() {
+        let m = parse_str("{\"workspace\": {\"members\": [\"crates/*\"]}}").unwrap();
+        assert!(is_virtual(&m));
+        assert_eq!(package_name(&m), None);
+        assert_eq!(effective_standard(&m), "c++17");
+    }
+
+    #[test]
+    fn virtual_manifest_rejects_own_targets() {
+        let err = parse_str(
+            "{\"workspace\": {\"members\": []}, \"bin\": [{\"name\": \"a\", \"path\": \"x\"}]}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("virtual"), "got: {err}");
+    }
+
+    #[test]
+    fn lib_convention_from_src_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.cpp"), "").unwrap();
+        std::fs::write(dir.path().join("src/util.cpp"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"mylib\",\"version\":\"0.1.0\"}}",
+        );
+        let lib = resolve_lib(&m).unwrap().unwrap();
+        assert_eq!(lib.name, "mylib");
+        assert_eq!(lib.lib_type, "static");
+        // Helpers belong to the lib.
+        let sources = lib_full_sources(&m, &lib);
+        assert_eq!(sources.len(), 2, "got: {sources:?}");
+    }
+
+    #[test]
+    fn header_only_convention_from_include() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("include").join("my")).unwrap();
+        std::fs::write(dir.path().join("include").join("my").join("a.h"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"hdr\",\"version\":\"0.1.0\"}}",
+        );
+        let lib = resolve_lib(&m).unwrap().unwrap();
+        assert_eq!(lib.lib_type, "header-only");
+        assert!(lib.roots.is_empty());
+        assert!(lib.include_dir.is_some());
+    }
+
+    #[test]
+    fn bins_win_over_include_headers() {
+        // A bin package with headers in include/ is NOT a header-only lib:
+        // the helpers belong to the bin.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::create_dir_all(dir.path().join("include")).unwrap();
+        std::fs::write(dir.path().join("src/main.cpp"), "").unwrap();
+        std::fs::write(dir.path().join("src/util.cpp"), "").unwrap();
+        std::fs::write(dir.path().join("include/util.h"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        assert!(resolve_lib(&m).unwrap().is_none());
+        let bins = resolve_bins(&m);
+        let sources = bin_full_sources(&m, &bins[0], &None).unwrap();
+        assert_eq!(sources.len(), 2, "got: {sources:?}");
+    }
+
+    #[test]
+    fn leftover_sources_form_lib_without_bins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/util.cpp"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        let lib = resolve_lib(&m).unwrap().unwrap();
+        assert_eq!(lib.lib_type, "static");
+        assert_eq!(lib.roots.len(), 1);
+    }
+
+    #[test]
+    fn no_lib_without_sources_or_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.cpp"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        assert!(resolve_lib(&m).unwrap().is_none());
+    }
+
+    #[test]
+    fn bin_gets_helpers_without_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for f in ["main.cpp", "util.cpp", "extra.cc"] {
+            std::fs::write(dir.path().join("src").join(f), "").unwrap();
+        }
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        let bins = resolve_bins(&m);
+        assert_eq!(bins.len(), 1);
+        let sources = bin_full_sources(&m, &bins[0], &None).unwrap();
+        assert_eq!(sources.len(), 3, "got: {sources:?}");
+    }
+
+    #[test]
+    fn bin_is_entry_only_with_lib() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for f in ["main.cpp", "lib.cpp", "util.cpp"] {
+            std::fs::write(dir.path().join("src").join(f), "").unwrap();
+        }
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        let lib = resolve_lib(&m).unwrap();
+        assert!(lib.is_some());
+        let bins = resolve_bins(&m);
+        let sources = bin_full_sources(&m, &bins[0], &lib).unwrap();
+        assert_eq!(sources.len(), 1, "got: {sources:?}");
+    }
+
+    #[test]
+    fn bin_lib_overlap_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.cpp"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"bin\":[{\"name\":\"a\",\"path\":\"src/lib.cpp\"}]}",
+        );
+        let lib = resolve_lib(&m).unwrap();
+        let bins = resolve_bins(&m);
+        let err = bin_full_sources(&m, &bins[0], &lib)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("also a lib source"), "got: {err}");
+    }
+
+    #[test]
+    fn glob_segments() {
+        assert!(match_glob("crates/*", "crates/foo"));
+        assert!(!match_glob("crates/*", "crates/foo/bar"));
+        assert!(match_glob("crates/**", "crates/foo/bar"));
+        assert!(match_glob("**", "a/b/c"));
+        assert!(match_glob("src/?ain.cpp", "src/main.cpp"));
+        assert!(!match_glob("src/*.cpp", "src/main.h"));
+        assert!(match_glob("exact", "exact"));
+    }
+
+    #[test]
+    fn member_expansion_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        for member in ["crates/app", "crates/lib"] {
+            let d = dir.path().join(member);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("rivet.json"),
+                "{\"package\":{\"name\":\"x\",\"version\":\"0.1.0\"}}",
+            )
+            .unwrap();
+        }
+        let got = expand_members(dir.path(), &[String::from("crates/*")]).unwrap();
+        assert_eq!(got.len(), 2, "got: {got:?}");
+        // Unmatched pattern is an error.
+        let err = expand_members(dir.path(), &[String::from("nope/*")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matched nothing"), "got: {err}");
+        // Member without rivet.json is an error.
+        std::fs::create_dir_all(dir.path().join("crates/bare")).unwrap();
+        let err = expand_members(dir.path(), &[String::from("crates/*")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no rivet.json"), "got: {err}");
+    }
+
+    #[test]
+    fn path_deps_listed() {
+        let m = parse_str(
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"dependencies\":{\"mylib\":{\"path\":\"../mylib\"},\"fmt\":\"11\"}}",
+        )
+        .unwrap();
+        let deps = path_dependencies(&m);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].0, "mylib");
+    }
+
+    #[test]
+    fn explicit_dir_bin_entry_collects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("tools").join("sub")).unwrap();
+        std::fs::write(dir.path().join("tools").join("t.cpp"), "").unwrap();
+        std::fs::write(dir.path().join("tools").join("sub").join("u.cxx"), "").unwrap();
+        std::fs::write(dir.path().join("tools").join("skip.txt"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"bin\":[{\"name\":\"tool\",\"path\":\"tools\"}]}",
+        );
+        let bins = resolve_bins(&m);
+        assert_eq!(bins.len(), 1);
+        assert!(bins[0].is_dir);
+        let sources = bin_full_sources(&m, &bins[0], &None).unwrap();
+        assert_eq!(sources.len(), 2, "got: {sources:?}");
     }
 }

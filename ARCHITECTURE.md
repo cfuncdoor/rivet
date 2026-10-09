@@ -10,9 +10,11 @@ Tool itself is Rust (stable, edition 2021+), built with Cargo.
 - `crates/rivet-git` — git dep subsystem: shell-out to system `git` only (M4+; stub in M1).
 - `crates/rivet-toolchain` — detect MSVC (vswhere / vcvars env capture), clang, gcc,
   clang-cl, MinGW; archiver; linker. One flag-normalization abstraction.
-- `crates/rivet-graph` — build graph of compile/link/archive steps, depfiles,
-  content-hash incremental rebuilds, parallel scheduler (minimal in M1, full in M2).
-- `crates/rivet-cache` — global cache in `~/.rivet` (stub in M1).
+- `crates/rivet-graph` — build graph: per-TU compile/link/archive steps,
+  depfiles, SHA-256 content-hash incremental rebuilds, parallel scheduler,
+  workspaces + path deps with topological order (full since M2).
+- `crates/rivet-cache` — global cache in `~/.rivet` (root helper done in M1;
+  artifact cache in M7).
 - `crates/rivet-registry` — index format, fetch, checksum verify (M5+; stub in M1).
 - `crates/rivet-cli` — arg parsing (clap), colored Cargo-like output, progress,
   `--message-format=json`, `-v`. All user-facing commands live here.
@@ -22,15 +24,26 @@ Tool itself is Rust (stable, edition 2021+), built with Cargo.
 Keep crates independently testable. Typed + documented public APIs.
 `thiserror` in libraries, `anyhow` only in `rivet-cli`.
 
-## Build flow (M1)
+## Build flow (M2)
 
 ```text
 rivet new hello        → rivet-cli::new (scaffold rivet.json + src/main.cpp)
-rivet build            → manifest::load (JSONC) → discover targets (conventions)
-                       → toolchain::detect → graph::build (compile+link)
-                       → target/<profile>/hello(.exe)
-rivet run              → build + exec binary, passthrough stdout/exit code
+rivet build            → scope: nearest manifest, walk up to workspace root
+                       → workspace::resolve_units (members + -p, path-dep BFS,
+                          topo sort; registry/git → milestone errors)
+                       → per unit in order: plan_with (bin/lib partition, D17)
+                          → is_fresh_unit? Fresh : Compiling + build_unit
+                            (parallel compiles w/ depfiles → archive → link,
+                             state recorded in incremental/rivet-state.json)
+                       → Finished dev in 2.3s
+rivet run [-p pkg] [--bin name] [-- args] → build scope + exec one binary
 ```
+
+Per-package state (`target/debug|release/`): `build/<tag>/*.o[bj]` objects,
+`build/*.a|.lib` archives, `deps/<tag>/*.d` GCC depfiles,
+`incremental/rivet-state.json` (fingerprint + source/dep SHA-256 + link
+digests), `<bin>[.exe]` outputs. Stale = missing object, fingerprint change,
+source hash change, or any recorded header hash change (always-hash, D15).
 
 Conventions (zero config): `src/main.cpp` → bin, `src/lib.cpp` or `include/` → lib,
 `tests/*.cpp` → tests, `examples/`, `benches/`. Public `include/`, private `src/`.

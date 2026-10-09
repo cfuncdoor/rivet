@@ -85,11 +85,41 @@ pub struct CxxToolchain {
     /// `LIBPATH`, `PATH`, SDK vars). `None` for non-MSVC toolchains or when
     /// the inherited environment already works (dev prompt).
     pub msvc_env: Option<Vec<(OsString, OsString)>>,
+    /// Path to the static archiver (`lib.exe`, `ar`, `llvm-lib`), when one
+    /// was found. `None` means archiving fails with an actionable error.
+    pub ar: Option<PathBuf>,
     /// How this toolchain was found (for `-v` logging).
     pub found_via: String,
 }
 
+/// How header dependencies are tracked for a toolchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DepStyle {
+    /// `-MMD -MF <depfile>`: the compiler writes a Makefile-style depfile.
+    GccDepfile,
+    /// `/showIncludes`: includes are parsed from captured stdout.
+    MsvcShowIncludes,
+}
+
 impl CxxToolchain {
+    /// Assemble a detected toolchain, probing for its static archiver.
+    fn with_archiver(
+        kind: ToolchainKind,
+        cxx: PathBuf,
+        version: String,
+        msvc_env: Option<Vec<(OsString, OsString)>>,
+        found_via: String,
+    ) -> Self {
+        let ar = detect_archiver(kind, &cxx);
+        Self {
+            kind,
+            cxx,
+            version,
+            msvc_env,
+            ar,
+            found_via,
+        }
+    }
     /// `true` for `cl.exe`-style drivers (MSVC and clang-cl).
     pub fn is_msvc_like(&self) -> bool {
         matches!(self.kind, ToolchainKind::Msvc | ToolchainKind::ClangCl)
@@ -105,10 +135,18 @@ impl CxxToolchain {
     }
 
     /// Content fingerprint: ABI/compiler/std/stdlib inputs that must
-    /// invalidate the build cache (full use in M2/M7; computed from M1).
+    /// invalidate the build cache. Covers kind, version, std, opt, debug,
+    /// defines, and include dirs (in order — order is semantics for `-I`).
     pub fn fingerprint(&self, opts: &CompileOptions) -> String {
+        let defines = opts.defines.join(";");
+        let includes = opts
+            .include_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(";");
         format!(
-            "{}|{}|std={}|opt={}|debug={}",
+            "{}|{}|std={}|opt={}|debug={}|defines={defines}|includes={includes}",
             self.kind,
             self.version.trim(),
             opts.std,
@@ -117,14 +155,35 @@ impl CxxToolchain {
         )
     }
 
-    /// Flags for a compile-only step (`source` → `object`).
-    pub fn compile_only_args(
-        &self,
-        source: &Path,
-        object: &Path,
-        opts: &CompileOptions,
-    ) -> Vec<OsString> {
-        let mut args: Vec<OsString> = Vec::new();
+    /// Header-tracking style for this toolchain.
+    pub fn dep_style(&self) -> DepStyle {
+        if self.is_msvc_like() {
+            DepStyle::MsvcShowIncludes
+        } else {
+            DepStyle::GccDepfile
+        }
+    }
+
+    /// Object file extension without the dot (`obj` or `o`).
+    pub fn obj_extension(&self) -> &'static str {
+        if self.is_msvc_like() {
+            "obj"
+        } else {
+            "o"
+        }
+    }
+
+    /// Static archive file name for a library (`hello.lib` / `libhello.a`).
+    pub fn staticlib_filename(&self, name: &str) -> String {
+        if self.is_msvc_like() {
+            format!("{name}.lib")
+        } else {
+            format!("lib{name}.a")
+        }
+    }
+
+    /// Shared flag core for a compile-only step (no dep tracking, no env).
+    fn push_common_args(&self, args: &mut Vec<OsString>, opts: &CompileOptions) {
         if self.is_msvc_like() {
             args.push(OsString::from("/nologo"));
             args.push(OsString::from("/EHsc"));
@@ -145,11 +204,6 @@ impl CxxToolchain {
                 s.push(inc);
                 args.push(s);
             }
-            args.push(OsString::from("/c"));
-            args.push(source.as_os_str().to_os_string());
-            let mut fo = OsString::from("/Fo");
-            fo.push(object);
-            args.push(fo);
         } else {
             args.push(OsString::from(format!("-std={}", opts.std)));
             args.push(OsString::from(format!("-O{}", opts.opt.min(3))));
@@ -164,6 +218,25 @@ impl CxxToolchain {
                 s.push(inc);
                 args.push(s);
             }
+        }
+    }
+
+    /// Flags for a compile-only step (`source` → `object`).
+    pub fn compile_only_args(
+        &self,
+        source: &Path,
+        object: &Path,
+        opts: &CompileOptions,
+    ) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        self.push_common_args(&mut args, opts);
+        if self.is_msvc_like() {
+            args.push(OsString::from("/c"));
+            args.push(source.as_os_str().to_os_string());
+            let mut fo = OsString::from("/Fo");
+            fo.push(object);
+            args.push(fo);
+        } else {
             args.push(OsString::from("-c"));
             args.push(source.as_os_str().to_os_string());
             args.push(OsString::from("-o"));
@@ -172,87 +245,95 @@ impl CxxToolchain {
         args
     }
 
-    /// Build a `Command` that compiles + links `sources` into `output`.
-    /// (M1 single-step; M2 splits per-TU compile + link with depfiles.)
-    pub fn build_exe_command(
+    /// Build a per-TU compile `Command` with header tracking enabled.
+    ///
+    /// - GCC/Clang: `depfile` must be `Some` (the caller creates its parent);
+    ///   adds `-MMD -MF <depfile> -MT <object>`.
+    /// - MSVC-like: always adds `/showIncludes` (parsed from captured stdout)
+    ///   plus `/Fd` next to the object so parallel `cl` processes never share
+    ///   the default `vc*.pdb`.
+    ///
+    /// The command carries the `vcvars` overlay and `VSLANG=1033` (English
+    /// `/showIncludes` notes) where applicable. Callers must capture (not
+    /// inherit) stdout for MSVC-like toolchains.
+    pub fn compile_command(
         &self,
-        sources: &[PathBuf],
+        source: &Path,
+        object: &Path,
+        depfile: Option<&Path>,
+        opts: &CompileOptions,
+    ) -> Command {
+        let mut cmd = Command::new(&self.cxx);
+        let mut args: Vec<OsString> = Vec::new();
+        self.push_common_args(&mut args, opts);
+        if self.is_msvc_like() {
+            args.push(OsString::from("/showIncludes"));
+            args.push(OsString::from("/c"));
+            args.push(source.as_os_str().to_os_string());
+            let mut fo = OsString::from("/Fo");
+            fo.push(object);
+            args.push(fo);
+            if opts.debug {
+                let mut fd = OsString::from("/Fd");
+                fd.push(object.with_extension("pdb"));
+                args.push(fd);
+            }
+        } else {
+            if let Some(dep) = depfile {
+                args.push(OsString::from("-MMD"));
+                args.push(OsString::from("-MF"));
+                args.push(dep.as_os_str().to_os_string());
+                args.push(OsString::from("-MT"));
+                // Forward slashes keep the `-MT` label (and depfile) free of
+                // backslash-escape ambiguity on Windows.
+                args.push(OsString::from(
+                    object.display().to_string().replace('\\', "/"),
+                ));
+            }
+            args.push(OsString::from("-c"));
+            args.push(source.as_os_str().to_os_string());
+            args.push(OsString::from("-o"));
+            args.push(object.as_os_str().to_os_string());
+        }
+        cmd.args(&args);
+        self.apply_env(&mut cmd);
+        cmd
+    }
+
+    /// Build a link `Command` for `objects` + static `archives` → `output`.
+    ///
+    /// The `cl` driver doubles as the link driver on MSVC-like toolchains
+    /// (no separate `link.exe` lookup). Archives are absolute paths, so no
+    /// `/LIBPATH`/`-L` search dirs are needed.
+    pub fn link_exe_command(
+        &self,
+        objects: &[PathBuf],
+        archives: &[PathBuf],
         output: &Path,
         opts: &CompileOptions,
     ) -> Command {
         let mut cmd = Command::new(&self.cxx);
         if self.is_msvc_like() {
             cmd.arg("/nologo");
-            cmd.arg("/EHsc");
-            cmd.arg(format!("/std:{}", opts.std));
-            match opts.opt {
-                0 => {
-                    cmd.arg("/Od");
-                }
-                1 => {
-                    cmd.arg("/O1");
-                }
-                _ => {
-                    cmd.arg("/O2");
-                }
+            for o in objects {
+                cmd.arg(o);
             }
-            if opts.debug {
-                cmd.arg("/Zi");
-            }
-            for d in &opts.defines {
-                cmd.arg(format!("/D{d}"));
-            }
-            for inc in &opts.include_dirs {
-                let mut s = OsString::from("/I");
-                s.push(inc);
-                cmd.arg(s);
-            }
-            for s in sources {
-                cmd.arg(s);
-            }
-            // Keep intermediate files out of the package dir: route .obj
-            // and .pdb into the target layout (created by rivet-graph).
-            // Without /Fo//Fd, cl drops main.obj/vc140.pdb next to the CWD.
-            let stem: OsString = output
-                .file_stem()
-                .map(|s| s.to_os_string())
-                .unwrap_or_else(|| OsString::from("a"));
-            let build_dir: PathBuf = output
-                .parent()
-                .map(|p| p.join("build"))
-                .unwrap_or_else(|| PathBuf::from("build"));
-            let mut fo = OsString::from("/Fo");
-            fo.push(build_dir.join(&stem).with_extension("obj"));
-            cmd.arg(fo);
-            if opts.debug {
-                let mut fd = OsString::from("/Fd");
-                fd.push(build_dir.join(&stem).with_extension("pdb"));
-                cmd.arg(fd);
+            for a in archives {
+                cmd.arg(a);
             }
             let mut fe = OsString::from("/Fe");
             fe.push(output);
             cmd.arg(fe);
             if opts.debug {
-                // Emit PDB next to the exe; harmless if the linker ignores it.
                 cmd.arg("/link");
                 cmd.arg("/DEBUG");
             }
         } else {
-            cmd.arg(format!("-std={}", opts.std));
-            cmd.arg(format!("-O{}", opts.opt.min(3)));
-            if opts.debug {
-                cmd.arg("-g");
+            for o in objects {
+                cmd.arg(o);
             }
-            for d in &opts.defines {
-                cmd.arg(format!("-D{d}"));
-            }
-            for inc in &opts.include_dirs {
-                let mut s = OsString::from("-I");
-                s.push(inc);
-                cmd.arg(s);
-            }
-            for s in sources {
-                cmd.arg(s);
+            for a in archives {
+                cmd.arg(a);
             }
             cmd.arg("-o");
             cmd.arg(output);
@@ -261,12 +342,47 @@ impl CxxToolchain {
         cmd
     }
 
-    /// Apply the captured `vcvars` environment overlay (MSVC only).
+    /// Build an archive `Command` for `objects` → static library `output`.
+    pub fn archive_command(&self, objects: &[PathBuf], output: &Path) -> Result<Command, Error> {
+        let ar = self.ar.clone().ok_or_else(|| Error::CommandFailed {
+            what: "archive static library".to_string(),
+            message: format!(
+                "no archiver found for {} ({}). Fix: install the full toolchain (MSVC Build Tools `lib.exe`, or binutils `ar`)",
+                self.kind,
+                self.cxx.display()
+            ),
+        })?;
+        let mut cmd = Command::new(&ar);
+        if self.is_msvc_like() {
+            cmd.arg("/NOLOGO");
+            let mut out = OsString::from("/OUT:");
+            out.push(output);
+            cmd.arg(out);
+            for o in objects {
+                cmd.arg(o);
+            }
+        } else {
+            cmd.arg("crus");
+            cmd.arg(output);
+            for o in objects {
+                cmd.arg(o);
+            }
+        }
+        self.apply_env(&mut cmd);
+        Ok(cmd)
+    }
+
+    /// Apply the captured `vcvars` environment overlay, plus `VSLANG=1033`
+    /// on MSVC-like toolchains so `/showIncludes` notes are always the
+    /// English `Note: including file:` form regardless of VS locale (D16).
     pub fn apply_env(&self, cmd: &mut Command) {
         if let Some(env) = &self.msvc_env {
             for (k, v) in env {
                 cmd.env(k, v);
             }
+        }
+        if self.is_msvc_like() {
+            cmd.env("VSLANG", "1033");
         }
     }
 }
@@ -372,13 +488,14 @@ pub fn detect_verbose() -> Result<Detection, Error> {
     match which::which("clang-cl") {
         Ok(p) => {
             log.push(format!("found clang-cl in PATH: {}", p.display()));
-            let tc = CxxToolchain {
-                kind: ToolchainKind::ClangCl,
-                version: query_version(&p, &[]),
-                cxx: p,
-                msvc_env: None,
-                found_via: "clang-cl in PATH".to_string(),
-            };
+            let version = query_version(&p, &[]);
+            let tc = CxxToolchain::with_archiver(
+                ToolchainKind::ClangCl,
+                p,
+                version,
+                None,
+                "clang-cl in PATH".to_string(),
+            );
             return Ok(Detection { toolchain: tc, log });
         }
         Err(_) => {
@@ -391,13 +508,14 @@ pub fn detect_verbose() -> Result<Detection, Error> {
     match which::which("clang++") {
         Ok(p) => {
             log.push(format!("found clang++ in PATH: {}", p.display()));
-            let tc = CxxToolchain {
-                kind: ToolchainKind::Clang,
-                version: query_version(&p, &[OsString::from("--version")]),
-                cxx: p,
-                msvc_env: None,
-                found_via: "clang++ in PATH".to_string(),
-            };
+            let version = query_version(&p, &[OsString::from("--version")]);
+            let tc = CxxToolchain::with_archiver(
+                ToolchainKind::Clang,
+                p,
+                version,
+                None,
+                "clang++ in PATH".to_string(),
+            );
             return Ok(Detection { toolchain: tc, log });
         }
         Err(_) => {
@@ -415,13 +533,8 @@ pub fn detect_verbose() -> Result<Detection, Error> {
             } else {
                 ToolchainKind::Gcc
             };
-            let tc = CxxToolchain {
-                kind,
-                version: query_version(&p, &[OsString::from("--version")]),
-                cxx: p,
-                msvc_env: None,
-                found_via: "g++ in PATH".to_string(),
-            };
+            let version = query_version(&p, &[OsString::from("--version")]);
+            let tc = CxxToolchain::with_archiver(kind, p, version, None, "g++ in PATH".to_string());
             return Ok(Detection { toolchain: tc, log });
         }
         Err(_) => {
@@ -437,13 +550,14 @@ pub fn detect_verbose() -> Result<Detection, Error> {
             match which::which(name) {
                 Ok(p) => {
                     log.push(format!("found {name} in PATH: {}", p.display()));
-                    let tc = CxxToolchain {
-                        kind: ToolchainKind::Gcc,
-                        version: query_version(&p, &[OsString::from("--version")]),
-                        cxx: p,
-                        msvc_env: None,
-                        found_via: format!("{name} in PATH"),
-                    };
+                    let version = query_version(&p, &[OsString::from("--version")]);
+                    let tc = CxxToolchain::with_archiver(
+                        ToolchainKind::Gcc,
+                        p,
+                        version,
+                        None,
+                        format!("{name} in PATH"),
+                    );
                     return Ok(Detection { toolchain: tc, log });
                 }
                 Err(_) => {
@@ -583,13 +697,13 @@ fn probe_msvc_inherited_env(cl: &Path) -> Result<CxxToolchain, String> {
     if version.starts_with("<could not run") {
         return Err(version);
     }
-    Ok(CxxToolchain {
-        kind: ToolchainKind::Msvc,
-        cxx: cl.to_path_buf(),
+    Ok(CxxToolchain::with_archiver(
+        ToolchainKind::Msvc,
+        cl.to_path_buf(),
         version,
-        msvc_env: None,
-        found_via: "cl in PATH (inherited env)".to_string(),
-    })
+        None,
+        "cl in PATH (inherited env)".to_string(),
+    ))
 }
 
 /// `vswhere -latest ... -property installationPath` → vcvars → cl.
@@ -767,13 +881,35 @@ fn msvc_from_cl_path(cl: &Path, via: &str, log: &mut Vec<String>) -> Result<CxxT
             None
         }
     };
-    Ok(CxxToolchain {
-        kind: ToolchainKind::Msvc,
-        version: query_version_with_env(cl, &[], msvc_env.as_deref()),
-        cxx: cl.to_path_buf(),
+    Ok(CxxToolchain::with_archiver(
+        ToolchainKind::Msvc,
+        cl.to_path_buf(),
+        query_version_with_env(cl, &[], msvc_env.as_deref()),
         msvc_env,
-        found_via: format!("MSVC {via}"),
-    })
+        format!("MSVC {via}"),
+    ))
+}
+
+/// Probe for the static archiver belonging to a detected compiler.
+///
+/// - MSVC: `lib.exe` next to `cl.exe`.
+/// - clang-cl: `llvm-lib`, else `lib` in `PATH`.
+/// - clang/gcc/MinGW: `ar`, else `llvm-ar` in `PATH`.
+///
+/// (Cross-prefixed binutils, e.g. `x86_64-linux-gnu-ar`, are M7 work.)
+fn detect_archiver(kind: ToolchainKind, cxx: &Path) -> Option<PathBuf> {
+    match kind {
+        ToolchainKind::Msvc => {
+            let lib = cxx.parent()?.join("lib.exe");
+            lib.is_file().then_some(lib)
+        }
+        ToolchainKind::ClangCl => which::which("llvm-lib")
+            .or_else(|_| which::which("lib"))
+            .ok(),
+        ToolchainKind::Clang | ToolchainKind::Gcc | ToolchainKind::Mingw => {
+            which::which("ar").or_else(|_| which::which("llvm-ar")).ok()
+        }
+    }
 }
 
 /// Run vcvars and parse the resulting `KEY=VALUE` lines (`set` output).
@@ -840,6 +976,7 @@ mod tests {
             }),
             version: "test".to_string(),
             msvc_env: None,
+            ar: None,
             found_via: "test".to_string(),
         }
     }
@@ -912,5 +1049,69 @@ mod tests {
     fn clang_cl_is_msvc_like() {
         assert!(fake(ToolchainKind::ClangCl).is_msvc_like());
         assert!(!fake(ToolchainKind::Gcc).is_msvc_like());
+    }
+
+    #[test]
+    fn dep_styles_split_by_family() {
+        assert_eq!(
+            fake(ToolchainKind::Msvc).dep_style(),
+            DepStyle::MsvcShowIncludes
+        );
+        assert_eq!(
+            fake(ToolchainKind::ClangCl).dep_style(),
+            DepStyle::MsvcShowIncludes
+        );
+        assert_eq!(fake(ToolchainKind::Gcc).dep_style(), DepStyle::GccDepfile);
+        assert_eq!(fake(ToolchainKind::Clang).dep_style(), DepStyle::GccDepfile);
+    }
+
+    #[test]
+    fn artifact_naming() {
+        assert_eq!(fake(ToolchainKind::Msvc).obj_extension(), "obj");
+        assert_eq!(fake(ToolchainKind::Gcc).obj_extension(), "o");
+        assert_eq!(
+            fake(ToolchainKind::Msvc).staticlib_filename("foo"),
+            "foo.lib"
+        );
+        assert_eq!(
+            fake(ToolchainKind::Gcc).staticlib_filename("foo"),
+            "libfoo.a"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_defines_and_includes() {
+        let tc = fake(ToolchainKind::Gcc);
+        let base = CompileOptions::default();
+        let mut with_define = base.clone();
+        with_define.defines.push("NDEBUG".to_string());
+        let mut with_inc = base.clone();
+        with_inc.include_dirs.push(PathBuf::from("/x/inc"));
+        assert_ne!(tc.fingerprint(&base), tc.fingerprint(&with_define));
+        assert_ne!(tc.fingerprint(&base), tc.fingerprint(&with_inc));
+    }
+
+    #[test]
+    fn archive_without_archiver_errors_actionably() {
+        let tc = fake(ToolchainKind::Gcc);
+        let err = tc
+            .archive_command(&[PathBuf::from("a.o")], Path::new("liba.a"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no archiver"), "got: {err}");
+    }
+
+    #[test]
+    fn gnu_archive_invocation() {
+        let mut tc = fake(ToolchainKind::Gcc);
+        tc.ar = Some(PathBuf::from("ar"));
+        let cmd = tc
+            .archive_command(&[PathBuf::from("a.o")], Path::new("liba.a"))
+            .unwrap();
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.contains(&"crus".to_string()), "got: {args:?}");
     }
 }

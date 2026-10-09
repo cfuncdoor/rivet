@@ -33,9 +33,19 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
-      - name: M1 acceptance (hello corpus)
+      - name: M2 acceptance (examples corpus)
         run: |
           cargo build --locked
           ./target/debug/rivet build
           ./target/debug/rivet run
         working-directory: examples/hello
+      - name: M2 acceptance (lib+bin corpus)
+        run: |
+          ../../target/debug/rivet build
+          ../../target/debug/rivet run
+        working-directory: examples/libhello
+      - name: M2 acceptance (workspace corpus)
+        run: |
+          ../../target/debug/rivet build
+          ../../target/debug/rivet run -p hello
+        working-directory: examples/workspace

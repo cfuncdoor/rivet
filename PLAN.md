@@ -160,5 +160,9 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
 - [x] no-op rebuild optimization (toolchain cache + link-digest reuse);
       200-file bench: release Fresh ~0.4s wall (~0.3s in-rivet), single-TU
       recompile+relink ~2.3s; debug Fresh ~3.4s warm wall (was ~15s)
-- [ ] docs/ book, GH Actions matrix (win/linux × msvc/gcc/clang),
-      200-file benchmark vs CMake+Ninja
+- [x] GH Actions matrix (win/linux × msvc/gcc/clang): `RIVET_CXX` pins
+      the driver per job (D60), `-v` log greps the expected driver,
+      acceptance steps run under `shell: bash` on both OSes
+- [ ] 200-file benchmark vs CMake+Ninja (SKIPPED for now — corpus
+      generator kept at `examples/synth-200/gen.sh` for later)
+- [ ] docs/ book

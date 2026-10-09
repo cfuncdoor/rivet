@@ -414,6 +414,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rivet-adapters"
+version = "0.1.0"
+dependencies = [
+ "rivet-manifest",
+ "rivet-toolchain",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "rivet-buildscript"
+version = "0.1.0"
+dependencies = [
+ "rivet-toolchain",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "rivet-cache"
 version = "0.1.0"
 dependencies = [

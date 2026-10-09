@@ -705,6 +705,15 @@ pub fn detect_verbose() -> Result<Detection, Error> {
     let mut log: Vec<String> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
 
+    // 0. Explicit driver override (`RIVET_CXX`): CI pins toolchains per
+    // matrix job. An explicit request never falls through to another
+    // toolchain — failure is actionable.
+    if let Some(raw) = std::env::var_os("RIVET_CXX") {
+        if !raw.is_empty() {
+            return detect_override(&raw, &mut log).map(|toolchain| Detection { toolchain, log });
+        }
+    }
+
     // 1. cl.exe in PATH (dev prompt or pre-configured env).
     match which::which("cl") {
         Ok(p) => {
@@ -854,6 +863,17 @@ struct CachedToolchain {
     msvc_env: Vec<(String, String)>,
     ar: Option<PathBuf>,
     found_via: String,
+    /// `RIVET_CXX` value the entry was stored under (`None` = unset).
+    /// A change invalidates the entry: an override must never resolve to
+    /// a previously auto-detected driver or vice versa. Older cache files
+    /// predate the field and load as unset.
+    #[serde(default)]
+    cxx_override: Option<String>,
+}
+
+/// Current `RIVET_CXX` override value (`None` when unset or empty).
+fn cxx_override_env() -> Option<OsString> {
+    std::env::var_os("RIVET_CXX").filter(|v| !v.is_empty())
 }
 
 /// Load a cached toolchain: the driver (+ archiver, when recorded) must
@@ -861,11 +881,26 @@ struct CachedToolchain {
 /// Anything else is a miss (the caller runs full detection). Set
 /// `RIVET_NO_TOOLCHAIN_CACHE` (non-empty) to skip the cache.
 pub fn load_cached_toolchain(cache_root: &Path) -> Option<CxxToolchain> {
+    let current = cxx_override_env();
+    load_cached_toolchain_with(cache_root, current.as_deref())
+}
+
+/// [`load_cached_toolchain`] with an explicit override value (the plain
+/// form reads `RIVET_CXX` from the environment). Split out so unit tests
+/// can cover override keying without mutating process environment.
+pub fn load_cached_toolchain_with(
+    cache_root: &Path,
+    cxx_override: Option<&OsStr>,
+) -> Option<CxxToolchain> {
     if std::env::var_os("RIVET_NO_TOOLCHAIN_CACHE").is_some_and(|v| !v.is_empty()) {
         return None;
     }
     let text = std::fs::read_to_string(cache_root.join(TOOLCHAIN_CACHE_FILE)).ok()?;
     let cached: CachedToolchain = serde_json::from_str(&text).ok()?;
+    let current = cxx_override.map(|v| v.to_string_lossy().into_owned());
+    if cached.cxx_override != current {
+        return None;
+    }
     let kind = match cached.kind.as_str() {
         "msvc" => ToolchainKind::Msvc,
         "clang-cl" => ToolchainKind::ClangCl,
@@ -913,6 +948,18 @@ pub fn load_cached_toolchain(cache_root: &Path) -> Option<CxxToolchain> {
 /// Persist a detected toolchain for fast reuse (best-effort; the caller
 /// logs failures at `-v` and proceeds uncached).
 pub fn store_cached_toolchain(cache_root: &Path, tc: &CxxToolchain) -> Result<(), Error> {
+    let current = cxx_override_env();
+    store_cached_toolchain_with(cache_root, tc, current.as_deref())
+}
+
+/// [`store_cached_toolchain`] with an explicit override value (the plain
+/// form reads `RIVET_CXX` from the environment). Split out so unit tests
+/// can cover override keying without mutating process environment.
+pub fn store_cached_toolchain_with(
+    cache_root: &Path,
+    tc: &CxxToolchain,
+    cxx_override: Option<&OsStr>,
+) -> Result<(), Error> {
     let cached = CachedToolchain {
         kind: tc.kind.to_string(),
         cxx: tc.cxx.clone(),
@@ -933,6 +980,7 @@ pub fn store_cached_toolchain(cache_root: &Path, tc: &CxxToolchain) -> Result<()
             .unwrap_or_default(),
         ar: tc.ar.clone(),
         found_via: tc.found_via.clone(),
+        cxx_override: cxx_override.map(|v| v.to_string_lossy().into_owned()),
     };
     let text = serde_json::to_string_pretty(&cached).map_err(|e| Error::CommandFailed {
         what: "serialize toolchain cache".to_string(),
@@ -1064,6 +1112,76 @@ fn probe_msvc_inherited_env(cl: &Path) -> Result<CxxToolchain, String> {
         version,
         None,
         "cl in PATH (inherited env)".to_string(),
+    ))
+}
+
+/// Resolve an explicit driver override: the value is a driver path (used
+/// as-is when it names a file) or a `PATH` name (`clang++`, `g++`, …).
+/// The kind is inferred from the file name; anything unrecognized, or a
+/// driver that will not run, fails actionably instead of falling through
+/// to auto-detection.
+fn detect_override(raw: &OsStr, log: &mut Vec<String>) -> Result<CxxToolchain, Error> {
+    let asked = raw.to_string_lossy();
+    log.push(format!("RIVET_CXX override: {asked}"));
+    let given = Path::new(raw);
+    let driver = if given.is_file() {
+        given.to_path_buf()
+    } else {
+        match which::which(raw) {
+            Ok(p) => p,
+            Err(_) => {
+                return Err(Error::NoToolchain {
+                    tried: format!("RIVET_CXX={asked}: not a file and not found in PATH. Fix: set RIVET_CXX to a compiler driver path or PATH name (cl, clang-cl, clang++, g++, gcc, c++, cc), or unset it for auto-detection"),
+                })
+            }
+        }
+    };
+    let name = driver
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let kind = match name.as_str() {
+        "cl" => ToolchainKind::Msvc,
+        "clang-cl" => ToolchainKind::ClangCl,
+        "clang++" | "clang" => ToolchainKind::Clang,
+        "g++" | "gcc" | "c++" | "cc" => {
+            if cfg!(windows) {
+                ToolchainKind::Mingw
+            } else {
+                ToolchainKind::Gcc
+            }
+        }
+        _ => {
+            return Err(Error::NoToolchain {
+                tried: format!("RIVET_CXX={asked}: unrecognized driver name `{name}` ({}). Fix: point RIVET_CXX at cl, clang-cl, clang++, g++, gcc, c++, or cc", driver.display()),
+            })
+        }
+    };
+    if kind == ToolchainKind::Msvc {
+        // A bare `cl` only works with its environment (dev prompt or
+        // vcvars); without one there is no silent fallback.
+        return probe_msvc_inherited_env(&driver)
+            .map_err(|e| Error::NoToolchain {
+                tried: format!("RIVET_CXX={asked}: cl unusable ({e}). Fix: run from a VS developer prompt (or vcvars) so INCLUDE/LIB are set, or unset RIVET_CXX"),
+            })
+            .map(|mut tc| {
+                tc.found_via = format!("RIVET_CXX={asked}");
+                tc
+            });
+    }
+    let version = query_version(&driver, &[OsString::from("--version")]);
+    if version.starts_with("<could not run") {
+        return Err(Error::NoToolchain {
+            tried: format!("RIVET_CXX={asked}: driver {} would not run. Fix: check the path and execute permissions", driver.display()),
+        });
+    }
+    Ok(CxxToolchain::with_archiver(
+        kind,
+        driver,
+        version,
+        None,
+        format!("RIVET_CXX={asked}"),
     ))
 }
 
@@ -1780,5 +1898,85 @@ mod tests {
         value["version"] = serde_json::Value::String("0.0-stale".to_string());
         std::fs::write(&path, serde_json::to_string_pretty(&value).expect("json")).expect("write");
         assert!(load_cached_toolchain(dir.path()).is_none());
+    }
+
+    #[test]
+    fn rivet_cxx_bogus_path_fails_actionably() {
+        let mut log = Vec::new();
+        let err = detect_override(OsStr::new("/nonexistent/rivet-test-driver-xyz"), &mut log)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RIVET_CXX"), "got: {err}");
+        assert!(err.contains("not a file"), "got: {err}");
+        assert!(log.iter().any(|l| l.contains("RIVET_CXX")), "got: {log:?}");
+    }
+
+    #[test]
+    fn rivet_cxx_unknown_driver_name_fails_actionably() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("icc-fake");
+        std::fs::write(&fake, b"fake").expect("write");
+        let mut log = Vec::new();
+        let err = detect_override(fake.as_os_str(), &mut log)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unrecognized driver name"), "got: {err}");
+    }
+
+    #[test]
+    fn rivet_cxx_live_driver_resolves() {
+        let Ok(detected) = detect() else {
+            eprintln!("SKIP: no toolchain for override check");
+            return;
+        };
+        let mut log = Vec::new();
+        let tc = detect_override(detected.cxx.as_os_str(), &mut log).expect("override");
+        assert_eq!(tc.cxx, detected.cxx);
+        assert_eq!(tc.kind.to_string(), detected.kind.to_string());
+        assert!(tc.found_via.contains("RIVET_CXX"), "got: {}", tc.found_via);
+    }
+
+    #[test]
+    fn toolchain_cache_override_change_is_miss() {
+        let Ok(detected) = detect() else {
+            eprintln!("SKIP: no toolchain for cache override check");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_cached_toolchain_with(dir.path(), &detected, Some(OsStr::new("clang++")))
+            .expect("store");
+        // Unset and different values both miss …
+        assert!(load_cached_toolchain_with(dir.path(), None).is_none());
+        assert!(load_cached_toolchain_with(dir.path(), Some(OsStr::new("g++"))).is_none());
+        // … while the recorded value hits.
+        let back =
+            load_cached_toolchain_with(dir.path(), Some(OsStr::new("clang++"))).expect("load");
+        assert_eq!(back.cxx, detected.cxx);
+    }
+
+    #[test]
+    fn rivet_cxx_gnu_style_driver_probes_version() {
+        // `rustc` stands in for a GNU-style driver: copied under a `g++`
+        // file name, the override must infer the kind and run `--version`.
+        let rustc = match which::which("rustc") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP: no rustc for driver probe");
+                return;
+            }
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir
+            .path()
+            .join(if cfg!(windows) { "g++.exe" } else { "g++" });
+        std::fs::copy(&rustc, &fake).expect("copy rustc");
+        let mut log = Vec::new();
+        let tc = detect_override(fake.as_os_str(), &mut log).expect("override");
+        assert_eq!(
+            tc.kind.to_string(),
+            if cfg!(windows) { "mingw" } else { "gcc" }
+        );
+        assert!(tc.version.contains("rustc"), "got: {}", tc.version);
+        assert!(tc.found_via.contains("RIVET_CXX"), "got: {}", tc.found_via);
     }
 }

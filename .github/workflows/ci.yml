@@ -6,17 +6,33 @@ on:
 
 jobs:
   build-test:
+    name: ${{ matrix.os }} / ${{ matrix.cxx }}
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
-        cxx: [msvc, gcc, clang]
-        exclude:
-          - os: ubuntu-latest
-            cxx: msvc
+        include:
+          # Default detection must find MSVC (no override).
           - os: windows-latest
+            cxx: msvc
+            expect: cl.exe
+            rivet_cxx: ''
+          - os: windows-latest
+            cxx: clang
+            expect: clang
+            rivet_cxx: clang++
+          - os: ubuntu-latest
             cxx: gcc
+            expect: g++
+            rivet_cxx: g++
+          - os: ubuntu-latest
+            cxx: clang
+            expect: clang
+            rivet_cxx: clang++
     runs-on: ${{ matrix.os }}
+    env:
+      # Empty means auto-detection (the msvc job); every other job pins
+      # its toolchain (empty `RIVET_CXX` is ignored by detection).
+      RIVET_CXX: ${{ matrix.rivet_cxx }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,6 +43,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential clang cmake
+      - name: Install LLVM (Windows clang job)
+        if: runner.os == 'Windows' && matrix.cxx == 'clang'
+        shell: bash
+        run: command -v clang++ || choco install llvm -y
       - name: Rust fmt check
         run: cargo fmt --check
       - name: Clippy
@@ -35,24 +55,36 @@ jobs:
         run: cargo test --workspace
         env:
           RIVET_TEST_NETWORK: 1
+      # Acceptance steps run under bash on both OSes: PowerShell cannot
+      # execute the extensionless `./target/debug/rivet`, git-bash can.
       - name: acceptance (examples corpus)
+        shell: bash
         run: |
           cargo build --locked
           ./target/debug/rivet build
           ./target/debug/rivet run
         working-directory: examples/hello
+      - name: assert pinned toolchain
+        shell: bash
+        run: |
+          ./target/debug/rivet build -v > build-verbose.log 2>&1
+          grep -iF '${{ matrix.expect }}' build-verbose.log
+        working-directory: examples/hello
       - name: acceptance (lib+bin corpus)
+        shell: bash
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet test
           ../../target/debug/rivet run
         working-directory: examples/libhello
       - name: acceptance (workspace corpus)
+        shell: bash
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet run -p hello
         working-directory: examples/workspace
       - name: acceptance (features corpus)
+        shell: bash
         run: |
           ../../../target/debug/rivet build
           ../../../target/debug/rivet build --features extra
@@ -62,16 +94,19 @@ jobs:
           ../../../target/debug/rivet compile-commands
         working-directory: examples/features/app
       - name: acceptance (cmake corpus)
+        shell: bash
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet run
         working-directory: examples/cmake-mini
       - name: acceptance (cmake+zlib corpus)
+        shell: bash
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet run
         working-directory: examples/cmake-zlib
       - name: acceptance (buildscript corpus)
+        shell: bash
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet run

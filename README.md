@@ -91,6 +91,14 @@ Output is Cargo-like (`Compiling`, `Fresh`/`Cached`, `Finished`), honors
 - **Cache**: built artifacts are content-keyed in `~/.rivet/artifacts`
   and restored with a `Cached` note instead of recompiling.
 
+## Environment
+
+| Variable | Effect |
+|---|---|
+| `RIVET_CXX` | Pin the C++ driver (path or `PATH` name: `cl`, `clang-cl`, `clang++`, `g++`, …). Fails actionably instead of falling back. Unset (or empty) means auto-detection. |
+| `RIVET_HOME` | Override the cache root (default `~/.rivet`). Useful for tests and CI isolation. |
+| `RIVET_NO_TOOLCHAIN_CACHE` | Set (non-empty) to skip the `~/.rivet/toolchain.json` detection cache. |
+
 ## Docs
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — workspace layout, build/lock flows

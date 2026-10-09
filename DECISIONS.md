@@ -426,3 +426,19 @@ simpler option that preserves Cargo's mental model, then continue.
   MSVC): release no-op Fresh ~0.4s wall (~0.3s in-rivet, was ~6s),
   single-TU recompile+relink ~2.3s; debug no-op ~3.4s warm wall
   (was ~15s).
+- **D60: `RIVET_CXX` pins the compiler driver; the CI matrix asserts it.**
+  The win/linux × msvc/gcc/clang matrix was decorative: the `cxx` axis
+  never selected a toolchain (auto-detection always won — well-known
+  MSVC paths beat any `PATH` surgery on Windows). `RIVET_CXX` names a
+  driver path or `PATH` name as detection step 0; the kind is inferred
+  from the file name and failures are actionable (`NoToolchain` with the
+  override in the tried list), never silent fallback to another
+  toolchain. The toolchain cache keys on the override value so pinned
+  and unpinned runs never share entries. Env-only (no CLI flag): it
+  flows through build/test/run/compile-commands untouched, matching the
+  `RIVET_HOME`/`RIVET_NO_TOOLCHAIN_CACHE` precedent. `--target` cross
+  builds still use `clang++` from `PATH`. CI pins per job
+  (`msvc` = unset → default detection, else `clang++`/`g++`) and greps
+  the `-v` log for the expected driver; acceptance steps run under
+  `shell: bash` on both OSes because PowerShell cannot execute the
+  extensionless `./target/debug/rivet`.

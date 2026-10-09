@@ -219,3 +219,18 @@ fn future_commands_fail_actionably() {
         .stdout(predicate::str::contains("would upload"));
     let _ = OsString::from("keep-import");
 }
+
+#[test]
+fn rivet_cxx_bogus_override_fails_actionably() {
+    // No toolchain needed: the override fails before any probing.
+    let dir = TempDir::new().unwrap();
+    new_project(&dir, "hello");
+    let pkg: PathBuf = dir.path().join("hello");
+    rivet()
+        .current_dir(&pkg)
+        .env("RIVET_CXX", "/nonexistent/rivet-test-driver-xyz")
+        .arg("build")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("RIVET_CXX"));
+}

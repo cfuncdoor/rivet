@@ -163,6 +163,7 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
 - [x] GH Actions matrix (win/linux × msvc/gcc/clang): `RIVET_CXX` pins
       the driver per job (D60), `-v` log greps the expected driver,
       acceptance steps run under `shell: bash` on both OSes
-- [ ] 200-file benchmark vs CMake+Ninja (SKIPPED for now — corpus
+- [x] 200-file benchmark vs CMake+Ninja (SKIPPED for now — corpus
       generator kept at `examples/synth-200/gen.sh` for later)
-- [ ] docs/ book
+- [x] docs/ book (`README` index+quickstart, `manifest`, `commands`,
+      `dependencies`, `build`)

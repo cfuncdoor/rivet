@@ -91,19 +91,20 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
   offline rebuild from vendor, subdir deps, submodules, prune, patch, `dev`,
   fetch warm-up
 
-## M5 — Registry [IN PROGRESS — owner: M5 agent (rivet-registry only)]
-- [ ] Index client: sparse-HTTPS and/or local-dir index reads (JSON-lines,
-  M4-compatible), version listing, yank filtering
-- [ ] Tarball fetch (file:// + https), SHA-256 checksum verify, safe extract
-  (no path traversal / escaping symlinks) into the cache
-- [ ] `publish` / `login` / `search` library APIs (token store, index query,
-  tarball upload packaging)
-- [ ] Registry materialize API for the CLI integrator (fetch + verify +
-  extract → source dir + include/lib info)
-- [ ] Unit + hermetic tests (local static registry dir, `file://` only);
-  semver-compatible selection incl. pre-releases per semver rules
-- [ ] New deps justified in the return message (candidate: `ureq` rustls,
-  `tar` + `flate2`; keep it minimal)
+## M5 — Registry [DONE]
+- [x] Index client: sparse-HTTPS and local-dir reads (M4-compatible
+  JSON-lines), yank filtering, version listing
+- [x] Tarball fetch (`file://` + `https`), SHA-256 verify always, safe
+  extract (traversal/symlink rejection) into `<cache>/registry/<hash>/`
+- [x] `publish` / `login` / `search` (+ `install`): token store, dry-run
+  packaging, index search, bin copy to `~/.rivet/bin`
+- [x] Registry materialize wired into locked builds (checksum-verified,
+  offline + vendor paths); per-dep `registry` URLs locked (no more
+  `"default"` hardcode)
+- [x] Hermetic tests (`tests/m5.rs`, local `file://` registry): end-to-end,
+  checksum mismatch, yank skip, publish dry-run, login/search, offline
+  vendor rebuild, install
+- [x] New deps justified (`ureq` rustls, `tar` + `flate2`; D41/D45)
 
 ## M6 — Adapters (CMake/Meson/system libs) [IN PROGRESS — owner: M6 agent]
 - [ ] `crates/rivet-adapters` (new crate, agent-owned): CMake adapter

@@ -80,6 +80,17 @@ paths at edge level in both modes (D39). `update` locks the world
 (`--all-features`), merges per-seed resolutions, supports `-p`/`--precise`,
 aborts on moved tags, and reports `name: old -> new (N commits)` (D38).
 
+## Registry (M5)
+
+Sparse index `<url>/index/<name>` (JSON-lines, yank-aware) plus local-dir
+indexes; tarballs at `<url>/tarballs/<name>-<version>.tar.gz`, always
+SHA-256-verified, safely extracted to `<cache>/registry/<hash>/`
+(D41–D43). Per-dep `registry` URLs lock verbatim (`RIVET_REGISTRY` fills
+the `default` sentinel); alternate indexes sync on demand into a merged
+scratch dir (same-name collisions refused). `publish` (deterministic
+packaging, bearer auth, `--dry-run`), `login` (token store), `search`
+(local index), `install` (`~/.rivet/bin`) round out package management.
+
 ## Profiles / features (M3)
 
 Manifest `profile.dev|release` carry `opt`/`debug`/`lto`/`sanitizers`

@@ -268,3 +268,58 @@ simpler option that preserves Cargo's mental model, then continue.
   `HEAD^{tree}` equals the locked tree — content-addressed, so a mutated
   vendor fails loudly (`TreeMismatch` semantics) instead of silently.
   Registry packages cannot vend in M4 (fetching is M5) — actionable error.
+
+## M5
+
+- **D41: Registry transport = `ureq` 2.12 (`default-features = false`, `tls`).**
+  Minimal sync rustls client with bundled Mozilla roots and always-on cert
+  verification (no insecure knob, no OpenSSL — satisfies AGENTS.md
+  `ureq`/rustls-no-OpenSSL). One 120 s-timeout agent built per request
+  (no global state, no connection pool). Bodies capped (`MAX_INDEX_BYTES`
+  8 MiB, `MAX_TARBALL_BYTES` 256 MiB). `file://` reads local disk
+  (allowed even offline — it is not network); `https://` refused under
+  `offline`; all other schemes rejected without touching the network.
+  Anything heavier (`reqwest`/tokio/`curl`) is unjustified for index +
+  tarball GETs and one publish PUT.
+- **D42: Sparse index URL layout `<registry-url>/index/<name>`, tarballs `<registry-url>/tarballs/<name>-<version>.tar.gz`.**
+  Local-dir `<index-dir>/<name>` stays primary (M4-compatible JSON-lines
+  `{"version","checksum","yanked","deps"}`, extended with optional
+  `"description"`; unknown fields ignored both directions). `file://`
+  bases map to `<root>/index/<name>` and `<root>/tarballs/…` on disk so
+  the sparse layout is hermetically testable. Package names gated to
+  `[A-Za-z0-9_-]+` so index/tarball lookups can never escape. Lock
+  sentinel `"default"` is never a URL — `sparse()`/`tarball_url_for()` /
+  `materialize()` reject it actionably; the CLI resolves it to a concrete
+  `https://…` URL first.
+- **D43: Tarball layout + determinism rules.**
+  Cache: `<cache>/registry/<registry-hash>/<name>-<version>/` where hash
+  = first 16 hex of SHA-256 over the normalized registry URL (full URL
+  recorded in `.rivet-source-url`; reuse keyed by `.rivet-extract-ok`
+  holding the verified checksum). Source root = the single top-level
+  dir when the package dir holds exactly one dir (what `package_source_dir`
+  emits: `<name>-<version>/…`), else the package dir itself. Packaging:
+  entries sorted by archive path, file `0644` / dir `0755`, uid/gid 0,
+  mtime 0, gzip level 6; any `target` or `.git` component excluded;
+  symlinks rejected at package time. Same dir packaged twice = identical
+  bytes. Extraction rejects absolute/`..`/empty paths, non-file/dir/link
+  types, and absolute/escaping links, then re-validates the tree
+  (same discipline as `rivet-git` checkout validation).
+- **D44: Credentials at `~/.rivet/credentials` (JSON map URL → token).**
+  `login` creates parent dirs, pretty-prints + trailing newline,
+  overwrites per-URL. Unix chmods `0600` best-effort (warn, never fail);
+  Windows has no std chmod so login warns that the store inherits
+  directory ACLs. Missing file = `None` (never logged in); corrupt JSON
+  = actionable `Login` error (`delete + rivet login again`). Publish
+  wire format: `PUT <base>/publish/<name>/<version>`, body = gzip tarball,
+  `Content-Type: application/gzip`, `Authorization: Bearer <token>`,
+  `X-Rivet-Checksum: sha256:…`, optional `X-Rivet-Description` /
+  `X-Rivet-Deps` JSON. Publishing requires `https://` (never `file://` /
+  `http://` — tokens must not travel in the clear) and a non-empty token
+  (`AuthMissing` → `rivet login`).
+- **D45: New deps justified (`tar` 0.4, `flate2` 1.0, `ureq` 2.12).**
+  `tar` + `flate2` = gzip-tar pack/extract (AGENTS.md pre-approved;
+  hand-rolling tar/gzip is a bug farm). `ureq` = minimal rustls HTTPS
+  (see D41; only candidate that is sync, OpenSSL-free, and small).
+  Reused (already pinned in workspace): `semver` 1.0, `sha2` 0.10,
+  `serde` / `serde_json`, `walkdir` 2.5, `thiserror` 2.0 only,
+  `tempfile` 3.0 dev-only. MSRV stays 1.74.

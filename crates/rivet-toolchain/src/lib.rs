@@ -15,6 +15,10 @@ use std::process::Command;
 
 use thiserror::Error;
 
+pub mod target;
+
+pub use target::{select_for_target, TargetSelection, TargetTriple};
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -48,6 +52,40 @@ pub enum Error {
         kind: String,
         /// Supported sanitizer list for the message.
         supported: String,
+    },
+    /// A `--target` triple is malformed or names an unsupported arch/OS/env.
+    #[error("invalid target triple `{input}`: {reason}. Fix: use `native` or `arch-vendor-os[-env]`, e.g. `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`, `aarch64-apple-darwin`")]
+    InvalidTarget {
+        /// Triple as written.
+        input: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+    /// A cross-compile target has no usable compiler installed.
+    #[error("cannot target `{requested}` from `{host}`: no cross-capable compiler found.\nTried:\n  - {tried}\nFix: install LLVM clang (`winget install LLVM.LLVM` on Windows, `sudo apt install clang` on Linux) so rivet can pass `--target={requested}` to clang")]
+    NoCrossToolchain {
+        /// Requested triple.
+        requested: String,
+        /// Host triple.
+        host: String,
+        /// Candidates tried.
+        tried: String,
+    },
+    /// Precompiled headers need per-TU ordering the build graph has no
+    /// model for yet (M7 verdict: actionable error, not silent fallback).
+    #[error("precompiled headers are not supported yet ({reason}). Fix: keep headers in `include/` and `#include` them normally")]
+    PchNotSupported {
+        /// Why PCH cannot be expressed in the flag model.
+        reason: String,
+    },
+    /// C++20 modules need per-toolchain scanning the build graph has no
+    /// model for yet (M7 verdict: actionable error, not silent fallback).
+    #[error(
+        "C++20 modules are not supported yet ({reason}). Fix: keep using header-based includes"
+    )]
+    CxxModulesNotSupported {
+        /// Why modules cannot be expressed in the flag model.
+        reason: String,
     },
 }
 
@@ -98,6 +136,10 @@ pub struct CxxToolchain {
     /// Path to the static archiver (`lib.exe`, `ar`, `llvm-lib`), when one
     /// was found. `None` means archiving fails with an actionable error.
     pub ar: Option<PathBuf>,
+    /// Requested `--target` triple. `None` = native detection (fingerprint
+    /// byte-identical to earlier releases). Set by the coordinator from
+    /// `TargetSelection`; cross args derive from it via [`Self::target_args`].
+    pub target: Option<TargetTriple>,
     /// How this toolchain was found (for `-v` logging).
     pub found_via: String,
 }
@@ -127,7 +169,22 @@ impl CxxToolchain {
             version,
             msvc_env,
             ar,
+            target: None,
             found_via,
+        }
+    }
+
+    /// Extra driver args for the selected target (empty for native).
+    ///
+    /// Cross builds compile with `clang++ --target=<triple>`; the flag is
+    /// appended to compile and link commands (never to `ar`, which stays
+    /// native — see `select_for_target`).
+    pub fn target_args(&self) -> Vec<OsString> {
+        match &self.target {
+            Some(t) if !t.is_native() => {
+                vec![OsString::from(format!("--target={}", t.raw))]
+            }
+            _ => Vec::new(),
         }
     }
     /// `true` for `cl.exe`-style drivers (MSVC and clang-cl).
@@ -147,12 +204,14 @@ impl CxxToolchain {
     /// Content fingerprint: ABI/compiler/std/stdlib inputs that must
     /// invalidate the build cache. Covers kind, version, std, opt, debug,
     /// defines, include dirs (in order — order is semantics for `-I`), lto,
-    /// sanitizers, and enabled features (sorted).
+    /// sanitizers, enabled features (sorted), and the `--target` selection
+    /// (only when set — native `None` keeps the historic format byte for
+    /// byte, so native builds never rebuild spuriously).
     ///
     /// Format (M3, also consumed by `rivet-graph` link digests; M4 lockfile
     /// readers must treat it as opaque but stable within a toolchain):
     /// `<kind>|<version>|std=<std>|opt=<n>|debug=<0|1>|defines=<;>|includes=<;>`
-    /// `|lto=<0|1>|sanitizers=<csv>|features=<csv>`.
+    /// `|lto=<0|1>|sanitizers=<csv>|features=<csv>[|target=<triple>]`.
     pub fn fingerprint(&self, opts: &CompileOptions) -> String {
         let defines = opts.defines.join(";");
         let includes = opts
@@ -161,7 +220,7 @@ impl CxxToolchain {
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
             .join(";");
-        format!(
+        let base = format!(
             "{}|{}|std={}|opt={}|debug={}|defines={defines}|includes={includes}|lto={}|sanitizers={}|features={}",
             self.kind,
             self.version.trim(),
@@ -171,7 +230,75 @@ impl CxxToolchain {
             opts.lto as u8,
             opts.sanitizers.join(","),
             opts.features.join(","),
-        )
+        );
+        match &self.target {
+            Some(t) => format!("{base}|target={}", t.raw),
+            None => base,
+        }
+    }
+
+    /// Fingerprint plus the `--target` selection (M7).
+    ///
+    /// This is `fingerprint()` with [`TargetSelection::target_suffix`]
+    /// appended (`|target=native` by default, `|target=<triple>` when
+    /// `--target` names one). `fingerprint()` itself is byte-identical to
+    /// M3 so native builds never rebuild spuriously; the coordinator uses
+    /// this variant so a target switch rebuilds exactly once.
+    pub fn fingerprint_with_target(
+        &self,
+        opts: &CompileOptions,
+        target: Option<&TargetTriple>,
+    ) -> String {
+        let base = self.fingerprint(opts);
+        match target {
+            None => format!("{base}|target=native"),
+            Some(t) => format!("{base}|target={}", t.raw),
+        }
+    }
+
+    /// Precompiled-header *create* flags (M7 verdict: unsupported).
+    ///
+    /// MSVC needs `/Yc` on exactly one TU built before all `/Yu` consumers
+    /// (plus a shared `/Fp` file); GCC/Clang need the `.gch` built first
+    /// with identical flags and a forced `-include`. The flag model
+    /// compiles every TU uniformly with no ordering, so no flag list here
+    /// could be correct — this returns an actionable error instead of
+    /// silently emitting half a PCH setup. The graph needs a PCH-aware
+    /// planning step first (future work, not M7).
+    pub fn pch_create_flags(
+        &self,
+        _header: &Path,
+        _output: &Path,
+        _opts: &CompileOptions,
+    ) -> Result<Vec<OsString>, Error> {
+        Err(Error::PchNotSupported {
+            reason: "creating a PCH must precede (and share flags with) every consuming TU, but the build graph compiles all TUs uniformly with no ordering".to_string(),
+        })
+    }
+
+    /// Precompiled-header *use* flags (M7 verdict: unsupported — see
+    /// [`CxxToolchain::pch_create_flags`]).
+    pub fn pch_use_flags(
+        &self,
+        _header: &Path,
+        _opts: &CompileOptions,
+    ) -> Result<Vec<OsString>, Error> {
+        Err(Error::PchNotSupported {
+            reason: "consuming a PCH (`/Yu` + `/Fp` on MSVC, `-include` + `.gch` on GCC/Clang) requires the PCH artifact to exist first, which the build graph cannot order yet".to_string(),
+        })
+    }
+
+    /// C++20 module flags (M7 verdict: unsupported).
+    ///
+    /// Module compilation needs a compiler-specific dependency scan first
+    /// (MSVC `/scanDependencies`, Clang `-fmodule-mapper`/`--precompile`
+    /// DAG, GCC `-fmodules-ts` BMI ordering) to discover the build DAG
+    /// before compiling anything. Flags alone cannot express that; the
+    /// graph needs module-aware planning first (future work, not M7).
+    pub fn cxx_module_flags(&self, _opts: &CompileOptions) -> Result<Vec<OsString>, Error> {
+        Err(Error::CxxModulesNotSupported {
+            reason: "compilers disagree on module scanning (`/scanDependencies` vs BMI DAGs) and the build graph has no module-aware planning step yet".to_string(),
+        })
     }
 
     /// Reject sanitizer names this toolchain cannot honor.
@@ -358,6 +485,7 @@ impl CxxToolchain {
             args.push(OsString::from("-o"));
             args.push(object.as_os_str().to_os_string());
         }
+        args.extend(self.target_args());
         cmd.args(&args);
         self.apply_env(&mut cmd);
         cmd
@@ -371,10 +499,15 @@ impl CxxToolchain {
     /// link-time codegen and runtimes match the compile step: MSVC-like
     /// `/fsanitize=<csv>` (cl-level) + `/LTCG` (link-level), GNU/Clang
     /// `-flto` / `-fsanitize=<csv>`.
+    /// `lib_dirs` join the search path (`-L` / `/LIBPATH`) and `sys_libs`
+    /// join as bare names (`-l<name>` / `<name>.lib`) — fed by adapter
+    /// probes, system libs, and `rivet:lib -lname` script directives.
     pub fn link_exe_command(
         &self,
         objects: &[PathBuf],
         archives: &[PathBuf],
+        lib_dirs: &[PathBuf],
+        sys_libs: &[String],
         output: &Path,
         opts: &CompileOptions,
     ) -> Command {
@@ -400,11 +533,21 @@ impl CxxToolchain {
             if opts.lto {
                 link_opts.push("/LTCG");
             }
-            if !link_opts.is_empty() {
+            // Linker options (search paths, bare libs) go after `/link`;
+            // `cl` rejects them as source files otherwise (D9002/D9024).
+            if !link_opts.is_empty() || !lib_dirs.is_empty() || !sys_libs.is_empty() {
                 cmd.arg("/link");
-                for o in link_opts {
-                    cmd.arg(o);
-                }
+            }
+            for o in link_opts {
+                cmd.arg(o);
+            }
+            for dir in lib_dirs {
+                let mut lp = OsString::from("/LIBPATH:");
+                lp.push(dir);
+                cmd.arg(lp);
+            }
+            for name in sys_libs {
+                cmd.arg(msvc_lib_name(name));
             }
         } else {
             for o in objects {
@@ -412,6 +555,14 @@ impl CxxToolchain {
             }
             for a in archives {
                 cmd.arg(a);
+            }
+            for dir in lib_dirs {
+                let mut l = OsString::from("-L");
+                l.push(dir);
+                cmd.arg(l);
+            }
+            for name in sys_libs {
+                cmd.arg(format!("-l{name}"));
             }
             if opts.lto {
                 cmd.arg("-flto");
@@ -422,6 +573,7 @@ impl CxxToolchain {
             cmd.arg("-o");
             cmd.arg(output);
         }
+        cmd.args(self.target_args());
         self.apply_env(&mut cmd);
         cmd
     }
@@ -468,6 +620,16 @@ impl CxxToolchain {
         if self.is_msvc_like() {
             cmd.env("VSLANG", "1033");
         }
+    }
+}
+
+/// MSVC link name for a bare library: `foo` → `foo.lib` (already-suffixed
+/// names pass through).
+fn msvc_lib_name(name: &str) -> String {
+    if name.contains('.') {
+        name.to_string()
+    } else {
+        format!("{name}.lib")
     }
 }
 
@@ -1072,6 +1234,7 @@ mod tests {
             version: "test".to_string(),
             msvc_env: None,
             ar: None,
+            target: None,
             found_via: "test".to_string(),
         }
     }
@@ -1248,13 +1411,27 @@ mod tests {
             debug: false,
             ..Default::default()
         };
-        let cmd = msvc.link_exe_command(&[PathBuf::from("a.obj")], &[], Path::new("a.exe"), &opts);
+        let cmd = msvc.link_exe_command(
+            &[PathBuf::from("a.obj")],
+            &[],
+            &[],
+            &[],
+            Path::new("a.exe"),
+            &opts,
+        );
         let args = args_of(&cmd);
         assert!(args.iter().any(|a| a == "/LTCG"), "got: {args:?}");
         assert!(args.iter().any(|a| a == "/link"), "got: {args:?}");
 
         let gcc = fake(ToolchainKind::Gcc);
-        let cmd = gcc.link_exe_command(&[PathBuf::from("a.o")], &[], Path::new("a"), &opts);
+        let cmd = gcc.link_exe_command(
+            &[PathBuf::from("a.o")],
+            &[],
+            &[],
+            &[],
+            Path::new("a"),
+            &opts,
+        );
         let args = args_of(&cmd);
         assert!(args.iter().any(|a| a == "-flto"), "got: {args:?}");
     }
@@ -1272,7 +1449,14 @@ mod tests {
             args.iter().any(|a| a == "/fsanitize=address"),
             "got: {args:?}"
         );
-        let link = msvc.link_exe_command(&[PathBuf::from("a.obj")], &[], Path::new("a.exe"), &opts);
+        let link = msvc.link_exe_command(
+            &[PathBuf::from("a.obj")],
+            &[],
+            &[],
+            &[],
+            Path::new("a.exe"),
+            &opts,
+        );
         let link_args = args_of(&link);
         assert!(
             link_args.iter().any(|a| a == "/fsanitize=address"),
@@ -1286,7 +1470,14 @@ mod tests {
             args.iter().any(|a| a == "-fsanitize=address"),
             "got: {args:?}"
         );
-        let link = gcc.link_exe_command(&[PathBuf::from("a.o")], &[], Path::new("a"), &opts);
+        let link = gcc.link_exe_command(
+            &[PathBuf::from("a.o")],
+            &[],
+            &[],
+            &[],
+            Path::new("a"),
+            &opts,
+        );
         let link_args = args_of(&link);
         assert!(
             link_args.iter().any(|a| a == "-fsanitize=address"),
@@ -1303,6 +1494,44 @@ mod tests {
             args.iter().any(|a| a == "-fsanitize=address,undefined"),
             "got: {args:?}"
         );
+    }
+
+    #[test]
+    fn sys_libs_map_per_family() {
+        let msvc = fake(ToolchainKind::Msvc);
+        let link = msvc.link_exe_command(
+            &[PathBuf::from("a.obj")],
+            &[],
+            &[PathBuf::from("C:\\libs")],
+            &["ws2_32".to_string(), "dbghelp.lib".to_string()],
+            Path::new("a.exe"),
+            &CompileOptions::default(),
+        );
+        let args = args_of(&link);
+        assert!(
+            args.iter().any(|a| a == "/LIBPATH:C:\\libs"),
+            "got: {args:?}"
+        );
+        assert!(args.iter().any(|a| a == "ws2_32.lib"), "got: {args:?}");
+        assert!(args.iter().any(|a| a == "dbghelp.lib"), "got: {args:?}");
+
+        let gcc = fake(ToolchainKind::Gcc);
+        let link = gcc.link_exe_command(
+            &[PathBuf::from("a.o")],
+            &[],
+            &[PathBuf::from("/usr/lib")],
+            &["z".to_string()],
+            Path::new("a"),
+            &CompileOptions::default(),
+        );
+        let args = args_of(&link);
+        assert!(args.iter().any(|a| a == "-L/usr/lib"), "got: {args:?}");
+        assert!(args.iter().any(|a| a == "-lz"), "got: {args:?}");
+    }
+
+    #[test]
+    fn target_args_empty_for_native() {
+        assert!(fake(ToolchainKind::Gcc).target_args().is_empty());
     }
 
     #[test]
@@ -1340,5 +1569,52 @@ mod tests {
         assert_ne!(tc.fingerprint(&base), tc.fingerprint(&lto));
         assert_ne!(tc.fingerprint(&base), tc.fingerprint(&asan));
         assert_ne!(tc.fingerprint(&base), tc.fingerprint(&feat));
+    }
+
+    #[test]
+    fn fingerprint_with_target_appends_without_changing_base() {
+        let tc = fake(ToolchainKind::Gcc);
+        let opts = CompileOptions::default();
+        let base = tc.fingerprint(&opts);
+        // The M3 format is untouched (no spurious rebuilds) …
+        assert!(!base.contains("|target="), "got: {base}");
+        // … and the target variant only appends.
+        assert_eq!(
+            tc.fingerprint_with_target(&opts, None),
+            format!("{base}|target=native")
+        );
+        let linux = TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap();
+        let windows = TargetTriple::parse("x86_64-pc-windows-msvc").unwrap();
+        assert_eq!(
+            tc.fingerprint_with_target(&opts, Some(&linux)),
+            format!("{base}|target=x86_64-unknown-linux-gnu")
+        );
+        assert_ne!(
+            tc.fingerprint_with_target(&opts, Some(&linux)),
+            tc.fingerprint_with_target(&opts, Some(&windows))
+        );
+    }
+
+    #[test]
+    fn pch_and_modules_fail_actionably() {
+        let tc = fake(ToolchainKind::Msvc);
+        let opts = CompileOptions::default();
+        for err in [
+            tc.pch_create_flags(Path::new("pch.h"), Path::new("pch.pch"), &opts)
+                .unwrap_err()
+                .to_string(),
+            tc.pch_use_flags(Path::new("pch.h"), &opts)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(err.contains("precompiled headers"), "got: {err}");
+            assert!(err.contains("include/"), "got: {err}");
+        }
+        let err = tc.cxx_module_flags(&opts).unwrap_err().to_string();
+        assert!(err.contains("modules"), "got: {err}");
+        // GCC agrees: the verdict is toolchain-independent.
+        let gcc = fake(ToolchainKind::Gcc);
+        assert!(gcc.pch_use_flags(Path::new("pch.h"), &opts).is_err());
+        assert!(gcc.cxx_module_flags(&opts).is_err());
     }
 }

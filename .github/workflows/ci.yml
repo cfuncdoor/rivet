@@ -26,31 +26,33 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang
+          sudo apt-get install -y build-essential clang cmake
       - name: Rust fmt check
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
-      - name: M2 acceptance (examples corpus)
+        env:
+          RIVET_TEST_NETWORK: 1
+      - name: acceptance (examples corpus)
         run: |
           cargo build --locked
           ./target/debug/rivet build
           ./target/debug/rivet run
         working-directory: examples/hello
-      - name: M2 acceptance (lib+bin corpus)
+      - name: acceptance (lib+bin corpus)
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet test
           ../../target/debug/rivet run
         working-directory: examples/libhello
-      - name: M2 acceptance (workspace corpus)
+      - name: acceptance (workspace corpus)
         run: |
           ../../target/debug/rivet build
           ../../target/debug/rivet run -p hello
         working-directory: examples/workspace
-      - name: M3 acceptance (features corpus)
+      - name: acceptance (features corpus)
         run: |
           ../../../target/debug/rivet build
           ../../../target/debug/rivet build --features extra
@@ -59,3 +61,18 @@ jobs:
           ../../../target/debug/rivet run
           ../../../target/debug/rivet compile-commands
         working-directory: examples/features/app
+      - name: acceptance (cmake corpus)
+        run: |
+          ../../target/debug/rivet build
+          ../../target/debug/rivet run
+        working-directory: examples/cmake-mini
+      - name: acceptance (cmake+zlib corpus)
+        run: |
+          ../../target/debug/rivet build
+          ../../target/debug/rivet run
+        working-directory: examples/cmake-zlib
+      - name: acceptance (buildscript corpus)
+        run: |
+          ../../target/debug/rivet build
+          ../../target/debug/rivet run
+        working-directory: examples/buildscript-demo

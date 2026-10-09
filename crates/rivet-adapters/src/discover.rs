@@ -19,14 +19,20 @@ const SKIPPED_DIRS: &[&str] = &["CMakeFiles"];
 ///
 /// Returns the matched files as [`LibLink::File`] in link order: static
 /// archives first, then Windows import libs (a `.lib` with a same-stem
-/// `.dll` next to it), then shared libs. An empty `targets` list accepts
-/// everything; a non-empty list that matches nothing is
-/// [`Error::NoLibraries`] — never a silent "build everything instead".
+/// `.dll` next door), then shared objects. Bare `.dll` files are never
+/// returned (MSVC cannot link them — LNK1107; the import `.lib` covers
+/// them, and their dirs still surface via [`dll_dirs`] for runtime
+/// lookup). An empty `targets` list accepts everything; a non-empty list
+/// that matches nothing is [`Error::NoLibraries`] — never a silent "build
+/// everything instead".
 pub fn discover_libs(build_dir: &Path, targets: &[String]) -> Result<Vec<LibLink>, Error> {
     let mut files = Vec::new();
     collect_lib_files(build_dir, &mut files);
     files.sort();
     files.dedup();
+    // Bare DLLs are runtime-only (see above); drop them before matching so
+    // a `targets` filter naming a DLL stem matches its import lib instead.
+    files.retain(|f| !is_bare_dll(f));
     let matched: Vec<PathBuf> = if targets.is_empty() {
         files
     } else {
@@ -85,6 +91,47 @@ pub fn lib_dirs_of(libs: &[LibLink]) -> Vec<PathBuf> {
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+/// Dirs holding `.dll` files under `build_dir` (runtime lookup), sorted and
+/// deduped. Bare DLLs never link (see [`discover_libs`]) but their
+/// directories still belong on the runtime search path.
+pub fn dll_dirs(build_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    collect_dll_dirs(build_dir, &mut dirs);
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// `true` for a `.dll` file (link-excluded; see [`discover_libs`]).
+fn is_bare_dll(path: &Path) -> bool {
+    file_name(path)
+        .map(|n| n.to_ascii_lowercase().ends_with(".dll"))
+        .unwrap_or(false)
+}
+
+fn collect_dll_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() && !ft.is_file() {
+            continue;
+        }
+        if ft.is_dir() {
+            collect_dll_dirs(&path, out);
+        } else if is_bare_dll(&path) {
+            if let Some(parent) = path.parent() {
+                out.push(parent.to_path_buf());
+            }
+        }
+    }
 }
 
 /// Public include dirs for a source-built dependency:
@@ -303,15 +350,29 @@ mod tests {
                     .into_owned()
             })
             .collect();
+        // Bare DLLs never link on MSVC (LNK1107): only the import lib is
+        // returned; the DLL's dir still surfaces for runtime lookup.
         assert_eq!(
             names,
-            vec![
-                "solo.lib".to_string(),
-                "foo.lib".to_string(),
-                "foo.dll".to_string()
-            ],
+            vec!["solo.lib".to_string(), "foo.lib".to_string()],
             "got: {names:?}"
         );
+        assert_eq!(dll_dirs(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn bare_dll_without_import_lib_is_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(&dir.path().join("only.dll"));
+        // Nothing linkable: surfaces as NoLibraries (with the dir named),
+        // not as a corrupt link line.
+        let err = discover_libs(dir.path(), &[]).unwrap_err().to_string();
+        assert!(
+            err.contains(dir.path().to_string_lossy().as_ref()),
+            "got: {err}"
+        );
+        // Its directory is still reported for runtime lookup.
+        assert_eq!(dll_dirs(dir.path()).len(), 1);
     }
 
     #[test]

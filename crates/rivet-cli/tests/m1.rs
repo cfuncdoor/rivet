@@ -206,11 +206,16 @@ fn future_commands_fail_with_milestone_pointer() {
         .arg("hello")
         .assert()
         .success();
+    // Publish is implemented: without a registry it fails actionably;
+    // --dry-run shows what would upload.
     rivet()
         .current_dir(dir.path().join("hello"))
         .arg("publish")
+        .arg("--dry-run")
+        .arg("--registry")
+        .arg("https://example.com")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("M5").or(predicate::str::contains("not implemented")));
+        .success()
+        .stdout(predicate::str::contains("would upload"));
     let _ = OsString::from("keep-import");
 }

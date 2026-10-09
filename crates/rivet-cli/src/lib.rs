@@ -121,6 +121,9 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
+        /// Cross-compile for the given triple (`native` = host default).
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<String>,
         /// Do not use network (cache/vendor only).
         #[arg(long)]
         offline: bool,
@@ -165,6 +168,9 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
+        /// Cross-compile for the given triple (`native` = host default).
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<String>,
         /// Do not use network (cache/vendor only).
         #[arg(long)]
         offline: bool,
@@ -211,17 +217,71 @@ pub enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Publish the package to the registry (M5).
-    Publish,
-    /// Log in to the registry (M5).
-    Login,
-    /// Search the registry (M5).
+    /// Publish the package to the registry.
+    Publish {
+        /// Registry URL (default: `RIVET_REGISTRY`).
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
+        /// Auth token (default: prompt-avoiding `RIVET_TOKEN` env or stdin).
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+        /// Show what would be uploaded without uploading.
+        #[arg(long)]
+        dry_run: bool,
+        /// Publish only the given workspace package.
+        #[arg(short = 'p', long, value_name = "PKG")]
+        package: Option<String>,
+    },
+    /// Log in to the registry (stores a token for `publish`).
+    Login {
+        /// Registry URL (default: `RIVET_REGISTRY`).
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
+        /// Auth token (default: read one line from stdin).
+        #[arg(long, value_name = "TOKEN")]
+        token: Option<String>,
+    },
+    /// Search the registry index.
     Search {
         /// Query string.
         query: Option<String>,
+        /// Registry URL (default: `RIVET_REGISTRY` or the local index copy).
+        #[arg(long, value_name = "URL")]
+        registry: Option<String>,
     },
-    /// Build and copy binaries to `~/.rivet/bin` (M5).
-    Install,
+    /// Build and copy binaries to `~/.rivet/bin`.
+    Install {
+        /// Install only the given package (plus its path deps).
+        #[arg(short = 'p', long, value_name = "PKG")]
+        package: Option<String>,
+        /// Install only the given binary.
+        #[arg(long, value_name = "NAME")]
+        bin: Option<String>,
+        /// Build with the `release` profile.
+        #[arg(long)]
+        release: bool,
+        /// Parallel compile jobs (`0` = auto = cores).
+        #[arg(short = 'j', long, default_value_t = 0, value_name = "N")]
+        jobs: usize,
+        /// Enable features (comma-separated, repeatable).
+        #[arg(long, value_delimiter = ',', value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Enable all features.
+        #[arg(long)]
+        all_features: bool,
+        /// Disable the `default` feature.
+        #[arg(long)]
+        no_default_features: bool,
+        /// Do not use network (cache/vendor only).
+        #[arg(long)]
+        offline: bool,
+        /// Error if the lockfile would change.
+        #[arg(long)]
+        locked: bool,
+        /// No network + error if the lockfile would change.
+        #[arg(long)]
+        frozen: bool,
+    },
     /// Emit `compile_commands.json` (M3).
     CompileCommands {
         /// Use the `release` profile flags.
@@ -239,6 +299,9 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
+        /// Cross-compile for the given triple (`native` = host default).
+        #[arg(long, value_name = "TRIPLE")]
+        target: Option<String>,
         /// Do not use network (cache/vendor only).
         #[arg(long)]
         offline: bool,
@@ -342,6 +405,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             features,
             all_features,
             no_default_features,
+            target,
             offline,
             locked,
             frozen,
@@ -355,6 +419,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 jobs: *jobs,
                 keep_going: *keep_going,
                 features: feature_flags(features, *all_features, *no_default_features),
+                target: target.clone(),
                 args: args.clone(),
                 verbose: cli.verbose,
                 json: ui.json,
@@ -371,6 +436,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             features,
             all_features,
             no_default_features,
+            target,
             offline,
             locked,
             frozen,
@@ -382,6 +448,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 jobs: *jobs,
                 keep_going: *keep_going,
                 features: feature_flags(features, *all_features, *no_default_features),
+                target: target.clone(),
                 verbose: cli.verbose,
                 json: ui.json,
                 offline: *offline,
@@ -395,6 +462,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             features,
             all_features,
             no_default_features,
+            target,
             offline,
             locked,
             frozen,
@@ -404,6 +472,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 release: *release,
                 package: package.clone(),
                 features: feature_flags(features, *all_features, *no_default_features),
+                target: target.clone(),
                 verbose: cli.verbose,
                 offline: *offline,
                 locked: *locked,
@@ -432,15 +501,60 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             let root = load_scope()?;
             lockflow::dev_flow(&ui, &root, name, cli.verbose)
         }
-        Some(Commands::Publish) => {
+        Some(Commands::Publish {
+            registry,
+            token,
+            dry_run,
+            package,
+        }) => {
             let root = load_scope()?;
             for (pkg, key) in lockflow::active_patches(&root)? {
                 ui.warn(&format!(
                     "patch override active for `{key}` in {pkg}; remove it before publishing"
                 ));
             }
-            bail!(unimplemented_message(&Commands::Publish))
+            lockflow::publish_flow(
+                &ui,
+                &root,
+                package.clone(),
+                registry.clone(),
+                token.clone(),
+                *dry_run,
+                cli.verbose,
+            )
         }
+        Some(Commands::Login { registry, token }) => {
+            lockflow::login_flow(&ui, registry.clone(), token.clone())
+        }
+        Some(Commands::Search { query, registry }) => {
+            lockflow::search_flow(&ui, query.clone(), registry.clone(), cli.verbose)
+        }
+        Some(Commands::Install {
+            package,
+            bin,
+            release,
+            jobs,
+            features,
+            all_features,
+            no_default_features,
+            offline,
+            locked,
+            frozen,
+        }) => cmd_install(
+            &ui,
+            InstallFlags {
+                package: package.clone(),
+                bin: bin.clone(),
+                release: *release,
+                jobs: *jobs,
+                features: feature_flags(features, *all_features, *no_default_features),
+                offline: *offline,
+                locked: *locked,
+                frozen: *frozen,
+                verbose: cli.verbose,
+                json: ui.json,
+            },
+        ),
         Some(Commands::Clean { package }) => cmd_clean(&ui, package.clone()),
         Some(Commands::Toolchains) => cmd_toolchains(&ui),
         Some(other) => bail!(unimplemented_message(other)),
@@ -541,10 +655,6 @@ fn unimplemented_message(cmd: &Commands) -> String {
         Commands::Tree => ("tree", "M4"),
         Commands::Fmt => ("fmt", "M8"),
         Commands::Doc => ("doc", "M8"),
-        Commands::Publish => ("publish", "M5"),
-        Commands::Login => ("login", "M5"),
-        Commands::Search { .. } => ("search", "M5"),
-        Commands::Install => ("install", "M5"),
         _ => ("command", "a later milestone"),
     };
     format!("`rivet {name}` is not implemented yet (planned for {milestone}). See PLAN.md for the milestone checklist")
@@ -710,6 +820,8 @@ pub struct RunFlags {
     pub keep_going: bool,
     /// Feature selection.
     pub features: rivet_graph::FeatureFlags,
+    /// Cross-compile target triple.
+    pub target: Option<String>,
     /// Arguments forwarded to the binary.
     pub args: Vec<OsString>,
     /// Verbose logging.
@@ -736,6 +848,8 @@ pub struct TestFlags {
     pub keep_going: bool,
     /// Feature selection.
     pub features: rivet_graph::FeatureFlags,
+    /// Cross-compile target triple.
+    pub target: Option<String>,
     /// Verbose logging.
     pub verbose: bool,
     /// JSON message format.
@@ -756,6 +870,8 @@ pub struct CompileCommandsFlags {
     pub package: Option<String>,
     /// Feature selection.
     pub features: rivet_graph::FeatureFlags,
+    /// Cross-compile target triple.
+    pub target: Option<String>,
     /// Verbose logging.
     pub verbose: bool,
     /// No network (cache/vendor only).
@@ -764,6 +880,79 @@ pub struct CompileCommandsFlags {
     pub locked: bool,
     /// No network + error if the lockfile would change.
     pub frozen: bool,
+}
+
+/// Flags for [`cmd_install`].
+pub struct InstallFlags {
+    /// `-p` package selector.
+    pub package: Option<String>,
+    /// `--bin` binary selector.
+    pub bin: Option<String>,
+    /// Use the `release` profile.
+    pub release: bool,
+    /// Parallel compile jobs (`0` = auto).
+    pub jobs: usize,
+    /// Feature selection.
+    pub features: rivet_graph::FeatureFlags,
+    /// No network (cache/vendor only).
+    pub offline: bool,
+    /// Error if the lockfile would change.
+    pub locked: bool,
+    /// No network + error if the lockfile would change.
+    pub frozen: bool,
+    /// Verbose logging.
+    pub verbose: bool,
+    /// JSON message format.
+    pub json: bool,
+}
+
+/// Build the scope, then copy every selected binary to `~/.rivet/bin`.
+fn cmd_install(ui: &Ui, flags: InstallFlags) -> Result<()> {
+    let built = cmd_build(
+        ui,
+        BuildFlags {
+            release: flags.release,
+            package: flags.package.clone(),
+            bin: flags.bin.clone(),
+            jobs: flags.jobs,
+            keep_going: false,
+            features: flags.features.clone(),
+            target: None,
+            verbose: flags.verbose,
+            json: flags.json,
+            offline: flags.offline,
+            locked: flags.locked,
+            frozen: flags.frozen,
+        },
+    )?;
+    let root = rivet_cache::cache_root().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let bin_dir = root.join("bin");
+    std::fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("could not create {}", bin_dir.display()))?;
+    let mut bins: Vec<&PathBuf> = Vec::new();
+    for b in &built {
+        for target in &b.plan.bins {
+            if let Some(want) = &flags.bin {
+                if target.name != *want {
+                    continue;
+                }
+            }
+            bins.push(&target.output);
+        }
+    }
+    if bins.is_empty() {
+        bail!("no binaries selected. Fix: check `-p`/`--bin` selection");
+    }
+    for exe in bins {
+        let name = exe
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("binary has no file name"))?;
+        let dst = bin_dir.join(name);
+        std::fs::copy(exe, &dst)
+            .with_context(|| format!("could not copy {} to {}", exe.display(), dst.display()))?;
+        ui.status("Installed", &format!("{}", dst.display()));
+    }
+    Ok(())
 }
 
 /// One built unit: its resolution, plan, and (if it was stale) summary.
@@ -855,12 +1044,25 @@ fn restrict_to_bin(
         .collect())
 }
 
+/// Resolve the toolchain for an optional `--target` request.
+/// `None` (or a native triple) means normal detection; anything else goes
+/// through clang `--target=` or fails actionably. The selection's triple is
+/// recorded on the toolchain so fingerprints and driver flags follow.
+fn select_toolchain(target: Option<&str>) -> Result<rivet_toolchain::CxxToolchain> {
+    use rivet_toolchain::{select_for_target, TargetTriple};
+    let requested = target
+        .map(TargetTriple::parse)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let selection = select_for_target(requested.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut toolchain = selection.toolchain;
+    toolchain.target = requested;
+    Ok(toolchain)
+}
+
 /// Build every unit in scope, returning them with their plans.
-/// Prints Cargo-like `Compiling`/`Fresh`/`Finished` lines.
+/// Prints Cargo-like `Compiling`/`Fresh`/`Cached`/`Finished` lines.
 fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
-    if let Some(triple) = &flags.target {
-        bail!("cross-compiling to `{triple}` is not implemented yet (planned for M7). See PLAN.md");
-    }
     let root = load_scope()?;
     let profile = if flags.release { "release" } else { "dev" };
     let mut units = lockflow::resolve_build_units(
@@ -880,16 +1082,38 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
         units = restrict_to_bin(units, bin)?;
     }
 
-    let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let detection = select_toolchain(flags.target.as_deref())?;
     log_toolchain(ui, &detection);
+    if let Some(t) = &detection.target {
+        ui.verbose(&format!("target: {t}"));
+    }
+    let cache_root = rivet_cache::cache_root().map_err(|e| anyhow::anyhow!("{e}"))?;
     let build_opts = rivet_graph::BuildOptions {
         verbose: flags.verbose,
         jobs: flags.jobs,
         fail_fast: !flags.keep_going,
+        cache_dir: Some(cache_root),
     };
     let started = std::time::Instant::now();
     let mut built = Vec::new();
+    build_adapter_units(
+        ui,
+        &mut units,
+        profile,
+        &detection,
+        flags.jobs,
+        flags.verbose,
+    )?;
     for unit in &units {
+        if unit.adapter.is_some() {
+            // Adapter outputs feed dependents through `adapter_output`;
+            // they have no rivet targets of their own.
+            built.push(BuiltUnit {
+                unit: unit.clone(),
+                plan: adapter_empty_plan(&unit.manifest, profile),
+            });
+            continue;
+        }
         let plan = build_single_unit(ui, unit, &units, profile, &detection, &build_opts)?;
         built.push(BuiltUnit {
             unit: unit.clone(),
@@ -899,6 +1123,169 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     let secs = started.elapsed().as_secs_f64();
     ui.status("Finished", &format!("{profile} profile in {secs:.2}s"));
     Ok(built)
+}
+
+/// Run the adapter flow for every adapter unit in topo order (sync loop:
+/// clone out, build, write back so dependents see `adapter_output`).
+fn build_adapter_units(
+    ui: &Ui,
+    units: &mut [rivet_graph::workspace::Unit],
+    profile: &str,
+    toolchain: &rivet_toolchain::CxxToolchain,
+    jobs: usize,
+    verbose: bool,
+) -> Result<()> {
+    for unit in units.iter_mut() {
+        if unit.adapter.is_some() {
+            build_adapter_unit(ui, unit, profile, toolchain, jobs, verbose)?;
+        }
+    }
+    Ok(())
+}
+
+/// Empty plan placeholder for adapter-built units (their outputs feed
+/// dependents through `adapter_output`, never through rivet targets).
+fn adapter_empty_plan(
+    manifest: &rivet_manifest::Manifest,
+    profile: &str,
+) -> rivet_graph::PackagePlan {
+    rivet_graph::PackagePlan {
+        profile: profile.to_string(),
+        bins: Vec::new(),
+        lib: None,
+        header_only: false,
+        target_dir: manifest
+            .dir
+            .join("target")
+            .join(rivet_graph::profile_dir(profile)),
+    }
+}
+
+/// Build one foreign unit through its adapter (or probe it when `system`),
+/// filling `unit.adapter_output` for dependents later in topo order.
+/// Adapter spec/options live in `lockflow::adapter_fingerprint_paths`'s
+/// sibling state file next to the unit's target dir.
+fn build_adapter_unit(
+    ui: &Ui,
+    unit: &mut rivet_graph::workspace::Unit,
+    profile: &str,
+    toolchain: &rivet_toolchain::CxxToolchain,
+    jobs: usize,
+    verbose: bool,
+) -> Result<()> {
+    use rivet_adapters::{build_adapter, probe_installed, AdapterKind};
+    let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
+    let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
+    let spec = unit
+        .adapter
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("adapter unit `{name}` lost its spec (internal error)"))?;
+    // Guardrail: adapter units must be foreign. Explicit `bin`/`lib`
+    // declarations plus an `adapter` are contradictory (one entry point
+    // would silently never build); lib *conventions* (`src/lib.cpp`,
+    // leftover sources, `include/` headers) cannot distinguish foreign
+    // sources, so the adapter wins over them.
+    let bins = rivet_manifest::resolve_bins(&unit.manifest);
+    if !bins.is_empty() || unit.manifest.lib.is_some() {
+        bail!(
+            "adapter dep `{name}` declares rivet targets (bin/lib) and an `adapter`. Fix: remove the `adapter` to build it as a rivet package, or drop `bin`/`lib` to build it as foreign"
+        );
+    }
+    let base = unit_target_dir(unit, profile);
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("could not create {}", base.display()))?;
+    let state_path = base.join("adapter-fingerprint.json");
+
+    // System probes run every build (millisecond probes; the installed
+    // library may change under us — no fingerprint gate).
+    if spec.tool == "system"
+        || !AdapterKind::from_tool(&spec.tool)
+            .map(|k| k.builds_sources())
+            .unwrap_or(false)
+    {
+        let probe_tool = if spec.tool.is_empty() {
+            "system"
+        } else {
+            spec.tool.as_str()
+        };
+        let output = match AdapterKind::from_tool(probe_tool) {
+            Ok(AdapterKind::PkgConfig) | Ok(AdapterKind::System) => {
+                probe_installed(probe_tool, name).map_err(|e| anyhow::anyhow!("{e}"))?
+            }
+            _ => {
+                // `cmake`/`meson`/`make` with no sources cannot probe.
+                bail!(
+                    "adapter dep `{name}` has no sources to build with `{}`. Fix: give it a `path`/`git` source or use a probing tool",
+                    spec.tool
+                );
+            }
+        };
+        ui.status("Fresh", &format!("{name} v{version} (system probe)"));
+        ui.verbose(&format!(
+            "probed {name}: {} includes, {} libs",
+            output.include_dirs.len(),
+            output.libs.len()
+        ));
+        unit.adapter_output = Some(output);
+        return Ok(());
+    }
+
+    // Source builds: fingerprint gate (source bytes + spec + toolchain).
+    let tc_fp = toolchain.fingerprint(&rivet_graph::compile_options(
+        &unit.manifest,
+        profile,
+        &[],
+        &unit.features,
+        &[],
+    ));
+    let fp_now = rivet_adapters::fingerprint(&unit.dir, &spec, &tc_fp)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(prev) = lockflow::read_adapter_state(&state_path)? {
+        if prev.fingerprint == fp_now {
+            ui.status("Fresh", &format!("{name} v{version} (adapter)"));
+            unit.adapter_output = Some(prev.output);
+            return Ok(());
+        }
+    }
+    ui.status(
+        "Compiling",
+        &format!("{name} v{version} ({profile}, {})", spec.tool),
+    );
+    let build_type = if profile == "release" {
+        "Release"
+    } else {
+        "Debug"
+    };
+    let build_dir = base.join("adapter-build");
+    // `make` builds in-source: hand it a writable scratch copy (the real
+    // sources may live in an immutable checkout).
+    let source_dir = if spec.tool == "make" {
+        let copy = base.join("adapter-src");
+        if copy.is_dir() {
+            std::fs::remove_dir_all(&copy)
+                .with_context(|| format!("could not clear {}", copy.display()))?;
+        }
+        lockflow::copy_dir_filtered(&unit.dir, &copy, true)?;
+        copy
+    } else {
+        unit.dir.clone()
+    };
+    let mut ctx = rivet_adapters::AdapterCtx::new(build_dir).with_build_type(build_type);
+    if jobs > 0 {
+        ctx = ctx.with_jobs(jobs);
+    }
+    ctx = ctx.with_toolchain(toolchain.clone());
+    let output = build_adapter(&source_dir, &spec, &ctx).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if verbose {
+        eprintln!(
+            "       adapter {name}: {} includes, {} libs",
+            output.include_dirs.len(),
+            output.libs.len()
+        );
+    }
+    lockflow::write_adapter_state(&state_path, &fp_now, &output)?;
+    unit.adapter_output = Some(output);
+    Ok(())
 }
 
 /// Target dir for a unit: locked-materialized units redirect under the
@@ -941,6 +1328,9 @@ fn build_single_unit(
             &unit.features,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if summary.cached {
+            ui.status("Cached", &format!("{name} v{version}"));
+        }
         report_build_summary(ui, &summary);
     }
     Ok(plan)
@@ -990,18 +1380,36 @@ fn cmd_test(ui: &Ui, flags: TestFlags) -> Result<()> {
         flags.verbose,
     )?;
 
-    let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let detection = select_toolchain(flags.target.as_deref())?;
     log_toolchain(ui, &detection);
+    if let Some(t) = &detection.target {
+        ui.verbose(&format!("target: {t}"));
+    }
+    let cache_root = rivet_cache::cache_root().map_err(|e| anyhow::anyhow!("{e}"))?;
     let build_opts = rivet_graph::BuildOptions {
         verbose: flags.verbose,
         jobs: flags.jobs,
         fail_fast: !flags.keep_going,
+        cache_dir: Some(cache_root),
     };
     let started = std::time::Instant::now();
     let mut passed: usize = 0;
     let mut failed: usize = 0;
     let mut failures: Vec<String> = Vec::new();
+    let mut units = units;
+    build_adapter_units(
+        ui,
+        &mut units,
+        profile,
+        &detection,
+        flags.jobs,
+        flags.verbose,
+    )?;
     for unit in &units {
+        if unit.adapter.is_some() {
+            // No rivet tests inside foreign sources.
+            continue;
+        }
         let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
         let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
         // 1. Normal build: lib + bins first.
@@ -1087,10 +1495,16 @@ fn cmd_compile_commands(ui: &Ui, flags: CompileCommandsFlags) -> Result<()> {
     )?;
 
     // Flag mapping needs a toolchain, but nothing is compiled.
-    let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let detection = select_toolchain(flags.target.as_deref())?;
     log_toolchain(ui, &detection);
+    let mut units = units;
+    build_adapter_units(ui, &mut units, profile, &detection, 0, flags.verbose)?;
     let mut merged: Vec<rivet_graph::compile_commands::CompileEntry> = Vec::new();
     for unit in &units {
+        if unit.adapter.is_some() {
+            // Foreign sources are not rivet translation units.
+            continue;
+        }
         let target_dir = unit_target_dir(unit, profile);
         let plan = rivet_graph::plan_with_target(&unit.manifest, profile, &detection, &target_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1134,7 +1548,7 @@ fn cmd_run(ui: &Ui, flags: RunFlags) -> Result<()> {
             jobs: flags.jobs,
             keep_going: flags.keep_going,
             features: flags.features.clone(),
-            target: None,
+            target: flags.target.clone(),
             verbose: flags.verbose,
             json: flags.json,
             offline: flags.offline,
@@ -1319,8 +1733,6 @@ mod tests {
         // Tree is the remaining M4 stub; update/git/vendor/dev are implemented.
         let msg = unimplemented_message(&Commands::Tree);
         assert!(msg.contains("M4"), "got: {msg}");
-        let msg = unimplemented_message(&Commands::Publish);
-        assert!(msg.contains("M5"), "got: {msg}");
     }
 
     #[test]

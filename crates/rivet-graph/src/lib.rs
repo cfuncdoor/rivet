@@ -27,6 +27,7 @@ pub mod compile_commands;
 pub mod depfile;
 pub mod features;
 pub mod schedule;
+pub mod script;
 pub mod state;
 pub mod test;
 pub mod workspace;
@@ -144,6 +145,14 @@ pub enum Error {
         /// What failed.
         message: String,
     },
+    /// A foreign adapter spec or run failed.
+    #[error("adapter for `{name}` failed: {message}")]
+    Adapter {
+        /// Dependency key.
+        name: String,
+        /// What failed.
+        message: String,
+    },
     /// Path dependencies form a cycle.
     #[error("dependency cycle detected: {cycle}. Fix: remove one of the `path` edges")]
     DependencyCycle {
@@ -206,6 +215,12 @@ pub enum Error {
     /// Toolchain error.
     #[error("{0}")]
     Toolchain(#[from] rivet_toolchain::Error),
+    /// Build-script failure.
+    #[error("{0}")]
+    Buildscript(#[from] rivet_buildscript::Error),
+    /// Artifact-cache failure.
+    #[error("{0}")]
+    Cache(#[from] rivet_cache::Error),
 }
 
 // ---------------------------------------------------------------------------
@@ -498,12 +513,14 @@ pub fn plan_with_target(
 /// Compile options for a package: own `include/` first, then dependency
 /// include dirs (deduped, order-preserving — `-I` order is semantics).
 /// Profile `opt`/`debug`/`lto`/`sanitizers` come from the manifest profile;
-/// `features` (sorted, enabled) joins the fingerprint.
+/// `features` (sorted, enabled) joins the fingerprint. `extra_defines`
+/// carries adapter/probe/script defines.
 pub fn compile_options(
     manifest: &Manifest,
     profile: &str,
     extra_includes: &[PathBuf],
     features: &BTreeSet<String>,
+    extra_defines: &[String],
 ) -> CompileOptions {
     let prof = if profile == "release" {
         &manifest.profile.release
@@ -524,12 +541,41 @@ pub fn compile_options(
         std: m::effective_standard(manifest).to_string(),
         opt: prof.opt,
         debug: prof.debug,
-        defines: Vec::new(),
+        defines: extra_defines.to_vec(),
         include_dirs,
         lto: prof.lto,
         sanitizers: prof.sanitizers.clone(),
         features: features.iter().cloned().collect(),
     }
+}
+
+/// Full compile options: base options plus adapter/probe defines and the
+/// build script's defines/includes (deduped, order-preserving).
+fn full_compile_options(
+    manifest: &Manifest,
+    profile: &str,
+    inputs: &UnitInputs,
+    features: &BTreeSet<String>,
+    script: &script::ScriptUse,
+) -> CompileOptions {
+    let mut opts = compile_options(
+        manifest,
+        profile,
+        &inputs.include_dirs,
+        features,
+        &inputs.defines,
+    );
+    for d in &script.defines {
+        if !opts.defines.contains(d) {
+            opts.defines.push(d.clone());
+        }
+    }
+    for inc in &script.includes {
+        if !opts.include_dirs.contains(inc) {
+            opts.include_dirs.push(inc.clone());
+        }
+    }
+    opts
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +591,9 @@ pub struct BuildOptions {
     pub jobs: usize,
     /// Stop scheduling new compiles after the first failure.
     pub fail_fast: bool,
+    /// Artifact-cache root (`~/.rivet` layout). `Some` enables
+    /// whole-package cache lookup/store around the build; `None` disables.
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for BuildOptions {
@@ -553,6 +602,7 @@ impl Default for BuildOptions {
             verbose: false,
             jobs: 0,
             fail_fast: true,
+            cache_dir: None,
         }
     }
 }
@@ -572,22 +622,40 @@ pub struct UnitSummary {
     pub log: Vec<String>,
     /// `true` when nothing needed doing.
     pub fresh: bool,
+    /// `true` when outputs were restored from the artifact cache instead
+    /// of compiling (CLI prints `Cached`).
+    pub cached: bool,
 }
 
-/// Fingerprint for a package build (toolchain + resolved flags + features).
+/// Fingerprint for a package build.
+///
+/// Covers toolchain + resolved flags + features + link-only inputs.
+/// `script` contributes its defines/includes through the options;
+/// `lib_dirs`/`sys_libs` (link-only, invisible to the compile fingerprint)
+/// join as a content hash so probe changes rebuild.
 fn fingerprint_for(
     manifest: &Manifest,
     profile: &str,
     inputs: &UnitInputs,
     toolchain: &CxxToolchain,
     features: &BTreeSet<String>,
+    script: &script::ScriptUse,
 ) -> String {
-    toolchain.fingerprint(&compile_options(
-        manifest,
-        profile,
-        &inputs.include_dirs,
-        features,
-    ))
+    let opts = full_compile_options(manifest, profile, inputs, features, script);
+    let mut sys = String::new();
+    for dir in inputs.lib_dirs.iter().chain(script.lib_dirs.iter()) {
+        sys.push_str(&dir.display().to_string());
+        sys.push('\0');
+    }
+    for name in inputs.sys_libs.iter().chain(script.sys_libs.iter()) {
+        sys.push_str(name);
+        sys.push('\0');
+    }
+    format!(
+        "{}|syslibs={}",
+        toolchain.fingerprint(&opts),
+        state::hash_bytes(sys.as_bytes())
+    )
 }
 
 /// One stale translation unit awaiting compilation.
@@ -610,6 +678,7 @@ struct Assessment {
 fn assess(
     plan: &PackagePlan,
     inputs: &UnitInputs,
+    script: &script::ScriptUse,
     fingerprint: &str,
 ) -> Result<(state::BuildState, Assessment), Error> {
     let (mut st, usable) = state::BuildState::load(&plan.target_dir, fingerprint)?;
@@ -686,7 +755,7 @@ fn assess(
     // Stale links: missing output or digest mismatch over current inputs.
     let mut stale_links = Vec::new();
     for t in &targets {
-        let digest = current_link_digest(plan, t, inputs, fingerprint)?;
+        let digest = current_link_digest(plan, t, inputs, script, fingerprint)?;
         let stale = match digest {
             None => true,
             Some(d) => st.link(&link_id(t)).map(|s| s != &d).unwrap_or(true),
@@ -723,28 +792,67 @@ fn link_id(t: &TargetBuild) -> String {
     }
 }
 
-/// Digest over current input files for an output, or `None` when any input
-/// is missing (object or archive not built yet).
+/// Digest over current link inputs for an output, or `None` when any input
+/// is missing (object or archive not built yet). Paths join the digest
+/// alongside contents so a moved-but-identical input still relinks; link
+/// search dirs and bare names join as flag strings.
 fn current_link_digest(
     plan: &PackagePlan,
     t: &TargetBuild,
     inputs: &UnitInputs,
+    script: &script::ScriptUse,
     fingerprint: &str,
 ) -> Result<Option<String>, Error> {
-    let mut hashes = Vec::new();
+    let mut parts = Vec::new();
     for job in &t.jobs {
         match state::hash_file(&job.obj_abs)? {
-            Some(h) => hashes.push(h),
+            Some(h) => parts.push(format!("{}={h}", job.obj_abs.display())),
             None => return Ok(None),
         }
     }
-    for archive in link_archives(plan, t, inputs) {
-        match state::hash_file(&archive)? {
-            Some(h) => hashes.push(h),
+    let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, t, inputs, script);
+    for archive in &archives {
+        match state::hash_file(archive)? {
+            Some(h) => parts.push(format!("{}={h}", archive.display())),
             None => return Ok(None),
         }
     }
-    Ok(Some(state::link_digest(fingerprint, &hashes)))
+    for dir in lib_dirs {
+        parts.push(format!("L{}", dir.display()));
+    }
+    for name in sys_libs {
+        parts.push(format!("l{name}"));
+    }
+    Ok(Some(state::link_digest(fingerprint, &parts)))
+}
+
+/// Full link inputs for a target: archives (own lib, script files, dep
+/// archives in order) plus search dirs and bare names.
+fn full_link_inputs(
+    plan: &PackagePlan,
+    t: &TargetBuild,
+    inputs: &UnitInputs,
+    script: &script::ScriptUse,
+) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<String>) {
+    let mut archives = link_archives(plan, t, inputs);
+    for a in &script.archives {
+        if !archives.contains(a) {
+            archives.push(a.clone());
+        }
+    }
+    let mut lib_dirs = inputs.lib_dirs.clone();
+    for d in &script.lib_dirs {
+        if !lib_dirs.contains(d) {
+            lib_dirs.push(d.clone());
+        }
+    }
+    let mut sys_libs = inputs.sys_libs.clone();
+    for s in &script.sys_libs {
+        if !sys_libs.contains(s) {
+            sys_libs.push(s.clone());
+        }
+    }
+    (archives, lib_dirs, sys_libs)
 }
 
 /// Archives on a target's link line: own lib archive (bins only) plus
@@ -780,14 +888,21 @@ pub fn is_fresh_unit(
     inputs: &UnitInputs,
     features: &BTreeSet<String>,
 ) -> Result<bool, Error> {
-    let fingerprint = fingerprint_for(manifest, &plan.profile, inputs, toolchain, features);
-    toolchain.validate_options(&compile_options(
+    let (script, script_needs_run) = script::peek_script(manifest, &plan.target_dir)?;
+    if script_needs_run {
+        return Ok(false);
+    }
+    let fingerprint = fingerprint_for(
         manifest,
         &plan.profile,
-        &inputs.include_dirs,
+        inputs,
+        toolchain,
         features,
-    ))?;
-    let (_st, assessment) = assess(plan, inputs, &fingerprint)?;
+        &script,
+    );
+    let opts = full_compile_options(manifest, &plan.profile, inputs, features, &script);
+    toolchain.validate_options(&opts)?;
+    let (_st, assessment) = assess(plan, inputs, &script, &fingerprint)?;
     Ok(assessment.stale_tus.is_empty() && assessment.stale_links.is_empty())
 }
 
@@ -802,14 +917,39 @@ pub fn build_unit(
     opts: &BuildOptions,
     features: &BTreeSet<String>,
 ) -> Result<UnitSummary, Error> {
-    let fingerprint = fingerprint_for(manifest, &plan.profile, inputs, toolchain, features);
-    let compile_opts = compile_options(manifest, &plan.profile, &inputs.include_dirs, features);
-    toolchain.validate_options(&compile_opts)?;
     let package = m::package_name(manifest).unwrap_or("<unknown>").to_string();
-
     for sub in ["deps", "build", "incremental"] {
         std::fs::create_dir_all(plan.target_dir.join(sub))?;
     }
+    // Build script first: its outputs feed flags, links, fingerprint, and
+    // the cache key. The script compiles against base options (it cannot
+    // depend on its own output).
+    let script_out_dir = plan.target_dir.join("build").join("script");
+    let base_opts = full_compile_options(
+        manifest,
+        &plan.profile,
+        inputs,
+        features,
+        &script::ScriptUse::default(),
+    );
+    let script = script::run_script_if_needed(
+        manifest,
+        toolchain,
+        &base_opts,
+        &plan.target_dir,
+        &script_out_dir,
+        opts.verbose,
+    )?;
+    let fingerprint = fingerprint_for(
+        manifest,
+        &plan.profile,
+        inputs,
+        toolchain,
+        features,
+        &script,
+    );
+    let compile_opts = full_compile_options(manifest, &plan.profile, inputs, features, &script);
+    toolchain.validate_options(&compile_opts)?;
     let mut targets: Vec<&TargetBuild> = plan.bins.iter().collect();
     if let Some(lib) = &plan.lib {
         targets.push(lib);
@@ -823,12 +963,29 @@ pub fn build_unit(
         }
     }
 
-    let (mut st, assessment) = assess(plan, inputs, &fingerprint)?;
+    let (mut st, assessment) = assess(plan, inputs, &script, &fingerprint)?;
     let mut summary = UnitSummary {
         package,
         outputs: all_outputs(plan),
         ..Default::default()
     };
+    if script.ran {
+        summary.log.push("ran build.rivet.cpp".to_string());
+    }
+    for line in &script.log {
+        summary.log.push(line.clone());
+    }
+
+    // Artifact cache: on a hit, restore outputs + state and skip the build.
+    if !assessment.stale_tus.is_empty() || !assessment.stale_links.is_empty() {
+        if let Some(root) = &opts.cache_dir {
+            let key = cache_key_for(manifest, plan, &fingerprint, features)?;
+            if try_cache_restore(root, &key, plan, &mut st, &mut summary)? {
+                summary.cached = true;
+                return Ok(summary);
+            }
+        }
+    }
 
     // 1. Parallel compiles.
     if !assessment.stale_tus.is_empty() {
@@ -950,14 +1107,14 @@ pub fn build_unit(
             }
             summary.relinked.push(lib.output.clone());
         }
-        if let Some(digest) = current_link_digest(plan, lib, inputs, &fingerprint)? {
+        if let Some(digest) = current_link_digest(plan, lib, inputs, &script, &fingerprint)? {
             st.record_link(&link_id(lib), digest);
         }
     }
 
     // 4. Link bins whose inputs changed (digest over current files).
     for bin in &plan.bins {
-        let digest = current_link_digest(plan, bin, inputs, &fingerprint)?;
+        let digest = current_link_digest(plan, bin, inputs, &script, &fingerprint)?;
         let needs = summary.recompiled.iter().any(|(tag, _)| tag == &bin.tag)
             || !bin.output.is_file()
             || digest.as_ref() != st.link(&link_id(bin));
@@ -965,8 +1122,15 @@ pub fn build_unit(
             continue;
         }
         let objects: Vec<PathBuf> = bin.jobs.iter().map(|j| j.obj_abs.clone()).collect();
-        let archives = link_archives(plan, bin, inputs);
-        let mut cmd = toolchain.link_exe_command(&objects, &archives, &bin.output, &compile_opts);
+        let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, bin, inputs, &script);
+        let mut cmd = toolchain.link_exe_command(
+            &objects,
+            &archives,
+            &lib_dirs,
+            &sys_libs,
+            &bin.output,
+            &compile_opts,
+        );
         cmd.current_dir(&manifest.dir);
         if opts.verbose {
             summary.log.push(format!("Running `{cmd:?}`"));
@@ -988,12 +1152,22 @@ pub fn build_unit(
             });
         }
         summary.relinked.push(bin.output.clone());
-        if let Some(digest) = current_link_digest(plan, bin, inputs, &fingerprint)? {
+        if let Some(digest) = current_link_digest(plan, bin, inputs, &script, &fingerprint)? {
             st.record_link(&link_id(bin), digest);
         }
     }
 
     st.save(&plan.target_dir)?;
+    // Store fresh outputs in the artifact cache. Best-effort: a store
+    // failure is logged, never fatal to an otherwise good build.
+    if let Some(root) = &opts.cache_dir {
+        let key = cache_key_for(manifest, plan, &fingerprint, features)?;
+        if let Err(e) = cache_store(root, &key, plan, &st) {
+            summary
+                .log
+                .push(format!("artifact cache store skipped: {e}"));
+        }
+    }
     summary.fresh = summary.recompiled.is_empty() && summary.relinked.is_empty();
     Ok(summary)
 }
@@ -1005,6 +1179,208 @@ fn all_outputs(plan: &PackagePlan) -> Vec<PathBuf> {
         out.push(lib.output.clone());
     }
     out
+}
+
+/// Sidecar recording what a cache entry restores: output mapping plus a
+/// state snapshot (the cache manifest only tracks sizes, not TU records).
+/// Lives inside the artifact dir as `build-state.json`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CacheSidecar {
+    key: String,
+    outputs: Vec<SidecarOutput>,
+    tus: BTreeMap<String, BTreeMap<String, state::TuState>>,
+    links: BTreeMap<String, String>,
+}
+
+/// One restored output: original absolute path + stored basename.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SidecarOutput {
+    original: PathBuf,
+    stored: String,
+}
+
+const SIDECAR_NAME: &str = "build-state.json";
+
+/// Cache key inputs: every source file, current content. Recorded headers
+/// are NOT part of the key (they may be unknown after a `target/` wipe);
+/// instead a lookup verifies stored dep hashes against current files and
+/// treats any drift as a miss (then the normal build runs).
+fn cache_inputs_hash(plan: &PackagePlan) -> Result<String, Error> {
+    let mut files = BTreeSet::new();
+    for t in plan.bins.iter().chain(plan.lib.iter()) {
+        for job in &t.jobs {
+            files.insert(job.src_abs.clone());
+        }
+    }
+    let existing: Vec<PathBuf> = files.into_iter().filter(|p| p.is_file()).collect();
+    Ok(rivet_cache::inputs_hash(&existing)?)
+}
+
+/// Full artifact-cache key for a package build.
+fn cache_key_for(
+    manifest: &Manifest,
+    plan: &PackagePlan,
+    fingerprint: &str,
+    features: &BTreeSet<String>,
+) -> Result<String, Error> {
+    let name = m::package_name(manifest).unwrap_or("<unknown>");
+    let version = m::package_version(manifest).unwrap_or("0.0.0");
+    let features: Vec<String> = features.iter().cloned().collect();
+    let inputs_hash = cache_inputs_hash(plan)?;
+    // Flags ride inside the fingerprint already; pass none separately.
+    Ok(rivet_cache::artifact_key(
+        name,
+        version,
+        &features,
+        fingerprint,
+        &plan.profile,
+        &[],
+        &inputs_hash,
+    ))
+}
+
+/// Try a cache restore: verify recorded dep hashes against current files,
+/// copy outputs back, repopulate state, save. Returns `true` on a hit
+/// (caller returns the summary as cached); any drift is a miss and the
+/// normal build runs.
+fn try_cache_restore(
+    cache_root: &Path,
+    key: &str,
+    plan: &PackagePlan,
+    st: &mut state::BuildState,
+    summary: &mut UnitSummary,
+) -> Result<bool, Error> {
+    let Some(stored) = rivet_cache::lookup(cache_root, key) else {
+        return Ok(false);
+    };
+    let sidecar_path = stored.dir.join(SIDECAR_NAME);
+    let text = match std::fs::read_to_string(&sidecar_path) {
+        Ok(t) => t,
+        Err(_) => return Ok(false),
+    };
+    let sidecar: CacheSidecar = match serde_json::from_str(&text) {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    if sidecar.key != key {
+        return Ok(false);
+    }
+    // Verify recorded dep hashes against current files first: the key
+    // covers sources only, so header drift must fail the hit (then the
+    // normal build runs and recompiles precisely).
+    for sources in sidecar.tus.values() {
+        for rec in sources.values() {
+            for dep in &rec.deps {
+                let current = state::hash_file(Path::new(dep))?;
+                if current.as_ref() != rec.dep_hashes.get(dep) {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    // Map stored basenames to cache paths; every recorded output must
+    // resolve, else treat as a miss and rebuild normally.
+    let mut by_name: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for file in &stored.files {
+        if let Some(name) = file.file_name().and_then(|n| n.to_str()) {
+            by_name.insert(name.to_string(), file.clone());
+        }
+    }
+    let mut restored: Vec<PathBuf> = Vec::new();
+    for output in &sidecar.outputs {
+        let Some(cached) = by_name.get(&output.stored) else {
+            return Ok(false);
+        };
+        if let Some(parent) = output.original.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(cached, &output.original)?;
+        restored.push(output.original.clone());
+    }
+    // Repopulate incremental state from the snapshot so the next build
+    // probes Fresh instead of rebuilding.
+    for (unit, sources) in &sidecar.tus {
+        for (src_rel, rec) in sources {
+            st.record_tu(
+                unit,
+                src_rel,
+                state::TuRecord {
+                    hash: rec.hash.clone(),
+                    object_rel: rec.object.clone(),
+                    depfile_rel: rec.depfile.clone(),
+                    deps: rec.deps.clone(),
+                    dep_hashes: rec.dep_hashes.clone(),
+                },
+            );
+        }
+    }
+    for (id, digest) in &sidecar.links {
+        st.record_link(id, digest.clone());
+    }
+    st.save(&plan.target_dir)?;
+    summary.outputs = restored;
+    summary
+        .log
+        .push("restored outputs from artifact cache".to_string());
+    Ok(true)
+}
+
+/// Store a fresh build in the artifact cache with its state sidecar.
+fn cache_store(
+    cache_root: &Path,
+    key: &str,
+    plan: &PackagePlan,
+    st: &state::BuildState,
+) -> Result<(), Error> {
+    let outputs = all_outputs(plan);
+    if outputs.iter().any(|o| !o.is_file()) {
+        return Ok(());
+    }
+    let stored = rivet_cache::store(cache_root, key, &outputs)?;
+    let mut by_original: BTreeMap<PathBuf, String> = BTreeMap::new();
+    for (original, cached) in outputs.iter().zip(stored.files.iter()) {
+        if let Some(name) = cached.file_name().and_then(|n| n.to_str()) {
+            by_original.insert(original.clone(), name.to_string());
+        }
+    }
+    let mut sidecar_outputs = Vec::new();
+    for original in &outputs {
+        let Some(stored) = by_original.get(original) else {
+            return Ok(());
+        };
+        sidecar_outputs.push(SidecarOutput {
+            original: original.clone(),
+            stored: stored.clone(),
+        });
+    }
+    let mut tus = BTreeMap::new();
+    for unit in st.units() {
+        let mut sources = BTreeMap::new();
+        for src in st.sources_of(&unit) {
+            if let Some(rec) = st.tu(&unit, &src) {
+                sources.insert(src.clone(), rec.clone());
+            }
+        }
+        tus.insert(unit.clone(), sources);
+    }
+    let mut links = BTreeMap::new();
+    for id in st.link_ids() {
+        if let Some(digest) = st.link(&id) {
+            links.insert(id.clone(), digest.clone());
+        }
+    }
+    let sidecar = CacheSidecar {
+        key: key.to_string(),
+        outputs: sidecar_outputs,
+        tus,
+        links,
+    };
+    let text = serde_json::to_string_pretty(&sidecar).map_err(|e| state::Error::Corrupt {
+        path: SIDECAR_NAME.to_string(),
+        message: e.to_string(),
+    })?;
+    std::fs::write(stored.dir.join(SIDECAR_NAME), format!("{text}\n"))?;
+    Ok(())
 }
 
 /// Task name joining unit tag + source rel (replay sorts by this).
@@ -1124,6 +1500,7 @@ mod tests {
             version: "test".to_string(),
             msvc_env: None,
             ar: None,
+            target: None,
             found_via: "test".to_string(),
         }
     }
@@ -1270,6 +1647,9 @@ mod tests {
         let inputs = UnitInputs {
             archives: vec![PathBuf::from("/dep/libd.a")],
             include_dirs: Vec::new(),
+            lib_dirs: Vec::new(),
+            sys_libs: Vec::new(),
+            defines: Vec::new(),
         };
         let archives = link_archives(&p, &p.bins[0], &inputs);
         assert_eq!(archives.len(), 2);

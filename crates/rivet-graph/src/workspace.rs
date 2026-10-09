@@ -35,17 +35,31 @@ pub struct Unit {
     /// objects/state/archives live under the scope target dir instead).
     /// `None` means the package default (`<pkg>/target/<prof>`).
     pub target_dir_override: Option<PathBuf>,
+    /// Foreign-build adapter for this unit (from the discovering edge's
+    /// `adapter` entry, or synthesized for `system: true`). `Some` means
+    /// the unit builds via the adapter, never via rivet targets.
+    pub adapter: Option<m::AdapterSpec>,
+    /// Adapter build output, filled in by the coordinator after running
+    /// the adapter (topo order guarantees deps first). Dependents consume
+    /// it through [`UnitInputs`].
+    pub adapter_output: Option<rivet_adapters::AdapterOutput>,
 }
 
-/// External build inputs for one unit: transitive path-dependency archives
-/// (dependents first — correct static link order on GNU ld, harmless on
-/// MSVC) plus transitive public include dirs.
+/// External build inputs for one unit: transitive archives (dependents
+/// first — correct static link order on GNU ld, harmless on MSVC),
+/// transitive public include dirs, plus adapter/probe contributions.
 #[derive(Debug, Clone, Default)]
 pub struct UnitInputs {
     /// Transitive static archives, dependents first.
     pub archives: Vec<PathBuf>,
     /// Transitive `include/` dirs (existence-checked).
     pub include_dirs: Vec<PathBuf>,
+    /// Library search dirs from adapters/probes/scripts (`-L`/`/LIBPATH`).
+    pub lib_dirs: Vec<PathBuf>,
+    /// Bare library names from adapters/probes/scripts (`-l`/`*.lib`).
+    pub sys_libs: Vec<String>,
+    /// Preprocessor defines from adapters/probes/scripts (`-D`/`/D`).
+    pub defines: Vec<String>,
 }
 
 /// Locked dependency view (the CLI converts `rivet_resolver::Lockfile` into
@@ -88,6 +102,11 @@ pub enum LockedSource {
         /// Checksum from the index.
         checksum: String,
     },
+    /// Installed system library (probed at build time, never fetched).
+    System {
+        /// Required version (`*` when the dep states none).
+        version: String,
+    },
 }
 
 /// Materialization request for one locked git dep: turn the locked source
@@ -115,6 +134,26 @@ pub trait Materializer {
     /// Materialize `req` (cache checkout or vendor copy), returning the
     /// usable source dir (subdir applied).
     fn materialize(&self, req: &MaterialRequest) -> Result<PathBuf, String>;
+
+    /// Materialize a locked registry package (fetch + verify + extract).
+    /// Defaults to an error; the CLI overrides it with the registry cache.
+    fn materialize_registry(&self, req: &RegistryRequest) -> Result<PathBuf, String> {
+        let _ = req;
+        Err("registry package fetching is not supported by this materializer".to_string())
+    }
+}
+
+/// Materialization request for one locked registry package.
+#[derive(Debug, Clone)]
+pub struct RegistryRequest {
+    /// Dependency key (used for cache grouping).
+    pub key: String,
+    /// Registry URL as locked (`default` resolved by the caller).
+    pub registry: String,
+    /// Locked version.
+    pub version: String,
+    /// Locked `sha256:…` checksum (always verified).
+    pub checksum: String,
 }
 
 /// How dependency edges resolve: live manifests only, or via a lockfile.
@@ -130,13 +169,62 @@ enum Mode<'a> {
     },
 }
 
-/// Queued BFS item: a directory plus, for locked path deps, the expected
-/// (key, version) used to detect a stale lockfile at load time, plus for
-/// locked-materialized git deps the dep key used for target redirection.
+/// Queued BFS item: a directory plus lock/adapter context for load time.
 struct Queued {
     dir: PathBuf,
+    /// Locked path deps: expected `(key, version)` (stale lock detection).
     expect_path_version: Option<(String, String)>,
+    /// Locked git/registry deps: dep key for target redirection.
     redirect_key: Option<String>,
+    /// Foreign-build adapter from the discovering edge (`adapter` entry,
+    /// or synthesized for `system: true`). Drives adapter builds and
+    /// schemaless manifests.
+    adapter: Option<m::AdapterSpec>,
+}
+
+/// In-memory manifest for a schemaless foreign unit (no `rivet.json` on
+/// disk; synthesized from the inline `package` block at discovery).
+struct SynthUnit {
+    manifest: Manifest,
+}
+
+/// Default adapter spec for `system: true` edges without an explicit
+/// `adapter` (probe the installed library).
+fn system_spec() -> m::AdapterSpec {
+    m::AdapterSpec {
+        tool: "system".to_string(),
+        targets: Vec::new(),
+        options: BTreeMap::new(),
+    }
+}
+
+/// Adapter spec for an edge: explicit `adapter`, or synthesized `system`
+/// spec for `system: true`. Validates explicit specs eagerly (fail fast).
+fn edge_adapter(dep_name: &str, dep: &m::Dependency) -> Result<Option<m::AdapterSpec>, Error> {
+    match dep {
+        m::Dependency::Detailed(d) => {
+            if let Some(spec) = &d.adapter {
+                rivet_adapters::validate_spec(spec).map_err(|e| Error::Adapter {
+                    name: dep_name.to_string(),
+                    message: e.to_string(),
+                })?;
+                Ok(Some(spec.clone()))
+            } else if d.system.unwrap_or(false) {
+                Ok(Some(system_spec()))
+            } else {
+                Ok(None)
+            }
+        }
+        m::Dependency::Simple(_) => Ok(None),
+    }
+}
+
+/// `true` for `system: true` edges (probed, never built from sources).
+fn is_system_edge(dep: &m::Dependency) -> bool {
+    match dep {
+        m::Dependency::Detailed(d) => d.system.unwrap_or(false),
+        m::Dependency::Simple(_) => false,
+    }
 }
 
 /// Sanitize a dep key for use as a directory name.
@@ -291,6 +379,8 @@ fn resolve_impl(
     let mut units: BTreeMap<PathBuf, Unit> = BTreeMap::new();
     let mut known: BTreeSet<String> = BTreeSet::new();
     let mut queue: VecDeque<Queued> = VecDeque::new();
+    // In-memory manifests for schemaless foreign units (no rivet.json).
+    let mut synth: BTreeMap<PathBuf, SynthUnit> = BTreeMap::new();
     for seed in seeds {
         let dir = canonical(&seed.dir)?;
         if units.contains_key(&dir) {
@@ -301,13 +391,15 @@ fn resolve_impl(
         let features = activated_features_lenient(&man, flags)?;
         known.extend(man.features.keys().cloned());
         let active = active_optional_deps(&man, &features);
-        let mut dep_dirs = direct_dep_dirs(&man, &active, mode, root_patch)?;
+        let mut dep_dirs =
+            direct_dep_dirs(&man, &active, mode, root_patch, &scope_target, &mut synth)?;
         dep_dirs.sort_by(|a, b| a.dir.cmp(&b.dir));
         dep_dirs.dedup_by(|a, b| a.dir == b.dir);
         queue.extend(dep_dirs.iter().map(|q| Queued {
             dir: q.dir.clone(),
             expect_path_version: q.expect_path_version.clone(),
             redirect_key: q.redirect_key.clone(),
+            adapter: q.adapter.clone(),
         }));
         let dep_paths: Vec<PathBuf> = dep_dirs.into_iter().map(|q| q.dir).collect();
         units.insert(
@@ -319,6 +411,8 @@ fn resolve_impl(
                 from_workspace,
                 features,
                 target_dir_override: None,
+                adapter: None,
+                adapter_output: None,
             },
         );
     }
@@ -327,8 +421,14 @@ fn resolve_impl(
         if units.contains_key(&dep_dir) {
             continue;
         }
-        let mut dep_man = m::load(&dep_dir)?;
-        dep_man.dir = dep_dir.clone();
+        let dep_man = match synth.remove(&dep_dir) {
+            Some(s) => s.manifest,
+            None => {
+                let mut m = m::load(&dep_dir)?;
+                m.dir = dep_dir.clone();
+                m
+            }
+        };
         if dep_man.workspace.is_some() {
             return Err(Error::WorkspaceDep {
                 path: dep_dir.display().to_string(),
@@ -352,13 +452,21 @@ fn resolve_impl(
         let features = activated_features_lenient(&dep_man, flags)?;
         known.extend(dep_man.features.keys().cloned());
         let active = active_optional_deps(&dep_man, &features);
-        let mut dep_dirs = direct_dep_dirs(&dep_man, &active, mode, root_patch)?;
+        let mut dep_dirs = direct_dep_dirs(
+            &dep_man,
+            &active,
+            mode,
+            root_patch,
+            &scope_target,
+            &mut synth,
+        )?;
         dep_dirs.sort_by(|a, b| a.dir.cmp(&b.dir));
         dep_dirs.dedup_by(|a, b| a.dir == b.dir);
         queue.extend(dep_dirs.iter().map(|q| Queued {
             dir: q.dir.clone(),
             expect_path_version: q.expect_path_version.clone(),
             redirect_key: q.redirect_key.clone(),
+            adapter: q.adapter.clone(),
         }));
         let dep_paths: Vec<PathBuf> = dep_dirs.into_iter().map(|q| q.dir).collect();
         let target_dir_override = queued
@@ -373,6 +481,8 @@ fn resolve_impl(
                 from_workspace: false,
                 features,
                 target_dir_override,
+                adapter: queued.adapter,
+                adapter_output: None,
             },
         );
     }
@@ -396,18 +506,20 @@ fn resolve_impl(
 }
 
 /// Direct dependency dirs of `man`: path deps canonicalized, git deps
-/// materialized from the lock (locked mode), registry deps rejected.
+/// materialized from the lock (locked mode), registry deps fetched through
+/// the materializer (locked mode), system deps probed as units.
 ///
 /// Optional deps outside `active` are skipped (not part of the build) in
-/// both modes. In direct mode, active non-path deps fail with milestone
-/// pointers (registry → M5, git → M4); in locked mode they resolve against
-/// the lockfile (missing/stale coverage is [`Error::NotLocked`], locked
-/// registry packages are [`Error::RegistryFetch`]).
+/// both modes. Patch overrides are applied before anything else (see
+/// callers). `synth` collects in-memory manifests for schemaless foreign
+/// units and system units (no `rivet.json` on disk).
 fn direct_dep_dirs(
     man: &Manifest,
     active: &BTreeSet<String>,
     mode: &Mode,
     root_patch: &BTreeMap<String, PathBuf>,
+    scope_target: &Path,
+    synth: &mut BTreeMap<PathBuf, SynthUnit>,
 ) -> Result<Vec<Queued>, Error> {
     let mut out = Vec::new();
     for (dep_name, dep) in &man.dependencies {
@@ -437,6 +549,7 @@ fn direct_dep_dirs(
                             dir: c,
                             expect_path_version: None,
                             redirect_key: None,
+                            adapter: None,
                         });
                         continue;
                     }
@@ -468,6 +581,52 @@ fn direct_dep_dirs(
                 dir: c,
                 expect_path_version: None,
                 redirect_key: None,
+                adapter: None,
+            });
+            continue;
+        }
+        // `system: true` probes an installed library (no sources). Units
+        // live under the scope target dir (created empty); the lock records
+        // the requirement (locked mode) for reproducibility.
+        if is_system_edge(dep) {
+            let adapter = edge_adapter(dep_name, dep)?;
+            let version = match mode {
+                Mode::Direct => match dep {
+                    m::Dependency::Detailed(d) => {
+                        d.version.clone().unwrap_or_else(|| "*".to_string())
+                    }
+                    m::Dependency::Simple(s) => s.clone(),
+                },
+                Mode::Locked { locked, .. } => {
+                    let entry = locked.get(dep_name).ok_or_else(|| Error::NotLocked {
+                        name: dep_name.clone(),
+                        reason: "no lock entry. Fix: run `rivet update`".to_string(),
+                    })?;
+                    match &entry.source {
+                        LockedSource::System { version } => version.clone(),
+                        _ => {
+                            return Err(Error::NotLocked {
+                                name: dep_name.clone(),
+                                reason: "locked source kind changed. Fix: run `rivet update`"
+                                    .to_string(),
+                            });
+                        }
+                    }
+                }
+            };
+            let dir = scope_target.join("system").join(sanitize_key(dep_name));
+            std::fs::create_dir_all(&dir)?;
+            synth.insert(
+                dir.clone(),
+                SynthUnit {
+                    manifest: system_manifest(dep_name, &version, &dir),
+                },
+            );
+            out.push(Queued {
+                dir,
+                expect_path_version: None,
+                redirect_key: None,
+                adapter,
             });
             continue;
         }
@@ -477,12 +636,8 @@ fn direct_dep_dirs(
                 name: dep_name.clone(),
                 path: dep_dir.display().to_string(),
             })?;
-            if !c.join("rivet.json").is_file() {
-                return Err(Error::DependencyManifest {
-                    name: dep_name.clone(),
-                    path: c.display().to_string(),
-                });
-            }
+            let adapter = edge_adapter(dep_name, dep)?;
+            schemaless_or_manifest(&c, dep_name, dep, adapter.clone(), synth)?;
             let expect = match mode {
                 Mode::Direct => None,
                 Mode::Locked { locked, .. } => {
@@ -504,6 +659,7 @@ fn direct_dep_dirs(
                 dir: c,
                 expect_path_version: expect,
                 redirect_key: None,
+                adapter,
             });
             continue;
         }
@@ -577,16 +733,13 @@ fn direct_dep_dirs(
                         name: dep_name.clone(),
                         path: dir.display().to_string(),
                     })?;
-                    if !c.join("rivet.json").is_file() {
-                        return Err(Error::DependencyManifest {
-                            name: dep_name.clone(),
-                            path: c.display().to_string(),
-                        });
-                    }
+                    let adapter = edge_adapter(dep_name, dep)?;
+                    schemaless_or_manifest(&c, dep_name, dep, adapter.clone(), synth)?;
                     out.push(Queued {
                         dir: c,
                         expect_path_version: None,
                         redirect_key: Some(dep_name.clone()),
+                        adapter,
                     });
                 }
             }
@@ -599,19 +752,108 @@ fn direct_dep_dirs(
                         name: dep_name.clone(),
                     });
                 }
-                Mode::Locked { locked, .. } => {
-                    locked.get(dep_name).ok_or_else(|| Error::NotLocked {
+                Mode::Locked {
+                    locked,
+                    materializer,
+                } => {
+                    let entry = locked.get(dep_name).ok_or_else(|| Error::NotLocked {
                         name: dep_name.clone(),
                         reason: "no lock entry. Fix: run `rivet update`".to_string(),
                     })?;
-                    return Err(Error::RegistryFetch {
+                    let (registry, version, checksum) = match &entry.source {
+                        LockedSource::Registry {
+                            registry,
+                            version,
+                            checksum,
+                        } => (registry.clone(), version.clone(), checksum.clone()),
+                        _ => {
+                            return Err(Error::NotLocked {
+                                name: dep_name.clone(),
+                                reason: "locked source kind changed. Fix: run `rivet update`"
+                                    .to_string(),
+                            });
+                        }
+                    };
+                    let dir = materializer
+                        .materialize_registry(&RegistryRequest {
+                            key: dep_name.clone(),
+                            registry,
+                            version,
+                            checksum,
+                        })
+                        .map_err(|message| Error::Materialize {
+                            name: dep_name.clone(),
+                            message,
+                        })?;
+                    let c = canonical(&dir).map_err(|_| Error::DependencyDir {
                         name: dep_name.clone(),
+                        path: dir.display().to_string(),
+                    })?;
+                    let adapter = edge_adapter(dep_name, dep)?;
+                    schemaless_or_manifest(&c, dep_name, dep, adapter.clone(), synth)?;
+                    out.push(Queued {
+                        dir: c,
+                        expect_path_version: None,
+                        redirect_key: Some(dep_name.clone()),
+                        adapter,
                     });
                 }
             }
+            continue;
         }
     }
     Ok(out)
+}
+
+/// In-memory manifest for a system unit (probed, never built).
+fn system_manifest(key: &str, version: &str, dir: &Path) -> Manifest {
+    Manifest {
+        schema: None,
+        package: Some(m::Package {
+            name: key.to_string(),
+            version: version.to_string(),
+            standard: None,
+        }),
+        dependencies: BTreeMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        build_dependencies: BTreeMap::new(),
+        features: BTreeMap::new(),
+        target: BTreeMap::new(),
+        bin: Vec::new(),
+        lib: None,
+        profile: m::Profiles::default(),
+        workspace: None,
+        patch: BTreeMap::new(),
+        dir: dir.to_path_buf(),
+    }
+}
+
+/// Register a schemaless foreign unit (no `rivet.json` on disk) when the
+/// edge carries an adapter; otherwise report the missing manifest.
+/// Returns the edge adapter for the `Queued` item.
+fn schemaless_or_manifest(
+    c: &Path,
+    dep_name: &str,
+    dep: &m::Dependency,
+    adapter: Option<m::AdapterSpec>,
+    synth: &mut BTreeMap<PathBuf, SynthUnit>,
+) -> Result<Option<m::AdapterSpec>, Error> {
+    if c.join("rivet.json").is_file() {
+        return Ok(adapter);
+    }
+    if adapter.is_some() {
+        let inline = match dep {
+            m::Dependency::Detailed(d) => &d.package,
+            m::Dependency::Simple(_) => &None,
+        };
+        let manifest = m::synthesize_manifest(c, dep_name, inline)?;
+        synth.insert(c.to_path_buf(), SynthUnit { manifest });
+        return Ok(adapter);
+    }
+    Err(Error::DependencyManifest {
+        name: dep_name.to_string(),
+        path: c.display().to_string(),
+    })
 }
 
 /// Manifest `tag`/`branch`/`rev` as a `(kind, value)` pair, defaulting to
@@ -748,18 +990,54 @@ pub fn unit_inputs(
             .clone()
             .unwrap_or_else(|| dep.dir.join("target").join(super::profile_dir(profile)));
         let target = base.join("build");
-        if let Ok(Some(lib)) = m::resolve_lib(&dep.manifest) {
-            if rivet_manifest::lib_has_sources(&lib) && lib.lib_type == "static" {
-                let archive = target.join(toolchain.staticlib_filename(&lib.name));
-                // The archive may not exist yet on a fresh `is_fresh` probe;
-                // link planning records it regardless, and the build creates
-                // deps first (topo order), so it exists at link time.
-                inputs.archives.push(archive);
+        if dep.adapter.is_none() {
+            if let Ok(Some(lib)) = m::resolve_lib(&dep.manifest) {
+                if rivet_manifest::lib_has_sources(&lib) && lib.lib_type == "static" {
+                    let archive = target.join(toolchain.staticlib_filename(&lib.name));
+                    // The archive may not exist yet on a fresh `is_fresh` probe;
+                    // link planning records it regardless, and the build creates
+                    // deps first (topo order), so it exists at link time.
+                    inputs.archives.push(archive);
+                }
+            }
+            let inc = dep.dir.join("include");
+            if inc.is_dir() && !inputs.include_dirs.contains(&inc) {
+                inputs.include_dirs.push(inc);
             }
         }
-        let inc = dep.dir.join("include");
-        if inc.is_dir() && !inputs.include_dirs.contains(&inc) {
-            inputs.include_dirs.push(inc);
+        // Adapter/probe outputs feed dependents like first-class inputs.
+        // Order: static files join `archives` (link order preserved),
+        // includes join the search path, defines/lib flags accumulate.
+        if let Some(output) = &dep.adapter_output {
+            for inc in &output.include_dirs {
+                if inc.is_dir() && !inputs.include_dirs.contains(inc) {
+                    inputs.include_dirs.push(inc.clone());
+                }
+            }
+            for dir in &output.lib_dirs {
+                if !inputs.lib_dirs.contains(dir) {
+                    inputs.lib_dirs.push(dir.clone());
+                }
+            }
+            for lib in &output.libs {
+                match lib {
+                    rivet_adapters::LibLink::File(path) => {
+                        if !inputs.archives.contains(path) {
+                            inputs.archives.push(path.clone());
+                        }
+                    }
+                    rivet_adapters::LibLink::Name(name) => {
+                        if !inputs.sys_libs.contains(name) {
+                            inputs.sys_libs.push(name.clone());
+                        }
+                    }
+                }
+            }
+            for define in &output.defines {
+                if !inputs.defines.contains(define) {
+                    inputs.defines.push(define.clone());
+                }
+            }
         }
     }
     Ok(inputs)
@@ -1155,6 +1433,9 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("M5"), "got: {err}");
+        assert!(
+            err.contains("not supported by this materializer"),
+            "got: {err}"
+        );
     }
 }

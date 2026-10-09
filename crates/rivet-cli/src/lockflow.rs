@@ -55,6 +55,169 @@ fn registry_index_dir() -> Result<PathBuf> {
     Ok(root.join("registry").join("index").join("default"))
 }
 
+/// Index dir for one registry: the default copy, or a per-URL hash dir.
+fn index_dir_for(registry_url: &str) -> Result<PathBuf> {
+    if registry_url == "default" {
+        return registry_index_dir();
+    }
+    let root = rivet_cache::cache_root().map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(root
+        .join("registry")
+        .join("index")
+        .join(rivet_registry::registry_hash(registry_url)))
+}
+
+/// Default registry URL from `RIVET_REGISTRY` (there is no central
+/// rivet.dev registry yet; the env var points at yours).
+pub fn default_registry_url() -> Result<String> {
+    match std::env::var("RIVET_REGISTRY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(url) => Ok(url),
+        None => bail!(
+            "no default registry configured. Fix: set RIVET_REGISTRY=https://... (or give the dep a `registry` URL)"
+        ),
+    }
+}
+
+/// Resolve a locked `registry` value to a concrete URL.
+fn concrete_registry_url(locked: &str) -> Result<String> {
+    if locked == "default" {
+        default_registry_url()
+    } else {
+        Ok(locked.to_string())
+    }
+}
+
+/// Collect `(registry_url, dep name)` for registry deps reachable through
+/// path edges from `seeds` (git-backed manifests are unknown pre-resolve;
+/// their registry deps surface as index errors with actionable hints).
+fn scan_registry_deps(seeds: &[rivet_manifest::Manifest]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut queue: Vec<PathBuf> = seeds.iter().map(|m| m.dir.clone()).collect();
+    while let Some(dir) = queue.pop() {
+        if !visited.insert(dir.clone()) {
+            continue;
+        }
+        let Ok(man) = rivet_manifest::load(&dir) else {
+            continue;
+        };
+        for (key, dep) in &man.dependencies {
+            if dep.is_registry() {
+                let url = match dep {
+                    rivet_manifest::Dependency::Detailed(d) => {
+                        d.registry.clone().unwrap_or_else(|| "default".to_string())
+                    }
+                    rivet_manifest::Dependency::Simple(_) => "default".to_string(),
+                };
+                out.entry(url).or_default().push(key.clone());
+            } else if let Some(path) = dep.path() {
+                queue.push(man.dir.join(path));
+            }
+        }
+    }
+    for names in out.values_mut() {
+        names.sort();
+        names.dedup();
+    }
+    out
+}
+
+/// Ensure local index copies for alternate registries (download missing or
+/// stale files when online and `refresh`). The default registry always uses
+/// its local copy as-is. Returns the index dir the resolver should read:
+/// the single registry's dir, or a deterministic merged temp dir when
+/// several registries collide (same package name from two registries in
+/// one build is refused).
+fn prepare_registry_index(
+    seeds: &[rivet_manifest::Manifest],
+    offline: bool,
+    refresh: bool,
+    verbose: bool,
+) -> Result<PathBuf> {
+    let needed = scan_registry_deps(seeds);
+    if needed.is_empty() {
+        return registry_index_dir();
+    }
+    let mut single: Option<PathBuf> = None;
+    let mut multi = false;
+    for (url, names) in &needed {
+        let dir = index_dir_for(url)?;
+        let is_default = url == "default";
+        for name in names {
+            let file = dir.join(name);
+            let missing_or_refresh = !file.is_file() || (refresh && !is_default);
+            if missing_or_refresh && !offline {
+                if is_default {
+                    // Default index is user-managed; without RIVET_REGISTRY
+                    // there is nothing to sync from (resolver errors below).
+                    if default_registry_url().is_ok() {
+                        sync_index_file(url, name, &dir, verbose)?;
+                    }
+                    continue;
+                }
+                sync_index_file(url, name, &dir, verbose)?;
+            }
+        }
+        match &single {
+            None => single = Some(dir),
+            Some(d) if d == &dir => {}
+            Some(_) => multi = true,
+        }
+    }
+    let Some(dir) = single else {
+        return registry_index_dir();
+    };
+    if !multi {
+        return Ok(dir);
+    }
+    // Merge several registries into one deterministic scratch dir.
+    // Identical bytes merge silently; same name with different bytes is a
+    // real two-registry collision and is refused.
+    let mut urls: Vec<String> = needed.keys().cloned().collect();
+    urls.sort();
+    let digest = rivet_registry::sha256_hex(urls.join("\0").as_bytes());
+    let merged = std::env::temp_dir().join("rivet-index").join(&digest[..16]);
+    std::fs::create_dir_all(&merged)
+        .with_context(|| format!("could not create {}", merged.display()))?;
+    for (url, names) in &needed {
+        let dir = index_dir_for(url)?;
+        for name in names {
+            let src = dir.join(name);
+            let bytes = std::fs::read(&src)
+                .with_context(|| format!("could not read {} (sync it first)", src.display()))?;
+            let dst = merged.join(name);
+            if dst.is_file() {
+                let prev = std::fs::read(&dst).unwrap_or_default();
+                if prev != bytes {
+                    bail!(
+                        "package `{name}` comes from two registries in one build, which is not supported. Fix: unify on one registry"
+                    );
+                }
+            } else {
+                std::fs::write(&dst, &bytes)
+                    .with_context(|| format!("could not write {}", dst.display()))?;
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Download one index file into its local copy.
+fn sync_index_file(registry_url: &str, name: &str, dir: &Path, verbose: bool) -> Result<()> {
+    let url = format!("{}/index/{}", registry_url.trim_end_matches('/'), name);
+    let bytes = rivet_registry::download_bytes(&url, false).map_err(|e| anyhow::anyhow!("{e}"))?;
+    std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    std::fs::write(dir.join(name), &bytes)
+        .with_context(|| format!("could not write {}", dir.join(name).display()))?;
+    if verbose {
+        eprintln!("       synced index {name} from {registry_url}");
+    }
+    Ok(())
+}
+
 /// Vendor dir when the scope carries `vendor/rivet-vendor.json`.
 fn vendor_dir(scope_root: &Path) -> Option<PathBuf> {
     let dir = scope_root.join("vendor");
@@ -89,18 +252,19 @@ pub fn scope_seeds(root: &rivet_manifest::Manifest) -> Result<Vec<rivet_manifest
 }
 
 /// Resolve every seed and merge the locks (same name must agree on version
-/// and source; features union).
+/// and source; features union). Alternate registry indexes sync on demand
+/// (`refresh` forces re-download, e.g. for `update`); the default registry
+/// always uses its local copy.
 pub fn resolve_lock(
     seeds: &[rivet_manifest::Manifest],
     flags: &rivet_graph::FeatureFlags,
     offline: bool,
     git: &rivet_git::GitCache,
     verbose: bool,
+    refresh_indexes: bool,
 ) -> Result<rivet_resolver::Lockfile> {
-    let index = rivet_resolver::RegistryIndex::new(
-        registry_index_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    );
-    let _ = verbose;
+    let index_dir = prepare_registry_index(seeds, offline, refresh_indexes, verbose)?;
+    let index = rivet_resolver::RegistryIndex::new(index_dir);
     let provider = rivet_resolver::RealProvider::new(git.clone());
     let resolver = rivet_resolver::Resolver::new(index, &provider);
     let opts = rivet_resolver::ResolveOpts {
@@ -147,6 +311,9 @@ fn describe_source(source: &rivet_resolver::LockSource) -> String {
         }
         rivet_resolver::LockSource::Git { url, sha, .. } => {
             format!("{url} @ {}", &sha[..sha.len().min(12)])
+        }
+        rivet_resolver::LockSource::System { version } => {
+            format!("system {version}")
         }
     }
 }
@@ -200,6 +367,9 @@ pub fn lock_to_view(
                     registry: registry.clone(),
                     version: version.clone(),
                     checksum: checksum.clone(),
+                },
+                rivet_resolver::LockSource::System { version } => LockedSource::System {
+                    version: version.clone(),
                 },
             };
             (
@@ -257,11 +427,17 @@ pub struct CliMaterializer {
     vendor: Option<PathBuf>,
     vendor_map: BTreeMap<String, VendorEntry>,
     verbose: bool,
+    offline: bool,
 }
 
 impl CliMaterializer {
     /// Build from the scope root (picks up `vendor/` when present).
-    pub fn new(git: rivet_git::GitCache, scope_root: &Path, verbose: bool) -> Result<Self> {
+    pub fn new(
+        git: rivet_git::GitCache,
+        scope_root: &Path,
+        verbose: bool,
+        offline: bool,
+    ) -> Result<Self> {
         let vendor = vendor_dir(scope_root);
         let vendor_map = read_vendor_map(scope_root)?;
         Ok(Self {
@@ -269,6 +445,7 @@ impl CliMaterializer {
             vendor,
             vendor_map,
             verbose,
+            offline,
         })
     }
 }
@@ -328,6 +505,35 @@ impl rivet_graph::workspace::Materializer for CliMaterializer {
                 Err(cache_err.to_string())
             }
         }
+    }
+
+    fn materialize_registry(
+        &self,
+        req: &rivet_graph::workspace::RegistryRequest,
+    ) -> Result<PathBuf, String> {
+        // Vendored copies win when present (copied from verified cache).
+        if let Some(vendor) = &self.vendor {
+            let vdir = vendor.join(&req.key);
+            if vdir.join("rivet.json").is_file() {
+                return Ok(vdir);
+            }
+        }
+        let url = concrete_registry_url(&req.registry).map_err(|e| e.to_string())?;
+        let cache_root = rivet_cache::cache_root().map_err(|e| e.to_string())?;
+        let opts = rivet_registry::MaterializeOpts {
+            offline: self.offline,
+            verbose: self.verbose,
+        };
+        let src = rivet_registry::materialize(
+            &req.key,
+            &req.version,
+            &req.checksum,
+            &url,
+            &cache_root,
+            &opts,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(src.source_dir)
     }
 }
 
@@ -405,7 +611,7 @@ fn resolve_locked_flow(
     };
     let materialize_with = |lock: &rivet_resolver::Lockfile| -> Result<Vec<ws::Unit>> {
         let view = lock_to_view(lock);
-        let mat = CliMaterializer::new(git.clone(), &root.dir, verbose)?;
+        let mat = CliMaterializer::new(git.clone(), &root.dir, verbose, offline)?;
         let root_patch = root_patch_map(root)?;
         ws::resolve_locked_units(root, profile, only, flags, &view, &mat, &root_patch)
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -420,7 +626,7 @@ fn resolve_locked_flow(
                     // resolution may need the network); otherwise keep the
                     // actionable NotLocked error.
                     let seeds = scope_seeds(root)?;
-                    if let Ok(fresh) = resolve_lock(&seeds, flags, offline, &git, verbose) {
+                    if let Ok(fresh) = resolve_lock(&seeds, flags, offline, &git, verbose, false) {
                         rivet_resolver::check_locked(existing, &fresh)
                             .map_err(|e| anyhow::anyhow!("{e}"))?;
                     }
@@ -441,7 +647,7 @@ fn resolve_locked_flow(
         );
     }
     // (Re-)resolve and persist, then build from the fresh lock.
-    let fresh = resolve_lock(&seeds, flags, offline, &git, verbose).map_err(|e| {
+    let fresh = resolve_lock(&seeds, flags, offline, &git, verbose, false).map_err(|e| {
         if offline {
             anyhow::anyhow!("{e}\nHint: the lockfile is stale (or missing) and --offline forbids re-resolving; connect once or vendor first")
         } else {
@@ -504,7 +710,7 @@ pub fn update_flow(
         ));
     }
     strip_patched_deps(&mut seeds, &patched);
-    let fresh = resolve_lock(&seeds, flags, opts.offline, &git, verbose)?;
+    let fresh = resolve_lock(&seeds, flags, opts.offline, &git, verbose, true)?;
     let path = lock_path(&root.dir);
     let old: Option<rivet_resolver::Lockfile> = if path.is_file() {
         Some(rivet_resolver::read_lockfile(&path).map_err(|e| anyhow::anyhow!("{e}"))?)
@@ -764,7 +970,7 @@ pub fn vendor_flow(
     }
     let lock = rivet_resolver::read_lockfile(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     let git = git_cache(verbose, false)?;
-    let mat = CliMaterializer::new(git, &root.dir, verbose)?;
+    let mat = CliMaterializer::new(git, &root.dir, verbose, false)?;
     let vendor = root.dir.join("vendor");
     let mut sources = serde_json::Map::new();
     for pkg in &lock.packages {
@@ -818,10 +1024,45 @@ pub fn vendor_flow(
                     serde_json::json!({"kind": "git", "url": url, "sha": sha, "tree": tree}),
                 );
             }
-            rivet_resolver::LockSource::Registry { .. } => {
-                bail!(
-                    "cannot vendor registry package `{}` (fetching arrives with M5)",
-                    pkg.name
+            rivet_resolver::LockSource::Registry {
+                registry,
+                version,
+                checksum,
+            } => {
+                let url = concrete_registry_url(registry)?;
+                if dry_run {
+                    ui.status(
+                        "Vendor",
+                        &format!("{} (registry, would copy {url} {version})", pkg.name),
+                    );
+                } else {
+                    use rivet_graph::workspace::Materializer;
+                    let src = mat
+                        .materialize_registry(&rivet_graph::workspace::RegistryRequest {
+                            key: pkg.name.clone(),
+                            registry: registry.clone(),
+                            version: version.clone(),
+                            checksum: checksum.clone(),
+                        })
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    copy_dir_filtered(&src, &vendor.join(&pkg.name), true)
+                        .with_context(|| format!("could not vendor registry dep `{}`", pkg.name))?;
+                    ui.status("Vendored", &format!("{} (registry {version})", pkg.name));
+                }
+                sources.insert(
+                    pkg.name.clone(),
+                    serde_json::json!({"kind": "registry", "url": url, "version": version, "checksum": checksum}),
+                );
+            }
+            rivet_resolver::LockSource::System { version } => {
+                // Installed libraries have no sources to copy.
+                ui.status(
+                    if dry_run { "Vendor" } else { "Vendored" },
+                    &format!("{} (system {version}, nothing to copy)", pkg.name),
+                );
+                sources.insert(
+                    pkg.name.clone(),
+                    serde_json::json!({"kind": "system", "version": version}),
                 );
             }
         }
@@ -846,9 +1087,109 @@ pub fn vendor_flow(
     Ok(())
 }
 
+/// Adapter fingerprint + outputs snapshot (`adapter-fingerprint.json`).
+#[derive(Debug, Clone)]
+pub(crate) struct AdapterState {
+    pub fingerprint: String,
+    pub output: rivet_adapters::AdapterOutput,
+}
+
+/// Read adapter state, if present and parseable (`None` = rebuild).
+pub(crate) fn read_adapter_state(path: &Path) -> Result<Option<AdapterState>> {
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("could not read {}", path.display()))?;
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let fingerprint = v
+        .get("fingerprint")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let strings = |key: &str| {
+        v.get(key)
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let paths = |key: &str| {
+        strings(key)
+            .into_iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+    };
+    let libs = v
+        .get("libs")
+        .and_then(|a| a.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|e| {
+                    if let Some(f) = e.get("file").and_then(|s| s.as_str()) {
+                        Some(rivet_adapters::LibLink::File(PathBuf::from(f)))
+                    } else {
+                        e.get("name")
+                            .and_then(|s| s.as_str())
+                            .map(|n| rivet_adapters::LibLink::Name(n.to_string()))
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(Some(AdapterState {
+        fingerprint,
+        output: rivet_adapters::AdapterOutput {
+            include_dirs: paths("include_dirs"),
+            lib_dirs: paths("lib_dirs"),
+            libs,
+            defines: strings("defines"),
+        },
+    }))
+}
+
+/// Persist adapter fingerprint + outputs.
+pub(crate) fn write_adapter_state(
+    path: &Path,
+    fingerprint: &str,
+    output: &rivet_adapters::AdapterOutput,
+) -> Result<()> {
+    let libs: Vec<serde_json::Value> = output
+        .libs
+        .iter()
+        .map(|l| match l {
+            rivet_adapters::LibLink::File(p) => {
+                serde_json::json!({"file": p.display().to_string()})
+            }
+            rivet_adapters::LibLink::Name(n) => serde_json::json!({"name": n}),
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "fingerprint": fingerprint,
+        "include_dirs": output.include_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "lib_dirs": output.lib_dirs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        "libs": libs,
+        "defines": output.defines,
+    });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("could not create {}", parent.display()))?;
+    }
+    let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+    std::fs::write(path, format!("{text}\n"))
+        .with_context(|| format!("could not write {}", path.display()))?;
+    Ok(())
+}
+
 /// Recursive directory copy; skips `target/` trees when requested.
 /// Symlinks are followed (content copied) — checkouts reject escaping links.
-fn copy_dir_filtered(src: &Path, dst: &Path, skip_target: bool) -> Result<()> {
+pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, skip_target: bool) -> Result<()> {
     if !src.is_dir() {
         bail!(
             "cannot copy {}: not a directory. Fix: check the dependency source",
@@ -885,7 +1226,6 @@ fn copy_dir_filtered(src: &Path, dst: &Path, skip_target: bool) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Dev workflow
 // ---------------------------------------------------------------------------
-
 /// `(package display, dep key)` pairs with active `patch` overrides.
 pub fn active_patches(root: &rivet_manifest::Manifest) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
@@ -910,7 +1250,7 @@ pub fn active_patches(root: &rivet_manifest::Manifest) -> Result<Vec<(String, St
 /// auto-add the `patch` entry (warns about `publish`, per spec).
 pub fn dev_flow(ui: &Ui, root: &rivet_manifest::Manifest, name: &str, verbose: bool) -> Result<()> {
     // Find the dep (BFS over path deps; git deps are collected, not resolved).
-    let mut found: Option<(rivet_manifest::DependencyDetail, Vec<String>)> = None;
+    let mut found: Option<(Box<rivet_manifest::DependencyDetail>, Vec<String>)> = None;
     let mut available: Vec<String> = Vec::new();
     let mut visited: BTreeSet<PathBuf> = BTreeSet::new();
     let mut queue: Vec<PathBuf> = scope_seeds(root)?.into_iter().map(|m| m.dir).collect();
@@ -1209,5 +1549,230 @@ pub fn git_fetch_flow(ui: &Ui, root: &rivet_manifest::Manifest, verbose: bool) -
     git.fetch_all(&borrowed)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     ui.status("Fetched", &format!("{} remote(s)", pairs.len()));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Registry commands (M5)
+// ---------------------------------------------------------------------------
+
+/// Home dir for the credential store (`RIVET_HOME` override else the OS
+/// home — mirrors `rivet-cache::cache_root` one level up).
+fn credentials_home() -> Result<PathBuf> {
+    if let Some(home) = std::env::var_os("RIVET_HOME") {
+        if !home.is_empty() {
+            return Ok(PathBuf::from(home));
+        }
+    }
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from).ok_or_else(|| {
+        anyhow::anyhow!(
+            "could not determine home directory; set HOME (Linux) or USERPROFILE (Windows)"
+        )
+    })
+}
+
+/// Resolve the publish target package: the scope root's own package, or
+/// `-p` within a workspace/virtual root. Returns an owned manifest.
+fn publish_target(
+    root: &rivet_manifest::Manifest,
+    package: Option<&str>,
+) -> Result<rivet_manifest::Manifest> {
+    if let Some(name) = package {
+        for member in scope_seeds(root)? {
+            if rivet_manifest::package_name(&member) == Some(name) {
+                if member.package.is_none() {
+                    bail!("package `{name}` is a virtual manifest. Fix: publish a member with a `package` table");
+                }
+                return Ok(member);
+            }
+        }
+        bail!("package `{name}` not found in this workspace. Fix: check `-p`");
+    }
+    if root.package.is_some() {
+        Ok(root.clone())
+    } else {
+        bail!("workspace root has no package of its own. Fix: `rivet publish -p <package>`");
+    }
+}
+
+/// Registry metadata for a publish: name/version from the manifest,
+/// registry-only deps as index deps (path/git deps warn — they cannot be
+/// expressed in the index).
+fn publish_meta(manifest: &rivet_manifest::Manifest, ui: &Ui) -> rivet_registry::PublishMeta {
+    let pkg = manifest.package.as_ref().unwrap();
+    let mut deps = Vec::new();
+    for (name, dep) in &manifest.dependencies {
+        match dep {
+            rivet_manifest::Dependency::Simple(req) => {
+                deps.push(rivet_registry::IndexDep {
+                    name: name.clone(),
+                    req: req.clone(),
+                    optional: false,
+                });
+            }
+            rivet_manifest::Dependency::Detailed(d) => {
+                if let Some(req) = d
+                    .version
+                    .clone()
+                    .or_else(|| d.registry.clone().map(|_| "*".to_string()))
+                {
+                    deps.push(rivet_registry::IndexDep {
+                        name: name.clone(),
+                        req,
+                        optional: d.optional.unwrap_or(false),
+                    });
+                } else if d.path.is_some() || d.git.is_some() {
+                    ui.warn(&format!(
+                        "dep `{name}` is not a registry dep; index consumers will not see it"
+                    ));
+                }
+            }
+        }
+    }
+    deps.sort_by(|a, b| a.name.cmp(&b.name));
+    rivet_registry::PublishMeta {
+        name: pkg.name.clone(),
+        version: pkg.version.clone(),
+        description: None,
+        deps,
+    }
+}
+
+/// `rivet publish [--registry URL] [--token T] [--dry-run] [-p PKG]`.
+pub fn publish_flow(
+    ui: &Ui,
+    root: &rivet_manifest::Manifest,
+    package: Option<String>,
+    registry: Option<String>,
+    token: Option<String>,
+    dry_run: bool,
+    _verbose: bool,
+) -> Result<()> {
+    let manifest = publish_target(root, package.as_deref())?;
+    let meta = publish_meta(&manifest, ui);
+    let packaged = rivet_registry::package_source_dir(&manifest.dir, &meta)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let url = match registry {
+        Some(u) => u,
+        None => default_registry_url()?,
+    };
+    if dry_run {
+        ui.status(
+            "Publish",
+            &format!(
+                "would upload {} v{} ({} bytes, {}) to {url}",
+                meta.name,
+                meta.version,
+                packaged.bytes.len(),
+                packaged.checksum
+            ),
+        );
+        return Ok(());
+    }
+    let token = match token {
+        Some(t) if !t.trim().is_empty() => Some(t),
+        _ => std::env::var("RIVET_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                use std::io::BufRead;
+                std::io::stdin()
+                    .lock()
+                    .lines()
+                    .next()
+                    .and_then(|l| l.ok())
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+            }),
+    };
+    rivet_registry::publish(&url, &packaged, &meta, token.as_deref(), false)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ui.status(
+        "Published",
+        &format!("{} v{} to {url}", meta.name, meta.version),
+    );
+    Ok(())
+}
+
+/// `rivet login [--registry URL] [--token T]` (token via flag, `RIVET_TOKEN`,
+/// or one stdin line).
+pub fn login_flow(ui: &Ui, registry: Option<String>, token: Option<String>) -> Result<()> {
+    let url = match registry {
+        Some(u) => u,
+        None => default_registry_url()?,
+    };
+    let token = match token {
+        Some(t) if !t.trim().is_empty() => t,
+        _ => std::env::var("RIVET_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| {
+                use std::io::BufRead;
+                std::io::stdin()
+                    .lock()
+                    .lines()
+                    .next()
+                    .and_then(|l| l.ok())
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default()
+            }),
+    };
+    if token.trim().is_empty() {
+        bail!("no token given. Fix: `--token <t>`, `RIVET_TOKEN=<t>`, or pipe it on stdin");
+    }
+    let home = credentials_home()?;
+    let path =
+        rivet_registry::login(&url, token.trim(), &home).map_err(|e| anyhow::anyhow!("{e}"))?;
+    ui.status("Logged in", &format!("{url} ({})", path.display()));
+    Ok(())
+}
+
+/// `rivet search [QUERY] [--registry URL]`: substring search over the local
+/// index copy (`file://` registries read directly; `https://` needs a
+/// previously synced copy — sparse registries expose no listing endpoint).
+pub fn search_flow(
+    ui: &Ui,
+    query: Option<String>,
+    registry: Option<String>,
+    _verbose: bool,
+) -> Result<()> {
+    let index_dir = match registry {
+        Some(url) if url.starts_with("file://") => {
+            let path =
+                rivet_registry::file_url_to_path(&url).map_err(|e| anyhow::anyhow!("{e}"))?;
+            path.join("index")
+        }
+        Some(url) => index_dir_for(&url)?,
+        None => registry_index_dir()?,
+    };
+    if !index_dir.is_dir() {
+        bail!(
+            "no local index copy at {}. Fix: build a project using this registry first (it syncs on resolve)",
+            index_dir.display()
+        );
+    }
+    let rows = rivet_registry::search(&index_dir, query.as_deref().unwrap_or(""))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if rows.is_empty() {
+        ui.status("Search", "no matches");
+        return Ok(());
+    }
+    for row in rows {
+        ui.status(
+            "Found",
+            &format!(
+                "{} v{}{}",
+                row.name,
+                row.version,
+                row.description
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default()
+            ),
+        );
+    }
     Ok(())
 }

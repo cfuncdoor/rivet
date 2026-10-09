@@ -65,7 +65,10 @@ pub fn build(
     )?;
 
     let libs = discover_libs(&ctx.build_dir, &spec.targets)?;
-    let lib_dirs = lib_dirs_of(&libs);
+    let mut lib_dirs = lib_dirs_of(&libs);
+    lib_dirs.extend(super::discover::dll_dirs(&ctx.build_dir));
+    lib_dirs.sort();
+    lib_dirs.dedup();
     let include_dirs = discover_include_dirs(source_dir, &ctx.build_dir);
     Ok(AdapterOutput {
         include_dirs,
@@ -350,7 +353,21 @@ mod tests {
         let ctx = AdapterCtx::new(dir.path().join("build"));
         let s = spec(&[], &[("BUILD_SHARED_LIBS", "ON")]);
         let out = build(&src, &s, &ctx).unwrap();
-        assert!(out.libs.len() >= 2, "libs: {:?}", out.libs);
+        // `ma` builds shared without exports, so MSVC emits a bare `ma.dll`
+        // with no import lib: unlinkable, hence excluded from `libs` (its
+        // dir still surfaces for runtime lookup); `mb` stays static.
+        assert!(
+            out.libs.iter().any(|l| is_static(&l.to_string())),
+            "static mb expected, libs: {:?}",
+            out.libs
+        );
+        assert!(
+            out.libs
+                .iter()
+                .all(|l| !l.to_string().to_ascii_lowercase().ends_with(".dll")),
+            "bare DLLs must not link, libs: {:?}",
+            out.libs
+        );
         // Every reported file exists and is absolute.
         for lib in &out.libs {
             match lib {

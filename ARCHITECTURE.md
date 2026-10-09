@@ -104,6 +104,17 @@ bare names, defines) feed dependents' compile and link lines. An adapter
 plus explicit `bin`/`lib` targets is contradictory and errors; lib
 conventions defer to the adapter.
 
+## Build scripts, cache, targets (M7)
+
+`build.rivet.cpp` (auto-detected) compiles with the package toolchain and
+runs pre-build; `rivet:` directives feed includes/defines/libs and rerun
+gates, with outputs persisted so fresh builds never re-execute (D51).
+Whole-package artifacts cache under `~/.rivet/artifacts` keyed by
+package/version/features/fingerprint/profile/inputs, with dep-hash
+verification on restore and `Cached` restores (`target/` wipe-safe, D52).
+`--target` selects native detection or `clang --target=` cross builds,
+recorded in the fingerprint (D53); PCH/modules surface typed errors.
+
 ## Profiles / features (M3)
 
 Manifest `profile.dev|release` carry `opt`/`debug`/`lto`/`sanitizers`

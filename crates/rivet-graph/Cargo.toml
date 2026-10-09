@@ -9,6 +9,9 @@ rust-version = "1.74"
 [dependencies]
 rivet-manifest = { path = "../rivet-manifest" }
 rivet-toolchain = { path = "../rivet-toolchain" }
+rivet-adapters = { path = "../rivet-adapters" }
+rivet-buildscript = { path = "../rivet-buildscript" }
+rivet-cache = { path = "../rivet-cache" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

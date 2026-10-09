@@ -26,6 +26,8 @@ pub struct CompileEntry {
 }
 
 /// Entries for every TU in `plan` (bins + lib) under `manifest`'s flags.
+/// Persisted build-script outputs (if a build ran before) join defines and
+/// includes; the script itself never runs here (read-only command).
 pub fn compile_commands_for(
     manifest: &Manifest,
     plan: &PackagePlan,
@@ -33,7 +35,9 @@ pub fn compile_commands_for(
     inputs: &UnitInputs,
     features: &BTreeSet<String>,
 ) -> Result<Vec<CompileEntry>, Error> {
-    let opts = super::compile_options(manifest, &plan.profile, &inputs.include_dirs, features);
+    let (script, _) = super::script::peek_script(manifest, &plan.target_dir)
+        .unwrap_or((super::script::ScriptUse::default(), false));
+    let opts = super::full_compile_options(manifest, &plan.profile, inputs, features, &script);
     toolchain.validate_options(&opts)?;
     let mut targets: Vec<&TargetBuild> = plan.bins.iter().collect();
     if let Some(lib) = &plan.lib {

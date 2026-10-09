@@ -53,7 +53,7 @@ use rivet_manifest::AdapterSpec;
 use rivet_toolchain::CxxToolchain;
 use thiserror::Error;
 
-pub use discover::{discover_include_dirs, discover_libs, lib_dirs_of};
+pub use discover::{discover_include_dirs, discover_libs, dll_dirs, lib_dirs_of};
 pub use fingerprint::{fingerprint, needs_rebuild, source_dir_hash};
 pub use system::{parse_pkg_config, probe_pkg_config, probe_system, search_well_known};
 pub use util::tool_available;

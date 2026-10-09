@@ -117,21 +117,18 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
 - [x] Hermetic tests + `examples/cmake-mini` (offline) and
   `examples/cmake-zlib` (real zlib via git, network) demos
 
-## M7 — Build scripts, artifact cache, cross-compile [IN PROGRESS — owner: M7 agent]
-- [ ] `crates/rivet-buildscript` (agent-owned): compile `build.rivet.cpp`
-  with the detected toolchain, run it pre-build (sandboxed to package dirs
-  by default), parse `rivet:` directives (include dirs, link libs, defines,
-  rerun-if-changed) into a typed output model for the CLI integrator
-- [ ] `rivet-cache` (agent-owned): local artifact cache keyed by (package,
-  version, features, toolchain fingerprint, profile, flags hash) with
-  store/lookup/validate APIs for the CLI integrator
-- [ ] `rivet-toolchain` (agent-owned, flags/selection only): `--target`
-  triple parsing + toolchain selection hooks (find cross compilers, record
-  target in fingerprint); actionable errors for unsupported combos; PCH and
-  C++20-modules guidance (implement if cheap, else actionable error +
-  document)
-- [ ] Hermetic tests (tempdirs); `examples/buildscript-*` demos
-  (agent-owned examples)
+## M7 — Build scripts, artifact cache, cross-compile [DONE]
+- [x] `rivet-buildscript`: `build.rivet.cpp` compiled with the detected
+  toolchain, run pre-build (cwd = package, secrets scrubbed),
+  `rivet:` directives (include/lib/libdir/define/rerun-if-changed/env),
+  rerun gating with persisted outputs (D51)
+- [x] Artifact cache in `rivet-cache` (content key, quarantine on corrupt,
+  `Cached` restores with state; D52)
+- [x] `--target` triple parsing + selection (native detect, cross via
+  clang, fingerprint-suffixed; D53); PCH/modules = actionable errors (D54)
+- [x] `examples/buildscript-demo` hermetic demo; `tests/m7.rs` (script
+  rerun, cache hit after wipe, native/bogus targets)
+- [x] LTO/sanitizers already shipped in M3; shared/vendor already in M4
 
 ## M5/M6/M7 shared contracts (frozen)
 

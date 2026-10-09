@@ -1,3 +1,5 @@
 /target/
 target/
+# Build-script outputs inside examples (regenerated every build).
+examples/buildscript-demo/generated/
 # NOTE: Cargo.lock is intentionally committed (see DECISIONS.md).

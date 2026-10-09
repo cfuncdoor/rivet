@@ -64,7 +64,10 @@ pub fn build(
     )?;
 
     let libs = discover_libs(&ctx.build_dir, &spec.targets)?;
-    let lib_dirs = lib_dirs_of(&libs);
+    let mut lib_dirs = lib_dirs_of(&libs);
+    lib_dirs.extend(super::discover::dll_dirs(&ctx.build_dir));
+    lib_dirs.sort();
+    lib_dirs.dedup();
     let include_dirs = discover_include_dirs(source_dir, &ctx.build_dir);
     Ok(AdapterOutput {
         include_dirs,

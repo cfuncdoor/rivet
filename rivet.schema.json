@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://rivet.dev/schema/rivet.json",
   "title": "rivet.json manifest",
-  "description": "Cargo-like manifest for C++ packages (rivet M1).",
+  "description": "Cargo-like manifest for C++ packages",
   "type": "object",
   "required": ["package"],
   "properties": {

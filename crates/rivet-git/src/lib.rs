@@ -641,83 +641,62 @@ impl GitCache {
             std::fs::remove_dir_all(&tmp)
                 .map_err(|e| Error::io("remove stale clone tmp", &tmp, e))?;
         }
-        // Partial first; servers without filter support fall through.
-        let filtered = self.run_git(
-            &[
-                "clone",
-                "--bare",
-                "--filter=blob:none",
-                "--",
-                url,
-                &tmp.to_string_lossy(),
-            ],
-            None,
-        );
-        if filtered.is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            self.run_git(
-                &["clone", "--bare", "--", url, &tmp.to_string_lossy()],
-                None,
-            )
-            .map_err(|e| match e {
-                Error::GitFailed {
-                    cmd,
-                    status,
-                    stderr,
-                    ..
-                } => Error::GitFailed {
-                    cmd,
-                    status,
-                    stderr,
-                    hint: format!(
-                        "could not clone `{url}`. Hint: check the URL, network, and credentials"
-                    ),
-                },
-                other => other,
-            })?;
+        // Mirrors are full clones (never partial): `git clone --local`
+        // checkouts cannot reliably materialize blobs from a
+        // `--filter=blob:none` mirror on common git builds (observed:
+        // checkout exits 0 with every file deleted). Full mirrors keep
+        // checkouts hermetic and offline-capable after the first fetch.
+        // Clone into a temp sibling then rename (atomic-ish).
+        let tmp = db.with_extension("tmp-clone");
+        if tmp.exists() {
+            std::fs::remove_dir_all(&tmp)
+                .map_err(|e| Error::io("remove stale clone tmp", &tmp, e))?;
         }
+        self.run_git(
+            &["clone", "--bare", "--", url, &tmp.to_string_lossy()],
+            None,
+        )
+        .map_err(|e| match e {
+            Error::GitFailed {
+                cmd,
+                status,
+                stderr,
+                ..
+            } => Error::GitFailed {
+                cmd,
+                status,
+                stderr,
+                hint: format!(
+                    "could not clone `{url}`. Hint: check the URL, network, and credentials"
+                ),
+            },
+            other => other,
+        })?;
         std::fs::rename(&tmp, &db).map_err(|e| Error::io("rename clone into place", &db, e))?;
         let _ = std::fs::write(db.join("rivet-url.txt"), url);
         Ok(db)
     }
 
-    /// Fetch one ref into an existing mirror (partial first, full fallback).
+    /// Fetch one ref into an existing mirror (plain fetches; mirrors stay
+    /// full so checkouts never depend on promisor behavior).
     fn fetch_ref(&self, db: &Path, url: &str, git_ref: &GitRef) -> Result<(), Error> {
         debug_assert!(!self.offline);
         match git_ref {
             GitRef::Tag(t) => {
                 let spec = format!("+refs/tags/{t}:refs/tags/{t}");
-                let r = self.run_git_in_db(db, &["fetch", "--filter=blob:none", "origin", &spec]);
-                if r.is_err() {
-                    let r2 = self.run_git_in_db(db, &["fetch", "origin", &spec]);
-                    if r2.is_err() {
-                        // Last resort: full fetch (covers renamed/moved refs).
-                        self.run_git_in_db(db, &["fetch", "origin"])
-                            .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
-                    }
-                }
+                self.run_git_in_db(db, &["fetch", "origin", &spec])
+                    .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
                 Ok(())
             }
             GitRef::Branch(b) => {
                 if b == "HEAD" {
-                    if self
-                        .run_git_in_db(db, &["fetch", "--filter=blob:none", "origin"])
-                        .is_err()
-                    {
-                        self.run_git_in_db(db, &["fetch", "origin"])
-                            .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
-                    }
+                    self.run_git_in_db(db, &["fetch", "origin"])
+                        .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
                     return Ok(());
                 }
                 let spec = format!("+refs/heads/{b}:refs/heads/{b}");
-                let r = self.run_git_in_db(db, &["fetch", "--filter=blob:none", "origin", &spec]);
-                if r.is_err() {
-                    let r2 = self.run_git_in_db(db, &["fetch", "origin", &spec]);
-                    if r2.is_err() {
-                        self.run_git_in_db(db, &["fetch", "origin"])
-                            .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
-                    }
-                }
+                self.run_git_in_db(db, &["fetch", "origin", &spec])
+                    .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
                 Ok(())
             }
             GitRef::Rev(sha) => {
@@ -725,14 +704,8 @@ impl GitCache {
                 if self.run_git_in_db(db, &["cat-file", "-e", sha]).is_ok() {
                     return Ok(());
                 }
-                let r = self.run_git_in_db(db, &["fetch", "--filter=blob:none", "origin", sha]);
-                if r.is_err() {
-                    let r2 = self.run_git_in_db(db, &["fetch", "origin", sha]);
-                    if r2.is_err() {
-                        self.run_git_in_db(db, &["fetch", "origin"])
-                            .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
-                    }
-                }
+                self.run_git_in_db(db, &["fetch", "origin", sha])
+                    .map_err(|e| fetch_hint(e, url, &git_ref.describe()))?;
                 Ok(())
             }
         }
@@ -897,40 +870,57 @@ impl GitCache {
                 .run_git(&["rev-parse", "HEAD"], Some(&dest))
                 .unwrap_or_default();
             if head == sha {
-                return self.finish_checkout(url, sha, &dest, opts, true);
+                // Heal corrupt checkouts (e.g. file-less trees from the
+                // partial-mirror era, or tampered dirs): rebuild below.
+                if self.worktree_clean(&dest)? {
+                    return self.finish_checkout(url, sha, &dest, opts, true);
+                }
+                std::fs::remove_dir_all(&dest)
+                    .map_err(|e| Error::io("remove corrupt checkout", &dest, e))?;
+            } else {
+                return Err(Error::Io {
+                    action: "reuse checkout".to_string(),
+                    path: dest.display().to_string(),
+                    message: format!(
+                        "checkout exists but HEAD is `{head}`, expected `{sha}`. Hint: remove the directory or run `git prune` and retry"
+                    ),
+                });
             }
-            return Err(Error::Io {
-                action: "reuse checkout".to_string(),
-                path: dest.display().to_string(),
-                message: format!(
-                    "checkout exists but HEAD is `{head}`, expected `{sha}`. Hint: remove the directory or run `git prune` and retry"
-                ),
-            });
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| Error::io("create checkouts dir", parent, e))?;
         }
         let tmp = dest.with_extension("tmp-checkout");
-        if tmp.exists() {
-            std::fs::remove_dir_all(&tmp)
-                .map_err(|e| Error::io("remove stale checkout tmp", &tmp, e))?;
+        self.clone_detached(&db, &tmp, sha)?;
+        if !self.worktree_clean(&tmp)? {
+            // Blobs missing: the mirror predates full-mirror policy (a
+            // `blob:none` partial whose promisor cannot satisfy local
+            // clones — observed as exit-0 checkouts with every file `D`).
+            // Partial fetches never backfill (`partialclonefilter`
+            // persists), so drop the mirror and re-clone it full, then
+            // redo the working copy exactly once.
+            if self.offline {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::Offline {
+                    action: format!("materialize checkout of `{url}`"),
+                    where_: dest.display().to_string(),
+                });
+            }
+            std::fs::remove_dir_all(&db).map_err(|e| Error::io("remove partial mirror", &db, e))?;
+            let db = self.ensure_mirror(name, url)?;
+            self.clone_detached(&db, &tmp, sha)?;
+            if !self.worktree_clean(&tmp)? {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(Error::GitFailed {
+                    cmd: format!("git checkout --detach {sha}"),
+                    status: "materialization check failed".to_string(),
+                    stderr: "working tree does not match HEAD".to_string(),
+                    hint: "the remote may be corrupt; run `rivet git prune` and retry".to_string(),
+                });
+            }
         }
-        // Clone locally from the mirror (no network, offline-safe).
-        self.run_git(
-            &[
-                "clone",
-                "--local",
-                "--no-hardlinks",
-                "--no-checkout",
-                "--",
-                &db.to_string_lossy(),
-                &tmp.to_string_lossy(),
-            ],
-            None,
-        )?;
         let checkout_result = (|| {
-            self.run_git(&["checkout", "--detach", sha], Some(&tmp))?;
             if opts.submodules {
                 self.init_submodules(url, sha, &tmp)?;
             }
@@ -957,6 +947,48 @@ impl GitCache {
         std::fs::rename(&tmp, &dest)
             .map_err(|e| Error::io("rename checkout into place", &dest, e))?;
         self.finish_checkout(url, sha, &dest, opts, false)
+    }
+
+    /// Clone the mirror locally without checking out, then detach at
+    /// `sha`. Shared by the fresh path and the one repair retry.
+    fn clone_detached(&self, db: &Path, tmp: &Path, sha: &str) -> Result<(), Error> {
+        if tmp.exists() {
+            std::fs::remove_dir_all(tmp)
+                .map_err(|e| Error::io("remove stale checkout tmp", tmp, e))?;
+        }
+        // Local clone from the mirror (no network, offline-safe).
+        self.run_git(
+            &[
+                "clone",
+                "--local",
+                "--no-hardlinks",
+                "--no-checkout",
+                "--",
+                &db.to_string_lossy(),
+                &tmp.to_string_lossy(),
+            ],
+            None,
+        )?;
+        self.run_git(&["checkout", "--detach", sha], Some(tmp))?;
+        Ok(())
+    }
+
+    /// `true` when the working tree matches HEAD with no changes.
+    ///
+    /// Guards against file-less checkouts (a partial-mirror `clone --local`
+    /// can exit 0 while materializing nothing) and against tampering with
+    /// immutable dirs. Submodule states are ignored (reconciled separately).
+    fn worktree_clean(&self, work: &Path) -> Result<bool, Error> {
+        let out = self.run_git(
+            &[
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--ignore-submodules=all",
+            ],
+            Some(work),
+        )?;
+        Ok(out.trim().is_empty())
     }
 
     fn finish_checkout(
@@ -1120,12 +1152,7 @@ impl GitCache {
             if self.offline {
                 continue;
             }
-            if self
-                .run_git_in_db(&db, &["fetch", "--filter=blob:none", "origin"])
-                .is_err()
-            {
-                self.run_git_in_db(&db, &["fetch", "origin"])?;
-            }
+            self.run_git_in_db(&db, &["fetch", "origin"])?;
         }
         Ok(())
     }
@@ -2320,6 +2347,63 @@ mod tests {
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0].0, "a");
         assert!(is_allowed_url(&urls[0].1));
+    }
+
+    #[test]
+    fn checkout_materializes_all_files() {
+        // Regression: a partial-mirror `clone --local` can exit 0 while
+        // materializing nothing (dirs only, every file `D`). Checkouts
+        // must contain every tracked file with a clean worktree.
+        if !git_available() {
+            eprintln!("SKIP: git binary not found");
+            return;
+        }
+        let repo = make_repo(false).expect("make repo");
+        let (_d, cache) = temp_cache();
+        let sha = cache
+            .resolve_ref("pkg", &repo.url, &GitRef::Tag("v1".to_string()))
+            .expect("resolve tag");
+        let checkout = cache
+            .ensure_checkout("pkg", &repo.url, &sha, &CheckoutOpts::default())
+            .expect("checkout");
+        assert!(
+            checkout.join("a.txt").is_file(),
+            "tracked file materialized"
+        );
+        assert!(
+            cache.worktree_clean(&checkout).expect("status"),
+            "worktree must match HEAD"
+        );
+    }
+
+    #[test]
+    fn corrupt_checkout_heals_on_reuse() {
+        if !git_available() {
+            eprintln!("SKIP: git binary not found");
+            return;
+        }
+        let repo = make_repo(false).expect("make repo");
+        let (_d, cache) = temp_cache();
+        let sha = cache
+            .resolve_ref("pkg", &repo.url, &GitRef::Tag("v1".to_string()))
+            .expect("resolve tag");
+        let checkout = cache
+            .ensure_checkout("pkg", &repo.url, &sha, &CheckoutOpts::default())
+            .expect("checkout");
+        assert!(checkout.join("a.txt").is_file());
+        // Simulate corruption/tampering: delete a tracked file.
+        std::fs::remove_file(checkout.join("a.txt")).expect("delete");
+        assert!(!cache.worktree_clean(&checkout).expect("status"));
+        // Re-ensuring heals instead of reusing the corrupt tree.
+        let healed = cache
+            .ensure_checkout("pkg", &repo.url, &sha, &CheckoutOpts::default())
+            .expect("heal");
+        assert_eq!(healed, checkout);
+        assert!(checkout.join("a.txt").is_file(), "file restored");
+        assert!(
+            cache.worktree_clean(&checkout).expect("status"),
+            "worktree clean after heal"
+        );
     }
 
     #[test]

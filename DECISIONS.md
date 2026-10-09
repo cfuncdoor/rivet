@@ -336,3 +336,72 @@ simpler option that preserves Cargo's mental model, then continue.
   Tests requiring `cmake`/`pkg-config`/`make`/`meson` check presence via the crate's own `tool_available` and return early with a notice when absent; pure-logic tests always run. Real-build tests use tempdir fixtures so they need no network and no system packages. `make` builds in-source by nature, so the integrator hands it a writable scratch copy for immutable checkouts and fingerprints before building.
 - **D50: New deps: none.**
   `rivet-adapters` adds no runtime dependencies (shells out to `cmake`/`meson`/`make`/`pkg-config`; PATH lookup and hashing are hand-rolled to avoid `which`/`sha2`). Dev-only `tempfile 3.0` for hermetic tests (already the workspace standard, D7). Schemaless foreign deps (no `rivet.json`) resolve via the inline `package` block (name must equal the dep key, version required); `system: true` locks a `system` source entry and probes at build time; `system` with `path`/`git` is a parse error (probe-only means sourceless).
+
+## M7
+
+- **D51: Build-script directive set + sandbox limits.**
+  Convention: `<package-dir>/build.rivet.cpp`, auto-detected; absent = no
+  script. Compiled with the detected toolchain at C++17 minimum with the
+  package `include/` dir on the path; output `build-script[.exe]` under
+  `target/<prof>/build/script`. Stdout directives, all `rivet:<key> <value>`
+  (space or `=` separator): `include <dir>`, `lib <file|-lname>`
+  (verbatim, in order), `libdir <dir>`, `define <K[=V]>`,
+  `rerun-if-changed <path>`, `rerun-if-env <VAR>` (bare name). Relative
+  paths resolve against the package dir; repeats dedupe first-wins (`-I`
+  order is semantics). Unknown keys are an error naming the line number
+  and content; non-`rivet:` stdout plus stderr pass to the build log.
+  Rerun rule: script-bytes hash vs snapshot, content hashes of watched
+  files (missing↔present counts), watched env values; outputs persist in
+  `target/<prof>/incremental/build-script.json` so fresh builds never
+  re-execute. Sandbox, stated honestly: the script runs as the current
+  user with cwd = package dir, stdin null, and `*_TOKEN`/`*_KEY` env vars
+  stripped; there is NO network or filesystem isolation on stock OSes, so
+  only run scripts from sources you trust (same model as Cargo `build.rs`).
+- **D52: Artifact cache key layout + invalidation rule.**
+  Key = `sha256("package\\0version\\0<sorted features>\\0<toolchain
+  fingerprint>\\0profile\\0<sorted flags>\\0<inputs hash>")`, 64 hex chars;
+  the inputs hash covers sources only (headers verified post-lookup
+  against the sidecar — a wipe-safe two-phase hit). Entry layout
+  `<root>/artifacts/<key>/{files…, rivet-artifact.json}` plus a graph
+  sidecar `build-state.json` (output mapping + TU/link state snapshot);
+  corrupt entries quarantine + miss, never crash. Invalidation: any
+  dimension change is a miss; header drift fails the sidecar verify and
+  rebuilds precisely. Remote cache is out of scope (hook point documented
+  in `rivet-cache`). The CLI prints `Cached` on restore hits.
+- **D53: Target-triple support matrix.**
+  Parser accepts `native` + `arch-vendor-os[-env]` with arch/OS/env
+  aliases normalized. Native arch+OS (vendor/env ignored) → normal
+  detection; anything else → `clang++ --target=<triple>` when clang is
+  installed, else actionable `NoCrossToolchain`. The triple lives on
+  `CxxToolchain.target`: driver flags append `--target=` (compile+link,
+  never `ar`), and `fingerprint()` appends `|target=<triple>` only when
+  set — native `None` keeps the historic format byte-for-byte, so native
+  builds never rebuild spuriously.
+- **D54: PCH + C++20-modules verdict: actionable errors, not implemented.**
+  PCH needs ordered per-TU setup (`/Yc` creator + `/Yu` consumers) the
+  uniform per-TU flag model cannot express; modules need per-toolchain
+  dependency scanning first. Both surface typed errors prescribing plain
+  `include/` + `#include`. No manifest surface exists for either (nothing
+  to request them with), so the errors are currently unreachable from
+  builds — the APIs wait for a future manifest story.
+- **D55: New deps justified: `sha2 0.10` in `rivet-buildscript` +
+  `rivet-cache` (nothing else).**
+  `sha2` was already in the workspace (via `rivet-graph`) and pinned in
+  `Cargo.lock`; adding it to these two crates reuses the audited primitive
+  for script-hashing, inputs-hashing, and key derivation instead of a
+  second hasher. No `hex` crate (formatting via `format!("{:x}")`), no
+  network / archive / git crates. `tempfile 3.0` remains dev-only.
+- **D56: Mirrors are full clones; checkouts verify materialization (amends D30).**
+  Partial mirrors (`blob:none`) plus `clone --local` checkouts silently
+  produce file-less trees on common git builds (observed: checkout exits 0
+  with every file `D`; partial fetches never backfill because
+  `partialclonefilter` persists). So mirrors clone full, and every checkout
+  verifies `git status --porcelain` clean: reuse of a dirty checkout heals
+  by rebuild, fresh checkouts repair once via mirror re-clone, else hard
+  error. The bandwidth savings were not worth silent corruption.
+- **D57: Bare `.dll` files never link; linker flags go after `/link`.**
+  MSVC cannot link a `.dll` directly (LNK1107) — only import `.lib`s link,
+  so discovery drops bare DLLs (their dirs still surface for runtime
+  lookup). Separately, `/LIBPATH` and bare lib names are linker inputs
+  and must follow `/link` on the `cl` line (`D9002`/`D9024` otherwise).
+  Both found wiring the real-zlib demo.

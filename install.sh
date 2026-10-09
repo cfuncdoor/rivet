@@ -1,9 +1,9 @@
 #!/usr/bin/env sh
 # Install the latest rivet release for Linux (x86_64).
-# Usage: curl -fsSL https://raw.githubusercontent.com/<org>/rivet/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/cfuncdoor/rivet/main/install.sh | sh
 set -eu
 
-REPO="${RIVET_REPO:-<org>/rivet}"
+REPO="${RIVET_REPO:-cfuncdoor/rivet}"
 VERSION="${RIVET_VERSION:-latest}"
 DEST="${DEST:-$HOME/.rivet/bin}"
 OS="unknown-linux-musl"

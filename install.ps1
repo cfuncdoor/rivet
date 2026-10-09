@@ -1,8 +1,8 @@
 # Install the latest rivet release for Windows (x86_64).
-# Usage: irm https://raw.githubusercontent.com/<org>/rivet/main/install.ps1 | iex
+# Usage: irm https://raw.githubusercontent.com/cfuncdoor/rivet/main/install.ps1 | iex
 $ErrorActionPreference = "Stop"
 
-$Repo = if ($env:RIVET_REPO) { $env:RIVET_REPO } else { "<org>/rivet" }
+$Repo = if ($env:RIVET_REPO) { $env:RIVET_REPO } else { "cfuncdoor/rivet" }
 $Version = if ($env:RIVET_VERSION) { $env:RIVET_VERSION } else { "latest" }
 $Dest = if ($env:DEST) { $env:DEST } else { "$HOME\.rivet\bin" }
 

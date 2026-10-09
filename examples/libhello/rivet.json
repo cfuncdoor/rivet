@@ -1,5 +1,5 @@
 {
-  "$schema": "https://rivet.dev/schema/rivet.json",
+  "$schema": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
   "package": {
     "name": "libhello",
     "version": "0.1.0",

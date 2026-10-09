@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://rivet.dev/schema/rivet.json",
+  "$id": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
   "title": "rivet.json manifest",
   "description": "Cargo-like manifest for C++ packages",
   "type": "object",

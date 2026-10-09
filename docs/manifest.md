@@ -3,7 +3,9 @@
 The manifest is **JSONC**: plain JSON plus `//` and `/* */` comments
 and trailing commas. Errors report `line:column` plus a JSON path
 (e.g. `dependencies.fmt.git`). A JSON Schema ships as
-`rivet.schema.json` (referenced via `$schema`); resolution writes the
+`rivet.schema.json` (referenced via `$schema` as
+`https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json`);
+resolution writes the
 strict-JSON, sorted-key lockfile `rivet.lock.json`.
 
 ```jsonc

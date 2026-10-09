@@ -17,12 +17,12 @@ one of the install scripts:
 
 ```sh
 # Linux
-curl -fsSL https://raw.githubusercontent.com/<org>/rivet/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/cfuncdoor/rivet/main/install.sh | sh
 ```
 
 ```powershell
 # Windows
-irm https://raw.githubusercontent.com/<org>/rivet/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/cfuncdoor/rivet/main/install.ps1 | iex
 ```
 
 Or build from source (needs a Rust toolchain; no other build tools):
@@ -41,7 +41,7 @@ Packages declare themselves in `rivet.json` (JSON with comments):
 
 ```jsonc
 {
-  "$schema": "https://rivet.dev/schema/rivet.json",
+  "$schema": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
   "package": { "name": "myapp", "version": "0.1.0", "standard": "c++20" },
   "dependencies": {
     "fmt": "11",                                    // registry, semver

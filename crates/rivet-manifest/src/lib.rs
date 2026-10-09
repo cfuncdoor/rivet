@@ -1548,7 +1548,7 @@ mod tests {
     #[test]
     fn parses_full_example_manifest() {
         let src = r#"{
-          "$schema": "https://rivet.dev/schema/rivet.json",
+          "$schema": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
           "package": { "name": "myapp", "version": "0.1.0", "standard": "c++20" },
           "dependencies": {
             "fmt": "11",

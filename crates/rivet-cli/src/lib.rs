@@ -696,7 +696,7 @@ fn validate_package_name(name: &str) -> Result<()> {
 fn manifest_template(name: &str) -> String {
     format!(
         r#"{{
-  "$schema": "https://rivet.dev/schema/rivet.json",
+  "$schema": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
   "package": {{
     "name": "{name}",
     "version": "0.1.0",

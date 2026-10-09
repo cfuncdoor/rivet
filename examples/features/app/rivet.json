@@ -1,0 +1,18 @@
+{
+  "$schema": "https://rivet.dev/schema/rivet.json",
+  "package": {
+    "name": "app",
+    "version": "0.1.0",
+    "standard": "c++17"
+  },
+  "dependencies": {
+    "extra": {
+      "path": "../extra",
+      "optional": true
+    }
+  },
+  "features": {
+    "default": [],
+    "extra": ["dep:extra"]
+  }
+}

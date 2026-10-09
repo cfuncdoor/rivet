@@ -1,0 +1,8 @@
+{
+  "$schema": "https://rivet.dev/schema/rivet.json",
+  "package": {
+    "name": "extra",
+    "version": "0.1.0",
+    "standard": "c++17"
+  }
+}

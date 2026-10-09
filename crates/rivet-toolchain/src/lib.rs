@@ -39,6 +39,16 @@ pub enum Error {
     /// IO failure.
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    /// A sanitizer is not supported by this toolchain.
+    #[error("sanitizer `{name}` is not supported by the {kind} toolchain. Fix: use `--features`/profile `sanitizers` with only {supported}")]
+    UnsupportedSanitizer {
+        /// Sanitizer name as written.
+        name: String,
+        /// Toolchain kind string.
+        kind: String,
+        /// Supported sanitizer list for the message.
+        supported: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -136,7 +146,13 @@ impl CxxToolchain {
 
     /// Content fingerprint: ABI/compiler/std/stdlib inputs that must
     /// invalidate the build cache. Covers kind, version, std, opt, debug,
-    /// defines, and include dirs (in order — order is semantics for `-I`).
+    /// defines, include dirs (in order — order is semantics for `-I`), lto,
+    /// sanitizers, and enabled features (sorted).
+    ///
+    /// Format (M3, also consumed by `rivet-graph` link digests; M4 lockfile
+    /// readers must treat it as opaque but stable within a toolchain):
+    /// `<kind>|<version>|std=<std>|opt=<n>|debug=<0|1>|defines=<;>|includes=<;>`
+    /// `|lto=<0|1>|sanitizers=<csv>|features=<csv>`.
     pub fn fingerprint(&self, opts: &CompileOptions) -> String {
         let defines = opts.defines.join(";");
         let includes = opts
@@ -146,13 +162,37 @@ impl CxxToolchain {
             .collect::<Vec<_>>()
             .join(";");
         format!(
-            "{}|{}|std={}|opt={}|debug={}|defines={defines}|includes={includes}",
+            "{}|{}|std={}|opt={}|debug={}|defines={defines}|includes={includes}|lto={}|sanitizers={}|features={}",
             self.kind,
             self.version.trim(),
             opts.std,
             opts.opt,
-            opts.debug as u8
+            opts.debug as u8,
+            opts.lto as u8,
+            opts.sanitizers.join(","),
+            opts.features.join(","),
         )
+    }
+
+    /// Reject sanitizer names this toolchain cannot honor.
+    ///
+    /// MSVC supports only `address`; anything else is an actionable error
+    /// (never silently dropped). GNU/Clang names pass through — the compiler
+    /// itself reports unknown names. Callers must run this before generating
+    /// commands, since command builders are infallible.
+    pub fn validate_options(&self, opts: &CompileOptions) -> Result<(), Error> {
+        if self.is_msvc_like() {
+            for name in &opts.sanitizers {
+                if name != "address" {
+                    return Err(Error::UnsupportedSanitizer {
+                        name: name.clone(),
+                        kind: self.kind.to_string(),
+                        supported: "`address` (the only sanitizer MSVC supports)".to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Header-tracking style for this toolchain.
@@ -183,6 +223,11 @@ impl CxxToolchain {
     }
 
     /// Shared flag core for a compile-only step (no dep tracking, no env).
+    ///
+    /// LTO/sanitizer mapping (M3 profiles): MSVC-like `/GL` + GNU/Clang
+    /// `-flto`; sanitizers as `/fsanitize=<csv>` (MSVC-like, validated to
+    /// `address`-only by [`CxxToolchain::validate_options`]) or
+    /// `-fsanitize=<csv>` (GNU/Clang). `clang-cl` follows the MSVC mapping.
     fn push_common_args(&self, args: &mut Vec<OsString>, opts: &CompileOptions) {
         if self.is_msvc_like() {
             args.push(OsString::from("/nologo"));
@@ -195,6 +240,15 @@ impl CxxToolchain {
             }
             if opts.debug {
                 args.push(OsString::from("/Zi"));
+            }
+            if opts.lto {
+                args.push(OsString::from("/GL"));
+            }
+            if !opts.sanitizers.is_empty() {
+                args.push(OsString::from(format!(
+                    "/fsanitize={}",
+                    opts.sanitizers.join(",")
+                )));
             }
             for d in &opts.defines {
                 args.push(OsString::from(format!("/D{d}")));
@@ -209,6 +263,15 @@ impl CxxToolchain {
             args.push(OsString::from(format!("-O{}", opts.opt.min(3))));
             if opts.debug {
                 args.push(OsString::from("-g"));
+            }
+            if opts.lto {
+                args.push(OsString::from("-flto"));
+            }
+            if !opts.sanitizers.is_empty() {
+                args.push(OsString::from(format!(
+                    "-fsanitize={}",
+                    opts.sanitizers.join(",")
+                )));
             }
             for d in &opts.defines {
                 args.push(OsString::from(format!("-D{d}")));
@@ -304,7 +367,10 @@ impl CxxToolchain {
     ///
     /// The `cl` driver doubles as the link driver on MSVC-like toolchains
     /// (no separate `link.exe` lookup). Archives are absolute paths, so no
-    /// `/LIBPATH`/`-L` search dirs are needed.
+    /// `/LIBPATH`/`-L` search dirs are needed. LTO/sanitizers ride along so
+    /// link-time codegen and runtimes match the compile step: MSVC-like
+    /// `/fsanitize=<csv>` (cl-level) + `/LTCG` (link-level), GNU/Clang
+    /// `-flto` / `-fsanitize=<csv>`.
     pub fn link_exe_command(
         &self,
         objects: &[PathBuf],
@@ -321,12 +387,24 @@ impl CxxToolchain {
             for a in archives {
                 cmd.arg(a);
             }
+            if !opts.sanitizers.is_empty() {
+                cmd.arg(format!("/fsanitize={}", opts.sanitizers.join(",")));
+            }
             let mut fe = OsString::from("/Fe");
             fe.push(output);
             cmd.arg(fe);
+            let mut link_opts: Vec<&str> = Vec::new();
             if opts.debug {
+                link_opts.push("/DEBUG");
+            }
+            if opts.lto {
+                link_opts.push("/LTCG");
+            }
+            if !link_opts.is_empty() {
                 cmd.arg("/link");
-                cmd.arg("/DEBUG");
+                for o in link_opts {
+                    cmd.arg(o);
+                }
             }
         } else {
             for o in objects {
@@ -334,6 +412,12 @@ impl CxxToolchain {
             }
             for a in archives {
                 cmd.arg(a);
+            }
+            if opts.lto {
+                cmd.arg("-flto");
+            }
+            if !opts.sanitizers.is_empty() {
+                cmd.arg(format!("-fsanitize={}", opts.sanitizers.join(",")));
             }
             cmd.arg("-o");
             cmd.arg(output);
@@ -402,6 +486,14 @@ pub struct CompileOptions {
     pub defines: Vec<String>,
     /// Extra include directories.
     pub include_dirs: Vec<PathBuf>,
+    /// Link-time optimization (M3 profiles).
+    pub lto: bool,
+    /// Sanitizers, e.g. `["address"]` (M3 profiles; MSVC supports only
+    /// `address` — see [`CxxToolchain::validate_options`]).
+    pub sanitizers: Vec<String>,
+    /// Enabled features, sorted (M3 contract C1; fingerprint only — no flags
+    /// are derived from features).
+    pub features: Vec<String>,
 }
 
 impl Default for CompileOptions {
@@ -412,6 +504,9 @@ impl Default for CompileOptions {
             debug: true,
             defines: Vec::new(),
             include_dirs: Vec::new(),
+            lto: false,
+            sanitizers: Vec::new(),
+            features: Vec::new(),
         }
     }
 }
@@ -1113,5 +1208,137 @@ mod tests {
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
         assert!(args.contains(&"crus".to_string()), "got: {args:?}");
+    }
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn lto_maps_per_family_on_compile() {
+        let msvc = fake(ToolchainKind::Msvc);
+        let opts = CompileOptions {
+            lto: true,
+            ..Default::default()
+        };
+        let args = msvc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts);
+        assert!(args.iter().any(|a| a == "/GL"), "got: {args:?}");
+
+        let gcc = fake(ToolchainKind::Gcc);
+        let args = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
+        assert!(args.iter().any(|a| a == "-flto"), "got: {args:?}");
+
+        let clang = fake(ToolchainKind::Clang);
+        let args = clang.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
+        assert!(args.iter().any(|a| a == "-flto"), "got: {args:?}");
+
+        // Off by default: neither flag appears.
+        let plain = CompileOptions::default();
+        let args = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &plain);
+        assert!(!args.iter().any(|a| a == "-flto"), "got: {args:?}");
+    }
+
+    #[test]
+    fn lto_maps_per_family_on_link() {
+        let msvc = fake(ToolchainKind::Msvc);
+        let opts = CompileOptions {
+            lto: true,
+            debug: false,
+            ..Default::default()
+        };
+        let cmd = msvc.link_exe_command(&[PathBuf::from("a.obj")], &[], Path::new("a.exe"), &opts);
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a == "/LTCG"), "got: {args:?}");
+        assert!(args.iter().any(|a| a == "/link"), "got: {args:?}");
+
+        let gcc = fake(ToolchainKind::Gcc);
+        let cmd = gcc.link_exe_command(&[PathBuf::from("a.o")], &[], Path::new("a"), &opts);
+        let args = args_of(&cmd);
+        assert!(args.iter().any(|a| a == "-flto"), "got: {args:?}");
+    }
+
+    #[test]
+    fn sanitizers_map_per_family() {
+        let opts = CompileOptions {
+            sanitizers: vec!["address".to_string()],
+            ..Default::default()
+        };
+        let msvc = fake(ToolchainKind::Msvc);
+        msvc.validate_options(&opts).unwrap();
+        let args = msvc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts);
+        assert!(
+            args.iter().any(|a| a == "/fsanitize=address"),
+            "got: {args:?}"
+        );
+        let link = msvc.link_exe_command(&[PathBuf::from("a.obj")], &[], Path::new("a.exe"), &opts);
+        let link_args = args_of(&link);
+        assert!(
+            link_args.iter().any(|a| a == "/fsanitize=address"),
+            "got: {link_args:?}"
+        );
+
+        let gcc = fake(ToolchainKind::Gcc);
+        gcc.validate_options(&opts).unwrap();
+        let args = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
+        assert!(
+            args.iter().any(|a| a == "-fsanitize=address"),
+            "got: {args:?}"
+        );
+        let link = gcc.link_exe_command(&[PathBuf::from("a.o")], &[], Path::new("a"), &opts);
+        let link_args = args_of(&link);
+        assert!(
+            link_args.iter().any(|a| a == "-fsanitize=address"),
+            "got: {link_args:?}"
+        );
+
+        // GNU joins several sanitizers as CSV on both steps.
+        let multi = CompileOptions {
+            sanitizers: vec!["address".to_string(), "undefined".to_string()],
+            ..Default::default()
+        };
+        let args = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &multi);
+        assert!(
+            args.iter().any(|a| a == "-fsanitize=address,undefined"),
+            "got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn msvc_rejects_non_address_sanitizers_actionably() {
+        let msvc = fake(ToolchainKind::Msvc);
+        let clang_cl = fake(ToolchainKind::ClangCl);
+        for tc in [&msvc, &clang_cl] {
+            let opts = CompileOptions {
+                sanitizers: vec!["thread".to_string()],
+                ..Default::default()
+            };
+            let err = tc.validate_options(&opts).unwrap_err().to_string();
+            assert!(err.contains("thread"), "got: {err}");
+            assert!(err.contains("address"), "got: {err}");
+        }
+        // GNU/Clang pass validation through (the compiler reports unknowns).
+        let gcc = fake(ToolchainKind::Gcc);
+        gcc.validate_options(&CompileOptions {
+            sanitizers: vec!["thread".to_string()],
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn fingerprint_covers_lto_sanitizers_features() {
+        let tc = fake(ToolchainKind::Gcc);
+        let base = CompileOptions::default();
+        let mut lto = base.clone();
+        lto.lto = true;
+        let mut asan = base.clone();
+        asan.sanitizers.push("address".to_string());
+        let mut feat = base.clone();
+        feat.features.push("extra".to_string());
+        assert_ne!(tc.fingerprint(&base), tc.fingerprint(&lto));
+        assert_ne!(tc.fingerprint(&base), tc.fingerprint(&asan));
+        assert_ne!(tc.fingerprint(&base), tc.fingerprint(&feat));
     }
 }

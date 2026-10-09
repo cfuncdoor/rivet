@@ -70,6 +70,15 @@ pub enum Commands {
         /// Keep going after a compile failure (report all errors).
         #[arg(long)]
         keep_going: bool,
+        /// Enable features (comma-separated, repeatable).
+        #[arg(long, value_delimiter = ',', value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Enable all features.
+        #[arg(long)]
+        all_features: bool,
+        /// Disable the `default` feature.
+        #[arg(long)]
+        no_default_features: bool,
         /// Cross-compile for the given triple (M7).
         #[arg(long, value_name = "TRIPLE")]
         target: Option<String>,
@@ -100,6 +109,15 @@ pub enum Commands {
         /// Keep going after a compile failure (report all errors).
         #[arg(long)]
         keep_going: bool,
+        /// Enable features (comma-separated, repeatable).
+        #[arg(long, value_delimiter = ',', value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Enable all features.
+        #[arg(long)]
+        all_features: bool,
+        /// Disable the `default` feature.
+        #[arg(long)]
+        no_default_features: bool,
         /// Arguments passed to the binary (after `--`).
         #[arg(last = true, value_name = "ARGS")]
         args: Vec<OsString>,
@@ -113,7 +131,29 @@ pub enum Commands {
     /// List detected C++ toolchains.
     Toolchains,
     /// Run tests (M3).
-    Test {},
+    Test {
+        /// Test with the `release` profile.
+        #[arg(long)]
+        release: bool,
+        /// Test only the given package (plus its path deps).
+        #[arg(short = 'p', long, value_name = "PKG")]
+        package: Option<String>,
+        /// Parallel compile jobs (`0` = auto = cores).
+        #[arg(short = 'j', long, default_value_t = 0, value_name = "N")]
+        jobs: usize,
+        /// Keep going after a compile failure (report all errors).
+        #[arg(long)]
+        keep_going: bool,
+        /// Enable features (comma-separated, repeatable).
+        #[arg(long, value_delimiter = ',', value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Enable all features.
+        #[arg(long)]
+        all_features: bool,
+        /// Disable the `default` feature.
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Syntax-check without producing binaries (M3).
     Check {},
     /// Add a dependency (registry in M5, git in M4).
@@ -152,7 +192,23 @@ pub enum Commands {
     /// Build and copy binaries to `~/.rivet/bin` (M5).
     Install,
     /// Emit `compile_commands.json` (M3).
-    CompileCommands,
+    CompileCommands {
+        /// Use the `release` profile flags.
+        #[arg(long)]
+        release: bool,
+        /// Emit only for the given package (plus its path deps).
+        #[arg(short = 'p', long, value_name = "PKG")]
+        package: Option<String>,
+        /// Enable features (comma-separated, repeatable).
+        #[arg(long, value_delimiter = ',', value_name = "FEATURES")]
+        features: Vec<String>,
+        /// Enable all features.
+        #[arg(long)]
+        all_features: bool,
+        /// Disable the `default` feature.
+        #[arg(long)]
+        no_default_features: bool,
+    },
     /// Git dependency management (M4).
     Git {
         #[command(subcommand)]
@@ -208,6 +264,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             bin,
             jobs,
             keep_going,
+            features,
+            all_features,
+            no_default_features,
             target,
             offline,
             locked,
@@ -220,6 +279,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 bin: bin.clone(),
                 jobs: *jobs,
                 keep_going: *keep_going,
+                features: feature_flags(features, *all_features, *no_default_features),
                 target: target.clone(),
                 verbose: cli.verbose,
                 json: ui.json,
@@ -235,6 +295,9 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             bin,
             jobs,
             keep_going,
+            features,
+            all_features,
+            no_default_features,
             args,
         }) => cmd_run(
             &ui,
@@ -244,9 +307,45 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
                 bin: bin.clone(),
                 jobs: *jobs,
                 keep_going: *keep_going,
+                features: feature_flags(features, *all_features, *no_default_features),
                 args: args.clone(),
                 verbose: cli.verbose,
                 json: ui.json,
+            },
+        ),
+        Some(Commands::Test {
+            release,
+            package,
+            jobs,
+            keep_going,
+            features,
+            all_features,
+            no_default_features,
+        }) => cmd_test(
+            &ui,
+            TestFlags {
+                release: *release,
+                package: package.clone(),
+                jobs: *jobs,
+                keep_going: *keep_going,
+                features: feature_flags(features, *all_features, *no_default_features),
+                verbose: cli.verbose,
+                json: ui.json,
+            },
+        ),
+        Some(Commands::CompileCommands {
+            release,
+            package,
+            features,
+            all_features,
+            no_default_features,
+        }) => cmd_compile_commands(
+            &ui,
+            CompileCommandsFlags {
+                release: *release,
+                package: package.clone(),
+                features: feature_flags(features, *all_features, *no_default_features),
+                verbose: cli.verbose,
             },
         ),
         Some(Commands::Clean { package }) => cmd_clean(&ui, package.clone()),
@@ -343,7 +442,6 @@ fn use_color(when: &str) -> bool {
 
 fn unimplemented_message(cmd: &Commands) -> String {
     let (name, milestone) = match cmd {
-        Commands::Test {} => ("test", "M3"),
         Commands::Check {} => ("check", "M3"),
         Commands::Add { .. } => ("add", "M4/M5"),
         Commands::Remove { .. } => ("remove", "M5"),
@@ -356,7 +454,6 @@ fn unimplemented_message(cmd: &Commands) -> String {
         Commands::Login => ("login", "M5"),
         Commands::Search { .. } => ("search", "M5"),
         Commands::Install => ("install", "M5"),
-        Commands::CompileCommands => ("compile-commands", "M3"),
         Commands::Git { .. } => ("git", "M4"),
         Commands::Dev { .. } => ("dev", "M4"),
         _ => ("command", "a later milestone"),
@@ -468,6 +565,20 @@ fn cmd_init(ui: &Ui, name: Option<String>) -> Result<()> {
 // Commands: build / run / clean / toolchains
 // ---------------------------------------------------------------------------
 
+/// Build CLI `--features`/`--all-features`/`--no-default-features` into a
+/// [`rivet_graph::FeatureFlags`].
+fn feature_flags(
+    features: &[String],
+    all_features: bool,
+    no_default_features: bool,
+) -> rivet_graph::FeatureFlags {
+    rivet_graph::FeatureFlags {
+        features: features.to_vec(),
+        all: all_features,
+        no_default: no_default_features,
+    }
+}
+
 /// Flags for [`cmd_build`].
 pub struct BuildFlags {
     /// Use the `release` profile.
@@ -480,6 +591,8 @@ pub struct BuildFlags {
     pub jobs: usize,
     /// Report all compile errors instead of stopping at the first.
     pub keep_going: bool,
+    /// Feature selection.
+    pub features: rivet_graph::FeatureFlags,
     /// `--target` triple (cross-compile, M7).
     pub target: Option<String>,
     /// Verbose logging.
@@ -506,12 +619,44 @@ pub struct RunFlags {
     pub jobs: usize,
     /// Report all compile errors instead of stopping at the first.
     pub keep_going: bool,
+    /// Feature selection.
+    pub features: rivet_graph::FeatureFlags,
     /// Arguments forwarded to the binary.
     pub args: Vec<OsString>,
     /// Verbose logging.
     pub verbose: bool,
     /// JSON message format.
     pub json: bool,
+}
+
+/// Flags for [`cmd_test`].
+pub struct TestFlags {
+    /// Use the `release` profile.
+    pub release: bool,
+    /// `-p` package selector (plus its path deps).
+    pub package: Option<String>,
+    /// Parallel compile jobs (`0` = auto).
+    pub jobs: usize,
+    /// Report all compile errors instead of stopping at the first.
+    pub keep_going: bool,
+    /// Feature selection.
+    pub features: rivet_graph::FeatureFlags,
+    /// Verbose logging.
+    pub verbose: bool,
+    /// JSON message format.
+    pub json: bool,
+}
+
+/// Flags for [`cmd_compile_commands`].
+pub struct CompileCommandsFlags {
+    /// Use the `release` profile flags.
+    pub release: bool,
+    /// `-p` package selector (plus its path deps).
+    pub package: Option<String>,
+    /// Feature selection.
+    pub features: rivet_graph::FeatureFlags,
+    /// Verbose logging.
+    pub verbose: bool,
 }
 
 /// One built unit: its resolution, plan, and (if it was stale) summary.
@@ -611,25 +756,19 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     }
     let root = load_scope()?;
     let profile = if flags.release { "release" } else { "dev" };
-    let mut units = rivet_graph::workspace::resolve_units(&root, profile, flags.package.as_deref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut units = rivet_graph::workspace::resolve_units_with_features(
+        &root,
+        profile,
+        flags.package.as_deref(),
+        &flags.features,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     if let Some(bin) = &flags.bin {
         units = restrict_to_bin(units, bin)?;
     }
 
     let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
-    if flags.verbose {
-        ui.verbose(&format!(
-            "toolchain: {} {} ({})",
-            detection.kind,
-            detection.cxx.display(),
-            detection.version
-        ));
-        ui.verbose(&format!("found via: {}", detection.found_via));
-        if let Some(ar) = &detection.ar {
-            ui.verbose(&format!("archiver: {}", ar.display()));
-        }
-    }
+    log_toolchain(ui, &detection);
     let build_opts = rivet_graph::BuildOptions {
         verbose: flags.verbose,
         jobs: flags.jobs,
@@ -638,31 +777,7 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     let started = std::time::Instant::now();
     let mut built = Vec::new();
     for unit in &units {
-        let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
-        let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
-        let plan = rivet_graph::plan_with(&unit.manifest, profile, &detection)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let inputs = rivet_graph::workspace::unit_inputs(unit, &units, profile, &detection)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if rivet_graph::is_fresh_unit(&unit.manifest, &plan, &detection, &inputs)
-            .map_err(|e| anyhow::anyhow!("{e}"))?
-        {
-            ui.status("Fresh", &format!("{name} v{version}"));
-        } else {
-            ui.status("Compiling", &format!("{name} v{version} ({profile})"));
-            let summary =
-                rivet_graph::build_unit(&unit.manifest, &plan, &detection, &inputs, &build_opts)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-            for line in &summary.log {
-                eprintln!("       {line}");
-            }
-            for (tag, rel) in &summary.recompiled {
-                ui.verbose(&format!("recompiled {tag}/{rel}"));
-            }
-            for out in &summary.relinked {
-                ui.verbose(&format!("linked {}", out.display()));
-            }
-        }
+        let plan = build_single_unit(ui, unit, &units, profile, &detection, &build_opts)?;
         built.push(BuiltUnit {
             unit: unit.clone(),
             plan,
@@ -671,6 +786,207 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
     let secs = started.elapsed().as_secs_f64();
     ui.status("Finished", &format!("{profile} profile in {secs:.2}s"));
     Ok(built)
+}
+
+/// Build one unit (normal lib+bins plan), printing `Fresh` or `Compiling`
+/// plus `-v` detail. Returns the plan for callers that extend it (tests).
+fn build_single_unit(
+    ui: &Ui,
+    unit: &rivet_graph::workspace::Unit,
+    units: &[rivet_graph::workspace::Unit],
+    profile: &str,
+    detection: &rivet_toolchain::CxxToolchain,
+    build_opts: &rivet_graph::BuildOptions,
+) -> Result<rivet_graph::PackagePlan> {
+    let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
+    let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
+    let plan = rivet_graph::plan_with(&unit.manifest, profile, detection)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let inputs = rivet_graph::workspace::unit_inputs(unit, units, profile, detection)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if rivet_graph::is_fresh_unit(&unit.manifest, &plan, detection, &inputs, &unit.features)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        ui.status("Fresh", &format!("{name} v{version}"));
+    } else {
+        ui.status("Compiling", &format!("{name} v{version} ({profile})"));
+        let summary = rivet_graph::build_unit(
+            &unit.manifest,
+            &plan,
+            detection,
+            &inputs,
+            build_opts,
+            &unit.features,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        report_build_summary(ui, &summary);
+    }
+    Ok(plan)
+}
+
+/// Replay a build summary's `-v` log and recompiled/relinked notes.
+fn report_build_summary(ui: &Ui, summary: &rivet_graph::UnitSummary) {
+    for line in &summary.log {
+        eprintln!("       {line}");
+    }
+    for (tag, rel) in &summary.recompiled {
+        ui.verbose(&format!("recompiled {tag}/{rel}"));
+    }
+    for out in &summary.relinked {
+        ui.verbose(&format!("linked {}", out.display()));
+    }
+}
+
+/// Log the detected toolchain at `-v`.
+fn log_toolchain(ui: &Ui, detection: &rivet_toolchain::CxxToolchain) {
+    ui.verbose(&format!(
+        "toolchain: {} {} ({})",
+        detection.kind,
+        detection.cxx.display(),
+        detection.version
+    ));
+    ui.verbose(&format!("found via: {}", detection.found_via));
+    if let Some(ar) = &detection.ar {
+        ui.verbose(&format!("archiver: {}", ar.display()));
+    }
+}
+
+fn cmd_test(ui: &Ui, flags: TestFlags) -> Result<()> {
+    let root = load_scope()?;
+    let profile = if flags.release { "release" } else { "dev" };
+    let units = rivet_graph::workspace::resolve_units_with_features(
+        &root,
+        profile,
+        flags.package.as_deref(),
+        &flags.features,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    log_toolchain(ui, &detection);
+    let build_opts = rivet_graph::BuildOptions {
+        verbose: flags.verbose,
+        jobs: flags.jobs,
+        fail_fast: !flags.keep_going,
+    };
+    let started = std::time::Instant::now();
+    let mut passed: usize = 0;
+    let mut failed: usize = 0;
+    let mut failures: Vec<String> = Vec::new();
+    for unit in &units {
+        let name = rivet_manifest::package_name(&unit.manifest).unwrap_or("<unknown>");
+        let version = rivet_manifest::package_version(&unit.manifest).unwrap_or("0.0.0");
+        // 1. Normal build: lib + bins first.
+        let plan = build_single_unit(ui, unit, &units, profile, &detection, &build_opts)?;
+        // 2. Then tests (synthesized targets through the same incremental
+        //    state), then run each binary sequentially.
+        let inputs = rivet_graph::workspace::unit_inputs(unit, &units, profile, &detection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let (tests, summary) = rivet_graph::test::build_tests(
+            &unit.manifest,
+            &plan,
+            &detection,
+            &inputs,
+            &build_opts,
+            &unit.features,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if !tests.is_empty() {
+            let did_work = summary
+                .recompiled
+                .iter()
+                .any(|(tag, _)| tag.starts_with("test-"));
+            if did_work {
+                ui.status("Compiling", &format!("{name} v{version} (tests)"));
+            } else {
+                ui.status("Fresh", &format!("{name} v{version} (tests)"));
+            }
+            report_build_summary(ui, &summary);
+            for target in &tests {
+                let run =
+                    rivet_graph::test::run_test_binary(&target.output, &target.name, &unit.dir)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if run.passed {
+                    ui.status("test", &format!("{} ... ok", run.name));
+                    passed += 1;
+                } else {
+                    ui.status("test", &format!("{} ... FAILED", run.name));
+                    let out = String::from_utf8_lossy(&run.stdout);
+                    let err = String::from_utf8_lossy(&run.stderr);
+                    if !out.is_empty() {
+                        println!("{out}");
+                    }
+                    if !err.is_empty() {
+                        eprintln!("{err}");
+                    }
+                    failed += 1;
+                    failures.push(run.name);
+                }
+            }
+        }
+    }
+    let secs = started.elapsed().as_secs_f64();
+    ui.status("Finished", &format!("{profile} profile in {secs:.2}s"));
+    println!("test result: ok. {passed} passed; {failed} failed");
+    if failed > 0 {
+        failures.sort();
+        bail!(
+            "tests failed: {} ({} passed, {} failed)",
+            failures.join(", "),
+            passed,
+            failed
+        );
+    }
+    Ok(())
+}
+
+fn cmd_compile_commands(ui: &Ui, flags: CompileCommandsFlags) -> Result<()> {
+    let root = load_scope()?;
+    let scope_dir = root.dir.clone();
+    let profile = if flags.release { "release" } else { "dev" };
+    let units = rivet_graph::workspace::resolve_units_with_features(
+        &root,
+        profile,
+        flags.package.as_deref(),
+        &flags.features,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Flag mapping needs a toolchain, but nothing is compiled.
+    let detection = rivet_toolchain::detect().map_err(|e| anyhow::anyhow!("{e}"))?;
+    log_toolchain(ui, &detection);
+    let mut merged: Vec<rivet_graph::compile_commands::CompileEntry> = Vec::new();
+    for unit in &units {
+        let plan = rivet_graph::plan_with(&unit.manifest, profile, &detection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let inputs = rivet_graph::workspace::unit_inputs(unit, &units, profile, &detection)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut entries = rivet_graph::compile_commands::compile_commands_for(
+            &unit.manifest,
+            &plan,
+            &detection,
+            &inputs,
+            &unit.features,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        entries.sort_by(|a, b| a.file.cmp(&b.file));
+        let path = plan.target_dir.join("compile_commands.json");
+        rivet_graph::compile_commands::write_compile_commands(&path, &entries)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        ui.status("Generated", &format!("{}", path.display()));
+        merged.extend(entries);
+    }
+    if units.len() > 1 {
+        merged.sort_by(|a, b| a.file.cmp(&b.file));
+        let path = scope_dir
+            .join("target")
+            .join(rivet_graph::profile_dir(profile))
+            .join("compile_commands.json");
+        rivet_graph::compile_commands::write_compile_commands(&path, &merged)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        ui.status("Generated", &format!("{}", path.display()));
+    }
+    Ok(())
 }
 
 fn cmd_run(ui: &Ui, flags: RunFlags) -> Result<()> {
@@ -682,6 +998,7 @@ fn cmd_run(ui: &Ui, flags: RunFlags) -> Result<()> {
             bin: flags.bin.clone(),
             jobs: flags.jobs,
             keep_going: flags.keep_going,
+            features: flags.features.clone(),
             target: None,
             verbose: flags.verbose,
             json: flags.json,
@@ -838,7 +1155,7 @@ mod tests {
 
     #[test]
     fn unimplemented_commands_point_at_milestones() {
-        let msg = unimplemented_message(&Commands::Test {});
+        let msg = unimplemented_message(&Commands::Check {});
         assert!(msg.contains("M3"), "got: {msg}");
         let msg = unimplemented_message(&Commands::Git {
             command: GitCommands::List,

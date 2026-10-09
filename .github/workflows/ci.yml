@@ -42,6 +42,7 @@ jobs:
       - name: M2 acceptance (lib+bin corpus)
         run: |
           ../../target/debug/rivet build
+          ../../target/debug/rivet test
           ../../target/debug/rivet run
         working-directory: examples/libhello
       - name: M2 acceptance (workspace corpus)
@@ -49,3 +50,12 @@ jobs:
           ../../target/debug/rivet build
           ../../target/debug/rivet run -p hello
         working-directory: examples/workspace
+      - name: M3 acceptance (features corpus)
+        run: |
+          ../../../target/debug/rivet build
+          ../../../target/debug/rivet build --features extra
+          ../../../target/debug/rivet build --all-features
+          ../../../target/debug/rivet build --no-default-features
+          ../../../target/debug/rivet run
+          ../../../target/debug/rivet compile-commands
+        working-directory: examples/features/app

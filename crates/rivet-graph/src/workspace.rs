@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use rivet_manifest::{self as m, Manifest};
 use rivet_toolchain::CxxToolchain;
 
+use super::features::{activated_features_lenient, active_optional_deps, FeatureFlags};
 use super::Error;
 
 /// One buildable package: its manifest plus canonical dir and direct path
@@ -27,6 +28,8 @@ pub struct Unit {
     pub deps: Vec<PathBuf>,
     /// `true` when reached from a workspace (member or root package).
     pub from_workspace: bool,
+    /// Activated features for this package (sorted; contract C1).
+    pub features: BTreeSet<String>,
 }
 
 /// External build inputs for one unit: transitive path-dependency archives
@@ -47,10 +50,28 @@ pub struct UnitInputs {
 /// - `only` (`-p`) narrows seeds to one package by name.
 /// - The transitive `path`-dependency closure is always pulled in and the
 ///   result is topologically sorted (dependencies first).
+///
+/// No features are enabled beyond each manifest's `default` (see
+/// [`resolve_units_with_features`] for flag-driven activation).
 pub fn resolve_units(
     root: &Manifest,
     profile: &str,
     only: Option<&str>,
+) -> Result<Vec<Unit>, Error> {
+    resolve_units_with_features(root, profile, only, &FeatureFlags::default())
+}
+
+/// Resolve the build scope with feature selection.
+///
+/// Optional `path` dependencies that no enabled feature activates are
+/// filtered out (they never enter the build). Non-path dependencies still
+/// fail with milestone pointers (registry → M5, git → M4) even when
+/// optional and inactive — the M4 CLI integration wires those flags.
+pub fn resolve_units_with_features(
+    root: &Manifest,
+    profile: &str,
+    only: Option<&str>,
+    flags: &FeatureFlags,
 ) -> Result<Vec<Unit>, Error> {
     super::check_profile(profile)?;
     // 1. Seeds.
@@ -104,8 +125,12 @@ pub fn resolve_units(
     }
     // 2. BFS over path deps (canonical dirs dedupe diamonds). Seeds are
     // inserted without the workspace check (a root package may itself
-    // carry `workspace`); path deps must be plain packages.
+    // carry `workspace`); path deps must be plain packages. Activation is
+    // lenient per package (requests apply where defined — union semantics);
+    // `known` collects every reached table so requests unknown to the whole
+    // scope still error below.
     let mut units: BTreeMap<PathBuf, Unit> = BTreeMap::new();
+    let mut known: BTreeSet<String> = BTreeSet::new();
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
     for seed in seeds {
         let dir = canonical(&seed.dir)?;
@@ -114,7 +139,10 @@ pub fn resolve_units(
         }
         let mut man = seed;
         man.dir = dir.clone();
-        let mut dep_dirs = direct_dep_dirs(&man)?;
+        let features = activated_features_lenient(&man, flags)?;
+        known.extend(man.features.keys().cloned());
+        let active = active_optional_deps(&man, &features);
+        let mut dep_dirs = direct_dep_dirs(&man, &active)?;
         dep_dirs.sort();
         dep_dirs.dedup();
         queue.extend(dep_dirs.clone());
@@ -125,6 +153,7 @@ pub fn resolve_units(
                 dir,
                 deps: dep_dirs,
                 from_workspace,
+                features,
             },
         );
     }
@@ -139,7 +168,10 @@ pub fn resolve_units(
                 path: dep_dir.display().to_string(),
             });
         }
-        let mut dep_dirs = direct_dep_dirs(&dep_man)?;
+        let features = activated_features_lenient(&dep_man, flags)?;
+        known.extend(dep_man.features.keys().cloned());
+        let active = active_optional_deps(&dep_man, &features);
+        let mut dep_dirs = direct_dep_dirs(&dep_man, &active)?;
         dep_dirs.sort();
         dep_dirs.dedup();
         queue.extend(dep_dirs.clone());
@@ -150,8 +182,24 @@ pub fn resolve_units(
                 dir: dep_dir,
                 deps: dep_dirs,
                 from_workspace: false,
+                features,
             },
         );
+    }
+    // Requests unknown to every reached package are typos, not union members.
+    for name in &flags.features {
+        if !known.contains(name) {
+            let mut available: Vec<String> = known.iter().cloned().collect();
+            available.sort();
+            return Err(Error::UnknownFeature {
+                name: name.clone(),
+                available: if available.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    available.join(", ")
+                },
+            });
+        }
     }
     // 3. Topological order (dependencies first); report cycles.
     topo_sort(units)
@@ -159,10 +207,19 @@ pub fn resolve_units(
 
 /// Direct path-dependency dirs of `man` (canonical), validating that every
 /// dep exists with a manifest and that non-path deps fail with milestone
-/// pointers (registry → M5, git → M4).
-fn direct_dep_dirs(man: &Manifest) -> Result<Vec<PathBuf>, Error> {
+/// pointers (registry → M5, git → M4). Optional path deps outside `active`
+/// are skipped (not part of the build); optional non-path deps still hit
+/// the milestone errors (M4 wires those flags).
+fn direct_dep_dirs(man: &Manifest, active: &BTreeSet<String>) -> Result<Vec<PathBuf>, Error> {
     let mut dep_dirs = Vec::new();
     for (dep_name, dep_dir) in m::path_dependencies(man) {
+        let optional = man
+            .dependencies
+            .get(&dep_name)
+            .is_some_and(|d| d.is_optional());
+        if optional && !active.contains(&dep_name) {
+            continue;
+        }
         let c = canonical(&dep_dir).map_err(|_| Error::DependencyDir {
             name: dep_name.clone(),
             path: dep_dir.display().to_string(),
@@ -474,5 +531,80 @@ mod tests {
         let root = load_dir(dir.path());
         let err = resolve_units(&root, "dev", None).unwrap_err().to_string();
         assert!(err.contains("gone"), "got: {err}");
+    }
+
+    fn names(units: &[Unit]) -> Vec<String> {
+        units
+            .iter()
+            .map(|u| m::package_name(&u.manifest).unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn optional_path_dep_filtered_unless_activated() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pkg(
+            &dir.path().join("app"),
+            "{\"package\":{\"name\":\"app\",\"version\":\"0.1.0\"},\"dependencies\":{\"opt\":{\"path\":\"../opt\",\"optional\":true}},\"features\":{\"default\":[],\"with-opt\":[\"dep:opt\"]}}",
+        );
+        write_pkg(
+            &dir.path().join("opt"),
+            "{\"package\":{\"name\":\"opt\",\"version\":\"0.1.0\"}}",
+        );
+        let root = load_dir(&dir.path().join("app"));
+
+        // Default: optional dep excluded.
+        let units = resolve_units(&root, "dev", None).unwrap();
+        assert_eq!(names(&units), vec!["app".to_string()]);
+        assert!(units[0].features.contains("default"));
+
+        // Activated: optional dep pulled in.
+        let units = resolve_units_with_features(
+            &root,
+            "dev",
+            None,
+            &FeatureFlags {
+                features: vec!["with-opt".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(names(&units), vec!["opt".to_string(), "app".to_string()]);
+        assert!(units[1].features.contains("with-opt"));
+
+        // --no-default-features alone still excludes it.
+        let units = resolve_units_with_features(
+            &root,
+            "dev",
+            None,
+            &FeatureFlags {
+                no_default: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(names(&units), vec!["app".to_string()]);
+    }
+
+    #[test]
+    fn unknown_feature_fails_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        write_pkg(
+            &dir.path().join("app"),
+            "{\"package\":{\"name\":\"app\",\"version\":\"0.1.0\"},\"features\":{\"default\":[]}}",
+        );
+        let root = load_dir(&dir.path().join("app"));
+        let err = resolve_units_with_features(
+            &root,
+            "dev",
+            None,
+            &FeatureFlags {
+                features: vec!["ghost".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown feature"), "got: {err}");
     }
 }

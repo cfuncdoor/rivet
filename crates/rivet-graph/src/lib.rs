@@ -23,9 +23,12 @@
 //! Compiler diagnostics are captured per task and replayed byte-for-byte on
 //! failure, so errors still pass through unmodified without interleaving.
 
+pub mod compile_commands;
 pub mod depfile;
+pub mod features;
 pub mod schedule;
 pub mod state;
+pub mod test;
 pub mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,6 +39,11 @@ use rivet_manifest as m;
 use rivet_manifest::Manifest;
 use rivet_toolchain::{CompileOptions, CxxToolchain, DepStyle};
 use thiserror::Error;
+
+pub use features::{
+    activated_features, activated_features_lenient, active_optional_deps, FeatureFlags,
+};
+pub use test::{discover_tests, DiscoveredTest};
 
 use workspace::UnitInputs;
 
@@ -126,6 +134,36 @@ pub enum Error {
     #[error("shared library `{name}` is not supported yet (planned for M7: needs an export/SONAME story). Fix: use `\"type\": \"static\"` or `\"header-only\"` for now")]
     SharedLib {
         /// Library name.
+        name: String,
+    },
+    /// `--features` named a feature the manifest does not define.
+    #[error("unknown feature `{name}`. Available: {available}. Fix: use `--features` with one of these or add it to the `features` table in rivet.json")]
+    UnknownFeature {
+        /// Requested name.
+        name: String,
+        /// Available names, comma-joined.
+        available: String,
+    },
+    /// A `dep:<name>` feature entry names a dependency that does not exist.
+    #[error("feature `{feature}` enables `dep:{name}`, but no such dependency exists. Fix: add `\"{name}\": {{ \"path\": \"...\", \"optional\": true }}` to `dependencies` in rivet.json")]
+    UnknownFeatureDep {
+        /// Feature carrying the entry.
+        feature: String,
+        /// Missing dependency name.
+        name: String,
+    },
+    /// A `dep:<name>` feature entry names a dependency that is not optional.
+    #[error("feature `{feature}` enables `dep:{name}`, but `{name}` is not optional. Fix: mark it `\"optional\": true` in `dependencies` in rivet.json")]
+    NonOptionalFeatureDep {
+        /// Feature carrying the entry.
+        feature: String,
+        /// Non-optional dependency name.
+        name: String,
+    },
+    /// Two `tests/` files share a binary stem.
+    #[error("duplicate test name `{name}`: two files in tests/ share the stem `{name}`. Fix: rename one of them")]
+    DuplicateTestName {
+        /// Colliding stem.
         name: String,
     },
     /// IO failure.
@@ -413,10 +451,13 @@ pub fn plan_with(
 
 /// Compile options for a package: own `include/` first, then dependency
 /// include dirs (deduped, order-preserving — `-I` order is semantics).
+/// Profile `opt`/`debug`/`lto`/`sanitizers` come from the manifest profile;
+/// `features` (sorted, enabled) joins the fingerprint.
 pub fn compile_options(
     manifest: &Manifest,
     profile: &str,
     extra_includes: &[PathBuf],
+    features: &BTreeSet<String>,
 ) -> CompileOptions {
     let prof = if profile == "release" {
         &manifest.profile.release
@@ -439,6 +480,9 @@ pub fn compile_options(
         debug: prof.debug,
         defines: Vec::new(),
         include_dirs,
+        lto: prof.lto,
+        sanitizers: prof.sanitizers.clone(),
+        features: features.iter().cloned().collect(),
     }
 }
 
@@ -484,14 +528,20 @@ pub struct UnitSummary {
     pub fresh: bool,
 }
 
-/// Fingerprint for a package build (toolchain + resolved flags).
+/// Fingerprint for a package build (toolchain + resolved flags + features).
 fn fingerprint_for(
     manifest: &Manifest,
     profile: &str,
     inputs: &UnitInputs,
     toolchain: &CxxToolchain,
+    features: &BTreeSet<String>,
 ) -> String {
-    toolchain.fingerprint(&compile_options(manifest, profile, &inputs.include_dirs))
+    toolchain.fingerprint(&compile_options(
+        manifest,
+        profile,
+        &inputs.include_dirs,
+        features,
+    ))
 }
 
 /// One stale translation unit awaiting compilation.
@@ -674,29 +724,41 @@ fn remove_quiet(path: &Path) {
 }
 
 /// Probe freshness without building anything (no dirs created, no state
-/// saved). Used by the CLI to print `Fresh` vs `Compiling`.
+/// saved). Used by the CLI to print `Fresh` vs `Compiling`. `features` is
+/// the package's activated set (joins the fingerprint); sanitizer options
+/// are validated so misconfiguration fails fast even on a fresh tree.
 pub fn is_fresh_unit(
     manifest: &Manifest,
     plan: &PackagePlan,
     toolchain: &CxxToolchain,
     inputs: &UnitInputs,
+    features: &BTreeSet<String>,
 ) -> Result<bool, Error> {
-    let fingerprint = fingerprint_for(manifest, &plan.profile, inputs, toolchain);
+    let fingerprint = fingerprint_for(manifest, &plan.profile, inputs, toolchain, features);
+    toolchain.validate_options(&compile_options(
+        manifest,
+        &plan.profile,
+        &inputs.include_dirs,
+        features,
+    ))?;
     let (_st, assessment) = assess(plan, inputs, &fingerprint)?;
     Ok(assessment.stale_tus.is_empty() && assessment.stale_links.is_empty())
 }
 
 /// Build one package: compile stale TUs in parallel, archive, link, record
-/// state. Returns what was rebuilt.
+/// state. Returns what was rebuilt. `features` is the package's activated
+/// set (fingerprint input).
 pub fn build_unit(
     manifest: &Manifest,
     plan: &PackagePlan,
     toolchain: &CxxToolchain,
     inputs: &UnitInputs,
     opts: &BuildOptions,
+    features: &BTreeSet<String>,
 ) -> Result<UnitSummary, Error> {
-    let fingerprint = fingerprint_for(manifest, &plan.profile, inputs, toolchain);
-    let compile_opts = compile_options(manifest, &plan.profile, &inputs.include_dirs);
+    let fingerprint = fingerprint_for(manifest, &plan.profile, inputs, toolchain, features);
+    let compile_opts = compile_options(manifest, &plan.profile, &inputs.include_dirs, features);
+    toolchain.validate_options(&compile_opts)?;
     let package = m::package_name(manifest).unwrap_or("<unknown>").to_string();
 
     for sub in ["deps", "build", "incremental"] {
@@ -709,6 +771,10 @@ pub fn build_unit(
     for t in &targets {
         std::fs::create_dir_all(&t.objects_dir)?;
         std::fs::create_dir_all(&t.depfiles_dir)?;
+        // Outputs may live in subdirs of the target dir (`tests/`).
+        if let Some(parent) = t.output.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
 
     let (mut st, assessment) = assess(plan, inputs, &fingerprint)?;

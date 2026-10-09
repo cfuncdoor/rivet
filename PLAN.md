@@ -25,20 +25,20 @@ M2 acceptance passed (see below). Do not start M4+ until M3 acceptance passes.
 - [x] Gate green + `examples/{hello,libhello,workspace}` corpus builds in CI
 
 ## M3 — Profiles, features, tests [IN PROGRESS — owner: M3 agent]
-- [ ] `rivet test`: discovers `tests/*.cpp` (stem-named binaries), links vs the
+- [x] `rivet test`: discovers `tests/*.cpp` (stem-named binaries), links vs the
       package lib + dep archives, runs each, reports `test <name> ... ok|FAILED`
       + `test result:` summary, nonzero exit on failure; `-p` selects
-- [ ] Profiles: `opt`/`debug`/`lto`/`sanitizers` honored in flags + fingerprint
-      (MSVC `/O2`+`/GL`+`/LTCG`, `/Zi`, `/fsanitize:address`; GNU `-O/-g/-flto`,
+- [x] Profiles: `opt`/`debug`/`lto`/`sanitizers` honored in flags + fingerprint
+      (MSVC `/O2`+`/GL`+`/LTCG`, `/Zi`, `/fsanitize=address`; GNU `-O/-g/-flto`,
       `-fsanitize=`); ASan run-tested where the local toolchain supports it
-- [ ] Features: `Dependency.optional` + `dep:<name>` activation,
+- [x] Features: `Dependency.optional` + `dep:<name>` activation,
       `--features`/`--all-features`/`--no-default-features`, unknown-feature
       errors, fingerprint inclusion; unification = union of requested features
       per package (see contract below)
-- [ ] `rivet compile-commands`: emits `target/<prof>/compile_commands.json`
+- [x] `rivet compile-commands`: emits `target/<prof>/compile_commands.json`
       (`directory` + `arguments` array + `file` per TU, all targets)
-- [ ] `examples/` corpus gains tests + a features demo; CI builds them
-- [ ] Unit + integration tests (real compiler, temp dirs); docs updated
+- [x] `examples/` corpus gains tests + a features demo; CI builds them
+- [x] Unit + integration tests (real compiler, temp dirs); docs updated
 
 ## M3/M4 shared contracts (frozen — both agents conform, neither changes them)
 

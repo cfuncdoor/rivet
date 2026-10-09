@@ -48,6 +48,83 @@ simpler option that preserves Cargo's mental model, then continue.
   `dev` → directory `debug`. Cargo compatibility wins over the literal
   reading; `Finished dev profile in …` still prints the profile name.
 
+## M3
+
+- **D23: Profile flags — MSVC `/GL`+`/LTCG`, `/fsanitize=address`;
+  GNU/Clang `-flto`, `-fsanitize=<csv>; all in the fingerprint.**
+  `CompileOptions` gains `lto: bool`, `sanitizers: Vec<String>`,
+  `features: Vec<String>` (sorted, fingerprint-only). Compile side rides in
+  `push_common_args`; link side in `link_exe_command` (MSVC `/LTCG` goes
+  after `/link`, `/fsanitize=` stays a cl-level flag). `clang-cl` follows
+  the MSVC mapping (it is `is_msvc_like`). MSVC supports only `address` —
+  anything else fails in `validate_options` with an actionable error;
+  GNU/Clang names pass through (the compiler reports unknowns). Command
+  builders stay infallible, so `build_unit`/`is_fresh_unit` (and
+  `compile_commands_for`) call `validate_options` first — misconfiguration
+  fails fast even on a fresh tree. Fingerprint format (opaque to M4, stable
+  within a toolchain):
+  `<kind>|<version>|std=…|opt=…|debug=…|defines=…|includes=…|lto=…|sanitizers=…|features=…`.
+  (PLAN.md M3 wrote `/fsanitize:address` with a colon; the real MSVC flag
+  uses `=`, which is what we emit.)
+- **D24: Features — union semantics with lenient per-package activation.**
+  `activated_features` (strict) errors on unknown requests and on `dep:`
+  entries naming missing/non-optional deps — but only entries of *enabled*
+  features are validated, so a disabled feature never breaks the build.
+  Command-line requests span packages with different tables, so
+  `workspace::resolve_units_with_features` uses `activated_features_lenient`
+  (requests filtered to each package's table = union of requested features
+  per package) plus a scope-wide check: a request unknown to *every*
+  reached package is still a typo error (Cargo's "none of the selected
+  packages contains these features" spirit). Same-package feature refs
+  enable transitively; `other/feat` cross-package entries are ignored here
+  and left for the M4 resolver. Optional *path* deps outside the active set
+  are filtered out of the build; optional git/registry deps still hit the
+  M4/M5 milestone errors (M4 wires those flags). `--features` is
+  comma-splitting + repeatable (clap `value_delimiter`). Enabled features
+  join the fingerprint, so toggling a feature rebuilds dependents.
+- **D25: `rivet test` — synthesized `test-<stem>` targets in the shared
+  state, sequential runs.**
+  Discovery (`rivet-graph::test`) scans top-level `tests/*.cpp` only
+  (`is_cpp_source`, sorted by stem; duplicate stems are an error; missing
+  `tests/` = no tests). Each file becomes a `TargetBuild` (tag
+  `test-<stem>`, objects `build/test-<stem>`, output
+  `target/<prof>/tests/<stem>[.exe]`) appended to the normal plan and
+  driven through `build_unit` — one state file, lib archived before test
+  links, normal bins link first. `devDependencies` stay unwired (M4).
+  The CLI builds lib+bins, then tests, then runs each binary sequentially
+  (cwd = package dir, output captured): `test <stem> ... ok|FAILED`
+  (+ output on failure), `test result: ok. N passed; M failed`, nonzero
+  exit on any failure. Supports `-p/--release/-j/--keep-going` + feature
+  flags; all tests run even after a failure (failures aggregate).
+- **D26: `compile_commands.json` — `compile_only_args` per TU, per-unit
+  files + workspace merge.**
+  Entries `{directory, arguments[], file}` with `arguments` = driver + full
+  compile flags + source (dep-tracking flags excluded — IDEs don't need
+  them; paths via `to_string_lossy`). Covers bins + lib + tests. One file
+  per unit at `target/<prof>/compile_commands.json`; multi-unit scopes
+  additionally get a merged, file-sorted copy at the scope root's
+  `target/<prof>/`. Needs a toolchain for flag mapping but compiles
+  nothing.
+- **D27: MSVC ASan builds and links, but running needs the runtime DLL on
+  PATH — so no sanitizer example.**
+  Verified empirically: `sanitizers:["address"]` compiles (`/fsanitize=address`)
+  and links on MSVC 14.51, but the exe exits `0xC0000135`
+  (`STATUS_DLL_NOT_FOUND`) unless the `clang_rt.asan_dynamic-x86_64.dll`
+  directory (next to `cl.exe`) is on `PATH`; with it on `PATH` the binary
+  runs clean (exit 0). That is stock MSVC ASan behavior (environment setup
+  like `vcvars`, not something `rivet run` should paper over in M3), so per
+  the M3 brief there is no `examples/*san*`: sanitizer coverage is
+  flag-string unit tests + an MSVC rejection test + a Linux-gated
+  build-and-run integration test (GCC ASan needs no PATH games).
+- **D28: Examples + CI.**
+  `examples/libhello` gains `tests/{greeting,answer}.cpp` (plain
+  return-code tests, no framework); new `examples/features/{app,extra}`
+  demo (optional path dep, `default: []`, `extra: ["dep:extra"]`) where
+  `extra/target/` existing after a build proves activation. CI builds the
+  libhello suite (`build`+`test`+`run`) and exercises the features matrix
+  (`build`, `--features extra`, `--all-features`, `--no-default-features`,
+  `run`, `compile-commands`).
+
 ## M2
 
 - **D13: `sha2` for content hashing.**

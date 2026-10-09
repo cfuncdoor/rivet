@@ -1,0 +1,41 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        cxx: [msvc, gcc, clang]
+        exclude:
+          - os: ubuntu-latest
+            cxx: msvc
+          - os: windows-latest
+            cxx: gcc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install C++ toolchain (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang
+      - name: Rust fmt check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: M1 acceptance (hello corpus)
+        run: |
+          cargo build --locked
+          ./target/debug/rivet build
+          ./target/debug/rivet run
+        working-directory: examples/hello

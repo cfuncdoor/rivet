@@ -1,0 +1,10 @@
+[package]
+name = "rivet-registry"
+version = "0.1.0"
+edition = "2021"
+description = "Registry index/fetch/publish (M5; stub in M1)"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[dependencies]
+thiserror = "2.0"

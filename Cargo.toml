@@ -1,0 +1,34 @@
+[package]
+name = "rivet"
+version = "0.1.0"
+edition = "2021"
+description = "Cargo-like build system and package manager for C++"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[[bin]]
+name = "rivet"
+path = "src/main.rs"
+
+[dependencies]
+rivet-cli = { path = "crates/rivet-cli" }
+anyhow = "1.0"
+
+[workspace]
+members = [
+  "crates/rivet-manifest",
+  "crates/rivet-resolver",
+  "crates/rivet-git",
+  "crates/rivet-toolchain",
+  "crates/rivet-graph",
+  "crates/rivet-cache",
+  "crates/rivet-registry",
+  "crates/rivet-cli",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

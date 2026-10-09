@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://rivet.dev/schema/rivet.json",
+  "title": "rivet.json manifest",
+  "description": "Cargo-like manifest for C++ packages (rivet M1).",
+  "type": "object",
+  "required": ["package"],
+  "properties": {
+    "$schema": { "type": "string" },
+    "package": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "description": "Package name."
+        },
+        "version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$",
+          "description": "SemVer 2.0 version."
+        },
+        "standard": {
+          "type": "string",
+          "enum": ["c++11", "c++14", "c++17", "c++20", "c++23", "c++26"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "properties": {
+              "version": { "type": "string" },
+              "path": { "type": "string" },
+              "git": { "type": "string" },
+              "tag": { "type": "string" },
+              "branch": { "type": "string" },
+              "rev": { "type": "string" },
+              "subdir": { "type": "string" },
+              "submodules": { "type": "boolean" },
+              "package": {
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "version": { "type": "string" }
+                }
+              },
+              "system": { "type": "boolean" }
+            },
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "devDependencies": { "type": "object" },
+    "buildDependencies": { "type": "object" },
+    "features": {
+      "type": "object",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "target": { "type": "object" },
+    "bin": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "path"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      }
+    },
+    "lib": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["static", "shared", "header-only"] },
+        "name": { "type": "string" },
+        "path": { "type": "string" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "properties": {
+        "dev": { "$ref": "#/definitions/profile" },
+        "release": { "$ref": "#/definitions/profile" }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "properties": {
+        "members": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "patch": { "type": "object" }
+  },
+  "definitions": {
+    "profile": {
+      "type": "object",
+      "properties": {
+        "opt": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "debug": { "type": "boolean" },
+        "lto": { "type": "boolean" },
+        "sanitizers": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

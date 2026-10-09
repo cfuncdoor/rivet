@@ -1,0 +1,916 @@
+//! C++ toolchain detection and flag normalization.
+//!
+//! Detects MSVC (via `vswhere` / well-known VS install paths / `vcvars`
+//! environment capture), `clang-cl`, `clang`, `gcc`, and MinGW. All compiler
+//! invocations use `Path`/`PathBuf` + `OsString`; no global mutable state.
+//!
+//! Detection order: `cl` in `PATH` → `vswhere` → well-known VS paths →
+//! `clang-cl` → `clang++` → `g++`. The first usable toolchain wins; every
+//! candidate tried is recorded so `-v` can log the decision and failures can
+//! say exactly what was tried and how to fix it.
+
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use thiserror::Error;
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+/// Toolchain errors. Always actionable: what was tried + how to fix.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// No usable C++ compiler found.
+    #[error("no C++ toolchain found.\nTried:\n{tried}\nFix: install one of:\n  - Windows: Visual Studio Build Tools (https://visualstudio.microsoft.com/downloads, check \"Desktop development with C++\"), or `winget install LLVM.LLVM`\n  - Linux: `sudo apt install build-essential clang` (or `dnf groupinstall \"Development Tools\"`)")]
+    NoToolchain {
+        /// Human-readable list of candidates tried.
+        tried: String,
+    },
+    /// Compiler invocation failed.
+    #[error("{what}: {message}")]
+    CommandFailed {
+        /// What was attempted.
+        what: String,
+        /// Detail + fix hint.
+        message: String,
+    },
+    /// IO failure.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
+}
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+/// Compiler family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolchainKind {
+    /// Microsoft Visual C++ (`cl.exe`).
+    Msvc,
+    /// LLVM clang in MSVC-compat mode (`clang-cl.exe`).
+    ClangCl,
+    /// LLVM clang (`clang++`).
+    Clang,
+    /// GNU compiler (`g++`).
+    Gcc,
+    /// MinGW-w64 gcc on Windows.
+    Mingw,
+}
+
+impl std::fmt::Display for ToolchainKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Msvc => write!(f, "msvc"),
+            Self::ClangCl => write!(f, "clang-cl"),
+            Self::Clang => write!(f, "clang"),
+            Self::Gcc => write!(f, "gcc"),
+            Self::Mingw => write!(f, "mingw"),
+        }
+    }
+}
+
+/// A detected C++ toolchain.
+#[derive(Debug, Clone)]
+pub struct CxxToolchain {
+    /// Compiler family.
+    pub kind: ToolchainKind,
+    /// Path to the C++ driver (`cl.exe`, `clang++`, `g++`).
+    pub cxx: PathBuf,
+    /// Detected version string (first line of `--version` / `cl` banner).
+    pub version: String,
+    /// MSVC environment overlay captured from `vcvars` (`INCLUDE`, `LIB`,
+    /// `LIBPATH`, `PATH`, SDK vars). `None` for non-MSVC toolchains or when
+    /// the inherited environment already works (dev prompt).
+    pub msvc_env: Option<Vec<(OsString, OsString)>>,
+    /// How this toolchain was found (for `-v` logging).
+    pub found_via: String,
+}
+
+impl CxxToolchain {
+    /// `true` for `cl.exe`-style drivers (MSVC and clang-cl).
+    pub fn is_msvc_like(&self) -> bool {
+        matches!(self.kind, ToolchainKind::Msvc | ToolchainKind::ClangCl)
+    }
+
+    /// Executable suffix for built binaries on this host.
+    pub fn exe_suffix(&self) -> &'static str {
+        if cfg!(windows) {
+            ".exe"
+        } else {
+            ""
+        }
+    }
+
+    /// Content fingerprint: ABI/compiler/std/stdlib inputs that must
+    /// invalidate the build cache (full use in M2/M7; computed from M1).
+    pub fn fingerprint(&self, opts: &CompileOptions) -> String {
+        format!(
+            "{}|{}|std={}|opt={}|debug={}",
+            self.kind,
+            self.version.trim(),
+            opts.std,
+            opts.opt,
+            opts.debug as u8
+        )
+    }
+
+    /// Flags for a compile-only step (`source` → `object`).
+    pub fn compile_only_args(
+        &self,
+        source: &Path,
+        object: &Path,
+        opts: &CompileOptions,
+    ) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        if self.is_msvc_like() {
+            args.push(OsString::from("/nologo"));
+            args.push(OsString::from("/EHsc"));
+            args.push(OsString::from(format!("/std:{}", opts.std)));
+            match opts.opt {
+                0 => args.push(OsString::from("/Od")),
+                1 => args.push(OsString::from("/O1")),
+                _ => args.push(OsString::from("/O2")),
+            }
+            if opts.debug {
+                args.push(OsString::from("/Zi"));
+            }
+            for d in &opts.defines {
+                args.push(OsString::from(format!("/D{d}")));
+            }
+            for inc in &opts.include_dirs {
+                let mut s = OsString::from("/I");
+                s.push(inc);
+                args.push(s);
+            }
+            args.push(OsString::from("/c"));
+            args.push(source.as_os_str().to_os_string());
+            let mut fo = OsString::from("/Fo");
+            fo.push(object);
+            args.push(fo);
+        } else {
+            args.push(OsString::from(format!("-std={}", opts.std)));
+            args.push(OsString::from(format!("-O{}", opts.opt.min(3))));
+            if opts.debug {
+                args.push(OsString::from("-g"));
+            }
+            for d in &opts.defines {
+                args.push(OsString::from(format!("-D{d}")));
+            }
+            for inc in &opts.include_dirs {
+                let mut s = OsString::from("-I");
+                s.push(inc);
+                args.push(s);
+            }
+            args.push(OsString::from("-c"));
+            args.push(source.as_os_str().to_os_string());
+            args.push(OsString::from("-o"));
+            args.push(object.as_os_str().to_os_string());
+        }
+        args
+    }
+
+    /// Build a `Command` that compiles + links `sources` into `output`.
+    /// (M1 single-step; M2 splits per-TU compile + link with depfiles.)
+    pub fn build_exe_command(
+        &self,
+        sources: &[PathBuf],
+        output: &Path,
+        opts: &CompileOptions,
+    ) -> Command {
+        let mut cmd = Command::new(&self.cxx);
+        if self.is_msvc_like() {
+            cmd.arg("/nologo");
+            cmd.arg("/EHsc");
+            cmd.arg(format!("/std:{}", opts.std));
+            match opts.opt {
+                0 => {
+                    cmd.arg("/Od");
+                }
+                1 => {
+                    cmd.arg("/O1");
+                }
+                _ => {
+                    cmd.arg("/O2");
+                }
+            }
+            if opts.debug {
+                cmd.arg("/Zi");
+            }
+            for d in &opts.defines {
+                cmd.arg(format!("/D{d}"));
+            }
+            for inc in &opts.include_dirs {
+                let mut s = OsString::from("/I");
+                s.push(inc);
+                cmd.arg(s);
+            }
+            for s in sources {
+                cmd.arg(s);
+            }
+            // Keep intermediate files out of the package dir: route .obj
+            // and .pdb into the target layout (created by rivet-graph).
+            // Without /Fo//Fd, cl drops main.obj/vc140.pdb next to the CWD.
+            let stem: OsString = output
+                .file_stem()
+                .map(|s| s.to_os_string())
+                .unwrap_or_else(|| OsString::from("a"));
+            let build_dir: PathBuf = output
+                .parent()
+                .map(|p| p.join("build"))
+                .unwrap_or_else(|| PathBuf::from("build"));
+            let mut fo = OsString::from("/Fo");
+            fo.push(build_dir.join(&stem).with_extension("obj"));
+            cmd.arg(fo);
+            if opts.debug {
+                let mut fd = OsString::from("/Fd");
+                fd.push(build_dir.join(&stem).with_extension("pdb"));
+                cmd.arg(fd);
+            }
+            let mut fe = OsString::from("/Fe");
+            fe.push(output);
+            cmd.arg(fe);
+            if opts.debug {
+                // Emit PDB next to the exe; harmless if the linker ignores it.
+                cmd.arg("/link");
+                cmd.arg("/DEBUG");
+            }
+        } else {
+            cmd.arg(format!("-std={}", opts.std));
+            cmd.arg(format!("-O{}", opts.opt.min(3)));
+            if opts.debug {
+                cmd.arg("-g");
+            }
+            for d in &opts.defines {
+                cmd.arg(format!("-D{d}"));
+            }
+            for inc in &opts.include_dirs {
+                let mut s = OsString::from("-I");
+                s.push(inc);
+                cmd.arg(s);
+            }
+            for s in sources {
+                cmd.arg(s);
+            }
+            cmd.arg("-o");
+            cmd.arg(output);
+        }
+        self.apply_env(&mut cmd);
+        cmd
+    }
+
+    /// Apply the captured `vcvars` environment overlay (MSVC only).
+    pub fn apply_env(&self, cmd: &mut Command) {
+        if let Some(env) = &self.msvc_env {
+            for (k, v) in env {
+                cmd.env(k, v);
+            }
+        }
+    }
+}
+
+/// Normalized per-build compile options. The toolchain maps these to
+/// compiler-specific flags, so the rest of rivet never branches on `cl`
+/// vs `g++` directly.
+#[derive(Debug, Clone)]
+pub struct CompileOptions {
+    /// C++ standard, e.g. `c++20`.
+    pub std: String,
+    /// Optimization level 0–3.
+    pub opt: u8,
+    /// Emit debug info.
+    pub debug: bool,
+    /// Preprocessor defines (`NAME` or `NAME=value`).
+    pub defines: Vec<String>,
+    /// Extra include directories.
+    pub include_dirs: Vec<PathBuf>,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            std: "c++17".to_string(),
+            opt: 0,
+            debug: true,
+            defines: Vec::new(),
+            include_dirs: Vec::new(),
+        }
+    }
+}
+
+/// One entry for `rivet toolchains`.
+#[derive(Debug, Clone)]
+pub struct ToolchainInfo {
+    /// Compiler family.
+    pub kind: ToolchainKind,
+    /// Path to the driver.
+    pub path: PathBuf,
+    /// Version string or failure reason.
+    pub version: String,
+    /// Whether this entry is the auto-selected default.
+    pub is_default: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Detection
+// ---------------------------------------------------------------------------
+
+/// Result of verbose detection: the toolchain plus the decision log.
+#[derive(Debug)]
+pub struct Detection {
+    /// Selected toolchain.
+    pub toolchain: CxxToolchain,
+    /// One line per candidate tried (for `-v`).
+    pub log: Vec<String>,
+}
+
+/// Detect the default toolchain, returning the decision log too.
+pub fn detect_verbose() -> Result<Detection, Error> {
+    let mut log: Vec<String> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+
+    // 1. cl.exe in PATH (dev prompt or pre-configured env).
+    match which::which("cl") {
+        Ok(p) => {
+            log.push(format!("found cl in PATH: {}", p.display()));
+            match probe_msvc_inherited_env(&p) {
+                Ok(tc) => return Ok(Detection { toolchain: tc, log }),
+                Err(e) => {
+                    log.push(format!("cl in PATH unusable: {e}"));
+                    tried.push(format!("cl in PATH ({}): {e}", p.display()));
+                }
+            }
+        }
+        Err(_) => {
+            log.push("cl not in PATH".to_string());
+            tried.push("cl in PATH: not found".to_string());
+        }
+    }
+
+    // 2–3. vswhere + well-known VS paths (Windows only).
+    #[cfg(windows)]
+    {
+        match find_msvc_via_vswhere(&mut log) {
+            Some(Ok(tc)) => return Ok(Detection { toolchain: tc, log }),
+            Some(Err(e)) => tried.push(format!("MSVC via vswhere: {e}")),
+            None => {
+                tried.push("MSVC via vswhere: vswhere not found or no VS with VC.Tools".to_string())
+            }
+        }
+        match find_msvc_via_known_paths(&mut log) {
+            Some(tc) => return Ok(Detection { toolchain: tc, log }),
+            None => tried.push(
+                "MSVC via well-known VS paths: no cl.exe under Visual Studio/BuildTools"
+                    .to_string(),
+            ),
+        }
+    }
+
+    // 4. clang-cl in PATH.
+    match which::which("clang-cl") {
+        Ok(p) => {
+            log.push(format!("found clang-cl in PATH: {}", p.display()));
+            let tc = CxxToolchain {
+                kind: ToolchainKind::ClangCl,
+                version: query_version(&p, &[]),
+                cxx: p,
+                msvc_env: None,
+                found_via: "clang-cl in PATH".to_string(),
+            };
+            return Ok(Detection { toolchain: tc, log });
+        }
+        Err(_) => {
+            log.push("clang-cl not in PATH".to_string());
+            tried.push("clang-cl in PATH: not found".to_string());
+        }
+    }
+
+    // 5. clang++ in PATH.
+    match which::which("clang++") {
+        Ok(p) => {
+            log.push(format!("found clang++ in PATH: {}", p.display()));
+            let tc = CxxToolchain {
+                kind: ToolchainKind::Clang,
+                version: query_version(&p, &[OsString::from("--version")]),
+                cxx: p,
+                msvc_env: None,
+                found_via: "clang++ in PATH".to_string(),
+            };
+            return Ok(Detection { toolchain: tc, log });
+        }
+        Err(_) => {
+            log.push("clang++ not in PATH".to_string());
+            tried.push("clang++ in PATH: not found".to_string());
+        }
+    }
+
+    // 6. g++ in PATH (gcc on Linux, MinGW g++ on Windows).
+    match which::which("g++") {
+        Ok(p) => {
+            log.push(format!("found g++ in PATH: {}", p.display()));
+            let kind = if cfg!(windows) {
+                ToolchainKind::Mingw
+            } else {
+                ToolchainKind::Gcc
+            };
+            let tc = CxxToolchain {
+                kind,
+                version: query_version(&p, &[OsString::from("--version")]),
+                cxx: p,
+                msvc_env: None,
+                found_via: "g++ in PATH".to_string(),
+            };
+            return Ok(Detection { toolchain: tc, log });
+        }
+        Err(_) => {
+            log.push("g++ not in PATH".to_string());
+            tried.push("g++ in PATH: not found".to_string());
+        }
+    }
+
+    // 7. c++/cc fallback (Unix).
+    #[cfg(not(windows))]
+    {
+        for name in ["c++", "cc"] {
+            match which::which(name) {
+                Ok(p) => {
+                    log.push(format!("found {name} in PATH: {}", p.display()));
+                    let tc = CxxToolchain {
+                        kind: ToolchainKind::Gcc,
+                        version: query_version(&p, &[OsString::from("--version")]),
+                        cxx: p,
+                        msvc_env: None,
+                        found_via: format!("{name} in PATH"),
+                    };
+                    return Ok(Detection { toolchain: tc, log });
+                }
+                Err(_) => {
+                    log.push(format!("{name} not in PATH"));
+                    tried.push(format!("{name} in PATH: not found"));
+                }
+            }
+        }
+    }
+
+    Err(Error::NoToolchain {
+        tried: tried
+            .iter()
+            .map(|t| format!("  - {t}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    })
+}
+
+/// Detect the default toolchain.
+pub fn detect() -> Result<CxxToolchain, Error> {
+    detect_verbose().map(|d| d.toolchain)
+}
+
+/// Probe every known toolchain for `rivet toolchains`.
+pub fn list_toolchains() -> Vec<ToolchainInfo> {
+    let mut out: Vec<ToolchainInfo> = Vec::new();
+    let default_cxx = detect().map(|t| t.cxx).unwrap_or_default();
+
+    #[cfg(windows)]
+    {
+        for cl in scan_known_cl_exes() {
+            if !out.iter().any(|i| i.path == cl) {
+                out.push(ToolchainInfo {
+                    kind: ToolchainKind::Msvc,
+                    version: query_version(&cl, &[]),
+                    path: cl.clone(),
+                    is_default: cl == default_cxx,
+                });
+            }
+        }
+        if let Ok(p) = which::which("cl") {
+            if !out.iter().any(|i| i.path == p) {
+                out.push(ToolchainInfo {
+                    kind: ToolchainKind::Msvc,
+                    version: query_version(&p, &[]),
+                    path: p.clone(),
+                    is_default: p == default_cxx,
+                });
+            }
+        }
+    }
+
+    for (name, kind) in [
+        ("clang-cl", ToolchainKind::ClangCl),
+        ("clang++", ToolchainKind::Clang),
+        (
+            "g++",
+            if cfg!(windows) {
+                ToolchainKind::Mingw
+            } else {
+                ToolchainKind::Gcc
+            },
+        ),
+        (
+            "gcc",
+            if cfg!(windows) {
+                ToolchainKind::Mingw
+            } else {
+                ToolchainKind::Gcc
+            },
+        ),
+    ] {
+        if let Ok(p) = which::which(name) {
+            if !out.iter().any(|i| i.path == p) {
+                out.push(ToolchainInfo {
+                    kind,
+                    version: query_version(&p, &[OsString::from("--version")]),
+                    path: p.clone(),
+                    is_default: p == default_cxx,
+                });
+            }
+        }
+    }
+    if !out.iter().any(|i| i.is_default) && !out.is_empty() {
+        if let Ok(def) = detect() {
+            if let Some(first) = out.iter_mut().find(|i| i.kind == def.kind) {
+                first.is_default = true;
+            }
+        }
+    }
+    out
+}
+
+// --- version probing -------------------------------------------------------
+
+/// Run the driver and return the first line of combined output,
+/// or `<unreadable version>` if it cannot be executed.
+fn query_version(driver: &Path, args: &[OsString]) -> String {
+    query_version_with_env(driver, args, None)
+}
+
+fn query_version_with_env(
+    driver: &Path,
+    args: &[OsString],
+    env: Option<&[(OsString, OsString)]>,
+) -> String {
+    let mut cmd = Command::new(driver);
+    cmd.args(args);
+    if let Some(env) = env {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+    // `cl` with no args prints its banner (to stderr) and exits non-zero;
+    // `--version` drivers print to stdout and exit zero. Either is fine.
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => return format!("<could not run {}: {e}>", driver.display()),
+    };
+    let mut combined = out.stdout;
+    combined.extend_from_slice(&out.stderr);
+    let text = String::from_utf8_lossy(&combined);
+    text.lines()
+        .next()
+        .unwrap_or("<empty version output>")
+        .trim()
+        .to_string()
+}
+
+// --- MSVC helpers (Windows) -------------------------------------------------
+
+/// Accept a `cl.exe` found in `PATH`: the inherited environment is assumed
+/// to work (dev prompt). Verifies the binary executes.
+fn probe_msvc_inherited_env(cl: &Path) -> Result<CxxToolchain, String> {
+    let version = query_version(cl, &[]);
+    if version.starts_with("<could not run") {
+        return Err(version);
+    }
+    Ok(CxxToolchain {
+        kind: ToolchainKind::Msvc,
+        cxx: cl.to_path_buf(),
+        version,
+        msvc_env: None,
+        found_via: "cl in PATH (inherited env)".to_string(),
+    })
+}
+
+/// `vswhere -latest ... -property installationPath` → vcvars → cl.
+#[cfg(windows)]
+fn find_msvc_via_vswhere(log: &mut Vec<String>) -> Option<Result<CxxToolchain, String>> {
+    let vswhere = find_vswhere()?;
+    log.push(format!("vswhere: {}", vswhere.display()));
+    let out = Command::new(&vswhere)
+        .args([
+            OsStr::new("-latest"),
+            OsStr::new("-products"),
+            OsStr::new("*"),
+            OsStr::new("-requires"),
+            OsStr::new("Microsoft.VisualStudio.Component.VC.Tools"),
+            OsStr::new("-property"),
+            OsStr::new("installationPath"),
+        ])
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(e) => return Some(Err(format!("could not run vswhere ({e})"))),
+    };
+    let install = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if install.is_empty() {
+        log.push("vswhere: no installation with VC.Tools".to_string());
+        return None;
+    }
+    log.push(format!("VS installation: {install}"));
+    Some(msvc_from_install_dir(Path::new(&install), "vswhere", log))
+}
+
+/// Scan well-known VS install roots for `cl.exe`.
+#[cfg(windows)]
+fn find_msvc_via_known_paths(log: &mut Vec<String>) -> Option<CxxToolchain> {
+    let mut hits = scan_known_cl_exes();
+    if hits.is_empty() {
+        return None;
+    }
+    // Prefer newest MSVC tools version (path sort approximates it).
+    hits.sort();
+    let cl = hits.pop().unwrap();
+    log.push(format!("MSVC via known paths: {}", cl.display()));
+    match msvc_from_cl_path(&cl, "well-known VS paths", log) {
+        Ok(tc) => Some(tc),
+        Err(e) => {
+            log.push(format!("MSVC candidate unusable: {e}"));
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn find_vswhere() -> Option<PathBuf> {
+    if let Ok(p) = which::which("vswhere") {
+        return Some(p);
+    }
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Some(base) = std::env::var_os(var) {
+            let p = PathBuf::from(base)
+                .join("Microsoft Visual Studio")
+                .join("Installer")
+                .join("vswhere.exe");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// All `cl.exe` copies under well-known VS roots (Hostx64/x64 only).
+#[cfg(windows)]
+fn scan_known_cl_exes() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            let base = PathBuf::from(base);
+            roots.push(base.join("Microsoft Visual Studio"));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+
+    let mut hits = Vec::new();
+    for root in roots {
+        // root/<ver>/<Edition|BuildTools>/VC/Tools/MSVC/<toolsver>/bin/Hostx64/x64/cl.exe
+        let Ok(editions) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for ver_dir in editions.flatten() {
+            let Ok(ed_list) = std::fs::read_dir(ver_dir.path()) else {
+                continue;
+            };
+            for ed in ed_list.flatten() {
+                let msvc_base = ed.path().join("VC").join("Tools").join("MSVC");
+                let Ok(tools) = std::fs::read_dir(&msvc_base) else {
+                    continue;
+                };
+                for tool in tools.flatten() {
+                    let cl = tool
+                        .path()
+                        .join("bin")
+                        .join("Hostx64")
+                        .join("x64")
+                        .join("cl.exe");
+                    if cl.is_file() {
+                        hits.push(cl);
+                    }
+                }
+            }
+        }
+    }
+    hits.sort();
+    hits.dedup();
+    hits
+}
+
+#[cfg(windows)]
+fn msvc_from_install_dir(
+    install: &Path,
+    via: &str,
+    log: &mut Vec<String>,
+) -> Result<CxxToolchain, String> {
+    let msvc_base = install.join("VC").join("Tools").join("MSVC");
+    let mut versions: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&msvc_base) {
+        for e in entries.flatten() {
+            let cl = e
+                .path()
+                .join("bin")
+                .join("Hostx64")
+                .join("x64")
+                .join("cl.exe");
+            if cl.is_file() {
+                versions.push(cl);
+            }
+        }
+    }
+    versions.sort();
+    let cl = versions
+        .pop()
+        .ok_or_else(|| format!("no cl.exe under {}", msvc_base.display()))?;
+    msvc_from_cl_path(&cl, via, log)
+}
+
+#[cfg(windows)]
+fn msvc_from_cl_path(cl: &Path, via: &str, log: &mut Vec<String>) -> Result<CxxToolchain, String> {
+    // cl at <install>/VC/Tools/MSVC/<ver>/bin/Hostx64/x64/cl.exe;
+    // vcvars at <install>/VC/Auxiliary/Build/vcvars64.bat.
+    let install = cl
+        .ancestors()
+        .find(|a| {
+            a.join("Auxiliary")
+                .join("Build")
+                .join("vcvars64.bat")
+                .is_file()
+        })
+        .map(Path::to_path_buf);
+    let msvc_env = match install {
+        Some(dir) => {
+            let vcvars = dir.join("Auxiliary").join("Build").join("vcvars64.bat");
+            match capture_vcvars_env(&vcvars) {
+                Ok(env) => {
+                    log.push(format!("captured vcvars env ({} vars)", env.len()));
+                    Some(env)
+                }
+                Err(e) => {
+                    log.push(format!("vcvars capture failed ({e}); using inherited env"));
+                    None
+                }
+            }
+        }
+        None => {
+            log.push("vcvars64.bat not found above cl.exe; using inherited env".to_string());
+            None
+        }
+    };
+    Ok(CxxToolchain {
+        kind: ToolchainKind::Msvc,
+        version: query_version_with_env(cl, &[], msvc_env.as_deref()),
+        cxx: cl.to_path_buf(),
+        msvc_env,
+        found_via: format!("MSVC {via}"),
+    })
+}
+
+/// Run vcvars and parse the resulting `KEY=VALUE` lines (`set` output).
+///
+/// `cmd.exe` has its own quote rules that differ from the standard Windows
+/// argv quoting `std::process::Command` uses, so passing the vcvars command
+/// via [`Command::args`] mangles the quotes around the batch path (paths
+/// contain spaces). Instead we pass the command line verbatim with
+/// `raw_arg` using the documented `cmd /S /C ""<batch>" <rest>"` idiom:
+/// the outer quotes are stripped by `cmd` and the inner quoted batch path
+/// then executes correctly.
+#[cfg(windows)]
+fn capture_vcvars_env(vcvars: &Path) -> Result<Vec<(OsString, OsString)>, String> {
+    use std::os::windows::process::CommandExt;
+    let inner = format!("\"{}\" >NUL && set", vcvars.display());
+    let out = Command::new("cmd")
+        .raw_arg("/S")
+        .raw_arg("/C")
+        .raw_arg(format!("\"{inner}\""))
+        .output()
+        .map_err(|e| format!("could not run vcvars ({e})"))?;
+    if !out.status.success() {
+        return Err(format!("vcvars exited with {}", out.status));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut env = Vec::new();
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let ku = k.to_ascii_uppercase();
+            let keep = ku == "PATH"
+                || ku == "INCLUDE"
+                || ku == "LIB"
+                || ku == "LIBPATH"
+                || ku.starts_with("WINDOWSSDK")
+                || ku.starts_with("WINDOWS_SDK")
+                || ku.starts_with("VCINSTALL")
+                || ku.starts_with("VCTOOLS")
+                || ku.starts_with("VSINSTALL")
+                || ku.starts_with("UCRT")
+                || ku.starts_with("UNIVERSALCRT")
+                || ku.starts_with("NETFXSDK");
+            if keep {
+                env.push((OsString::from(k), OsString::from(v)));
+            }
+        }
+    }
+    if env.is_empty() {
+        return Err("vcvars produced no usable env vars".to_string());
+    }
+    Ok(env)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake(kind: ToolchainKind) -> CxxToolchain {
+        CxxToolchain {
+            kind,
+            cxx: PathBuf::from(if kind == ToolchainKind::Msvc {
+                "cl.exe"
+            } else {
+                "g++"
+            }),
+            version: "test".to_string(),
+            msvc_env: None,
+            found_via: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn msvc_std_flag() {
+        let tc = fake(ToolchainKind::Msvc);
+        let opts = CompileOptions {
+            std: "c++20".to_string(),
+            ..Default::default()
+        };
+        let args = tc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts);
+        assert!(args.iter().any(|a| a == "/std:c++20"), "got: {args:?}");
+    }
+
+    #[test]
+    fn gcc_std_flag() {
+        let tc = fake(ToolchainKind::Gcc);
+        let opts = CompileOptions {
+            std: "c++20".to_string(),
+            ..Default::default()
+        };
+        let args = tc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
+        assert!(args.iter().any(|a| a == "-std=c++20"), "got: {args:?}");
+    }
+
+    #[test]
+    fn opt_levels_map() {
+        let msvc = fake(ToolchainKind::Msvc);
+        let opts0 = CompileOptions {
+            opt: 0,
+            ..Default::default()
+        };
+        let a0 = msvc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts0);
+        assert!(a0.iter().any(|a| a == "/Od"), "got: {a0:?}");
+        let gcc = fake(ToolchainKind::Gcc);
+        let opts3 = CompileOptions {
+            opt: 3,
+            debug: false,
+            ..Default::default()
+        };
+        let a3 = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts3);
+        assert!(a3.iter().any(|a| a == "-O3"), "got: {a3:?}");
+        assert!(!a3.iter().any(|a| a == "-g"), "got: {a3:?}");
+    }
+
+    #[test]
+    fn fingerprint_differs_by_std_and_opt() {
+        let tc = fake(ToolchainKind::Gcc);
+        let a = tc.fingerprint(&CompileOptions {
+            std: "c++17".into(),
+            opt: 0,
+            ..Default::default()
+        });
+        let b = tc.fingerprint(&CompileOptions {
+            std: "c++20".into(),
+            opt: 0,
+            ..Default::default()
+        });
+        let c = tc.fingerprint(&CompileOptions {
+            std: "c++17".into(),
+            opt: 3,
+            ..Default::default()
+        });
+        assert_ne!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn clang_cl_is_msvc_like() {
+        assert!(fake(ToolchainKind::ClangCl).is_msvc_like());
+        assert!(!fake(ToolchainKind::Gcc).is_msvc_like());
+    }
+}

@@ -1,0 +1,10 @@
+[package]
+name = "rivet-git"
+version = "0.1.0"
+edition = "2021"
+description = "Git dependency subsystem via system git binary (M4; stub in M1)"
+license = "MIT OR Apache-2.0"
+rust-version = "1.74"
+
+[dependencies]
+thiserror = "2.0"

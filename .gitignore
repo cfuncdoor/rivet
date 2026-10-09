@@ -1,0 +1,3 @@
+/target/
+target/
+# NOTE: Cargo.lock is intentionally committed (see DECISIONS.md).

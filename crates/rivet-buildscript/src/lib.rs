@@ -9,7 +9,7 @@
 //! into the graph's include/define/lib inputs, and gates rebuilds with
 //! [`needs_rerun`].
 //!
-//! Sandbox limits (recorded honestly, see the M7 decision entry): the script
+//! Sandbox limits (recorded honestly in DECISIONS.md): the script
 //! runs as the current user with its working directory set to the package
 //! dir and a scrubbed environment (secret-looking vars stripped — see
 //! [`run_script`]). There is **no** network or filesystem isolation on stock
@@ -717,8 +717,8 @@ int main() {
   std::printf("rivet:lib -lfoo\n");
   std::printf("rivet:libdir libs\n");
   std::printf("rivet:rerun-if-changed build.rivet.cpp\n");
-  std::printf("rivet:rerun-if-env RIVET_M7_TEST_TOKEN\n");
-  const char* t = std::getenv("RIVET_M7_TEST_TOKEN");
+  std::printf("rivet:rerun-if-env RIVET_TEST_TOKEN\n");
+  const char* t = std::getenv("RIVET_TEST_TOKEN");
   std::printf("rivet:define SAW_TOKEN=%s\n", t ? "1" : "0");
   return 0;
 }
@@ -733,7 +733,7 @@ int main() {
         let exe = compile_script(&tc, &script, &out_dir, &CompileOptions::default()).unwrap();
         assert!(exe.is_file());
 
-        std::env::remove_var("RIVET_M7_TEST_TOKEN");
+        std::env::remove_var("RIVET_TEST_TOKEN");
         let ran = run_script(&exe, dir.path(), false).unwrap();
         assert_eq!(ran.includes, vec![dir.path().join("generated")]);
         assert_eq!(ran.libs, vec!["-lfoo".to_string()]);
@@ -744,7 +744,7 @@ int main() {
             ran.rerun_if_changed,
             vec![dir.path().join(SCRIPT_FILE_NAME)]
         );
-        assert_eq!(ran.rerun_if_env, vec!["RIVET_M7_TEST_TOKEN".to_string()]);
+        assert_eq!(ran.rerun_if_env, vec!["RIVET_TEST_TOKEN".to_string()]);
         assert_eq!(ran.log, vec!["hello from build script".to_string()]);
         assert!(!ran.script_hash.is_empty());
         assert_eq!(
@@ -808,9 +808,9 @@ int main() {
             &CompileOptions::default(),
         )
         .unwrap();
-        std::env::set_var("RIVET_M7_TEST_TOKEN", "s3cret");
+        std::env::set_var("RIVET_TEST_TOKEN", "s3cret");
         let ran = run_script(&exe, dir.path(), false).unwrap();
-        std::env::remove_var("RIVET_M7_TEST_TOKEN");
+        std::env::remove_var("RIVET_TEST_TOKEN");
         // The script must NOT have seen the secret.
         assert!(ran.defines.contains(&"SAW_TOKEN=0".to_string()), "{ran:?}");
     }
@@ -835,10 +835,10 @@ int main() {
     fn needs_rerun_gates() {
         let dir = pkg_dir();
         std::fs::write(dir.path().join("watched.txt"), "v1").unwrap();
-        std::env::remove_var("RIVET_M7_TEST_ENV_A");
+        std::env::remove_var("RIVET_TEST_ENV_A");
         let prev = snapshotted(
             dir.path(),
-            "rivet:rerun-if-changed watched.txt\nrivet:rerun-if-env RIVET_M7_TEST_ENV_A\n",
+            "rivet:rerun-if-changed watched.txt\nrivet:rerun-if-env RIVET_TEST_ENV_A\n",
             "abc123",
         );
         // Identical → no rerun.
@@ -850,9 +850,9 @@ int main() {
         assert!(needs_rerun(dir.path(), &prev, "abc123"));
         // Watched env changed → rerun.
         std::fs::write(dir.path().join("watched.txt"), "v1").unwrap();
-        std::env::set_var("RIVET_M7_TEST_ENV_A", "1");
+        std::env::set_var("RIVET_TEST_ENV_A", "1");
         assert!(needs_rerun(dir.path(), &prev, "abc123"));
-        std::env::remove_var("RIVET_M7_TEST_ENV_A");
+        std::env::remove_var("RIVET_TEST_ENV_A");
         // Watched file deleted → rerun.
         std::fs::remove_file(dir.path().join("watched.txt")).unwrap();
         assert!(needs_rerun(dir.path(), &prev, "abc123"));
@@ -878,7 +878,7 @@ int main() {
         let dir = pkg_dir();
         let tc = rivet_toolchain::detect().unwrap();
         write_fixture(dir.path(), ECHO_SCRIPT);
-        std::env::remove_var("RIVET_M7_TEST_TOKEN");
+        std::env::remove_var("RIVET_TEST_TOKEN");
         let out = run_package_script(
             &tc,
             dir.path(),

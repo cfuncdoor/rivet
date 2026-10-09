@@ -1,7 +1,7 @@
 //! Publish uploads: request construction (unit-testable, no network) plus
 //! the live `PUT` with bearer auth.
 //!
-//! Wire format (M5; the server arrives later):
+//! Wire format (the server arrives later):
 //! `PUT <registry-url>/publish/<name>/<version>`, body = gzip tarball,
 //! `Content-Type: application/gzip`, `Authorization: Bearer <token>`,
 //! `X-Rivet-Checksum: sha256:…`, optional `X-Rivet-Description`, optional

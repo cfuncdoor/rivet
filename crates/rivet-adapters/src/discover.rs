@@ -225,7 +225,7 @@ fn normalize_lib_stem(file_name: &str) -> String {
 }
 
 /// Link order rank: pure static archives first, then import libs, then
-/// shared objects. `preferring static` per the M6 brief.
+/// shared objects, preferring static.
 fn link_rank(path: &Path) -> u8 {
     let name = file_name(path).unwrap_or_default().to_ascii_lowercase();
     if name.ends_with(".a") {

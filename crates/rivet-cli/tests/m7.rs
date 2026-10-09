@@ -1,4 +1,4 @@
-//! M7 acceptance tests: build scripts, artifact cache, `--target`.
+//! Acceptance tests: build scripts, artifact cache, `--target`.
 //! Hermetic tempdirs; the buildscript demo is copied out of `examples/`
 //! so the repo checkout stays clean.
 

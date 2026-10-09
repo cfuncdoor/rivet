@@ -23,7 +23,7 @@
 //!   (partial clone, exact ref only), then fall back to a full fetch of the
 //!   same ref, then to a full `fetch origin`. Servers without filter support
 //!   (notably `file://` test mirrors and old gits) fall through transparently.
-//! * Same-URL-different-refs rule (M4 decision, see resolver crate docs too):
+//! * Same-URL-different-refs rule (see resolver crate docs too):
 //!   one URL = one logical source. If two packages request the same URL with
 //!   different refs, resolution must unify them to a single SHA; if they point
 //!   at different SHAs that is an error spelling both refs. The checkout

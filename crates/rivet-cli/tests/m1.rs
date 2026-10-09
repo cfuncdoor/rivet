@@ -1,4 +1,4 @@
-//! M1 acceptance tests: `rivet new hello && rivet build && rivet run`
+//! Acceptance tests: `rivet new hello && rivet build && rivet run`
 //! against a real C++ compiler in temp dirs.
 
 use std::ffi::OsString;
@@ -197,8 +197,8 @@ fn json_message_format_emits_json_lines() {
 }
 
 #[test]
-fn future_commands_fail_with_milestone_pointer() {
-    // Inside a project scope so `publish` reaches its milestone stub.
+fn future_commands_fail_actionably() {
+    // Inside a project scope so `publish` reaches its real handler.
     let dir = TempDir::new().unwrap();
     rivet()
         .current_dir(dir.path())

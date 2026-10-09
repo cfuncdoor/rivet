@@ -1,7 +1,7 @@
 //! Content hashing and incremental-build state.
 //!
-//! Staleness is decided by content hashes only (D15: no mtime fast path in
-//! M2 — always hash). Per-package state lives at
+//! Staleness is decided by content hashes only (always hash, no mtime
+//! fast path). Per-package state lives at
 //! `target/<prof>/incremental/rivet-state.json`:
 //!
 //! ```json

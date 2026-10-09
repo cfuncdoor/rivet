@@ -1,4 +1,4 @@
-//! M4 lockfile flow: resolve/write `rivet.lock.json`, materialize locked
+//! Lockfile flow: resolve/write `rivet.lock.json`, materialize locked
 //! git sources (cache checkout or vendor copy), and the shared
 //! plain-or-locked unit resolution used by build/test/run/compile-commands.
 //!
@@ -40,6 +40,47 @@ pub fn lock_path(scope_root: &Path) -> PathBuf {
     scope_root.join("rivet.lock.json")
 }
 
+/// Locked versions by dep key (`rivet.lock.json`, empty when absent).
+pub fn lock_versions(scope_root: &Path) -> Result<BTreeMap<String, String>> {
+    let path = lock_path(scope_root);
+    if !path.is_file() {
+        return Ok(BTreeMap::new());
+    }
+    let lock = rivet_resolver::read_lockfile(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(lock
+        .packages
+        .into_iter()
+        .map(|p| (p.name, p.version))
+        .collect())
+}
+
+/// One-line human summary of a dependency declaration.
+pub fn describe_dep(dep: &rivet_manifest::Dependency) -> String {
+    match dep {
+        rivet_manifest::Dependency::Simple(req) => format!("registry {req}"),
+        rivet_manifest::Dependency::Detailed(d) => {
+            if let Some(path) = &d.path {
+                format!("path {path}")
+            } else if let Some(git) = &d.git {
+                let r = d
+                    .tag
+                    .as_ref()
+                    .map(|t| format!("tag {t}"))
+                    .or_else(|| d.branch.as_ref().map(|b| format!("branch {b}")))
+                    .or_else(|| d.rev.as_ref().map(|r| format!("rev {r}")))
+                    .unwrap_or_else(|| "default branch".to_string());
+                format!("git {git} ({r})")
+            } else if let Some(version) = &d.version {
+                format!("registry {version}")
+            } else if d.system.unwrap_or(false) {
+                "system (installed)".to_string()
+            } else {
+                "unknown source".to_string()
+            }
+        }
+    }
+}
+
 /// Git cache handle (requires the `git` binary; honors `RIVET_HOME`).
 pub fn git_cache(verbose: bool, offline: bool) -> Result<rivet_git::GitCache> {
     rivet_git::require_git().map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -49,7 +90,7 @@ pub fn git_cache(verbose: bool, offline: bool) -> Result<rivet_git::GitCache> {
         .with_offline(offline))
 }
 
-/// Local registry index copy (`~/.rivet/registry/index/default`; M5 serves it).
+/// Local registry index copy (`~/.rivet/registry/index/default`).
 fn registry_index_dir() -> Result<PathBuf> {
     let root = rivet_cache::cache_root().map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(root.join("registry").join("index").join("default"))
@@ -542,7 +583,7 @@ impl rivet_graph::workspace::Materializer for CliMaterializer {
 // ---------------------------------------------------------------------------
 
 /// Scope-root patch map (dep key → joined patch dir) for resolution.
-/// Non-path patch values are an M4-limits error (local paths only).
+/// Non-path patch values are an error (local paths only).
 fn root_patch_map(root: &rivet_manifest::Manifest) -> Result<BTreeMap<String, PathBuf>> {
     let mut map = BTreeMap::new();
     for (key, dep) in &root.patch {
@@ -552,7 +593,7 @@ fn root_patch_map(root: &rivet_manifest::Manifest) -> Result<BTreeMap<String, Pa
                     map.insert(key.clone(), root.dir.join(p));
                 }
                 None => bail!(
-                    "patch for `{key}` uses a non-path source, which is not supported in M4 (local paths only)"
+                    "patch for `{key}` uses a non-path source (local paths only)"
                 ),
             },
             rivet_manifest::Dependency::Simple(_) => bail!(
@@ -699,7 +740,7 @@ pub fn update_flow(
     let git = git_cache(verbose, opts.offline)?;
     let mut seeds = scope_seeds(root)?;
     // Patched deps resolve as their base with a warning (the build uses the
-    // patch instead; true patch-aware resolution is M5 work).
+    // patch instead; true patch-aware resolution is future work).
     let patched = collect_patched_keys(root, &seeds)?;
     if !patched.is_empty() {
         let mut names: Vec<String> = patched.iter().cloned().collect();
@@ -903,11 +944,11 @@ fn report_lock_diff(
 }
 
 // ---------------------------------------------------------------------------
-// Patch overrides (path-only in M4)
+// Patch overrides (path-only)
 // ---------------------------------------------------------------------------
 
 /// Dep keys overridden by `patch` tables (own table, else the scope root's).
-/// Non-path patch values are an M4-limits error.
+/// Non-path patch values are an error.
 pub fn collect_patched_keys(
     root: &rivet_manifest::Manifest,
     seeds: &[rivet_manifest::Manifest],
@@ -923,7 +964,7 @@ pub fn collect_patched_keys(
                 }
                 _ => {
                     bail!(
-                        "patch for `{key}` uses a non-path source, which is not supported in M4 (local paths only). Fix: point it at a `path`, or wait for M5 registries"
+                        "patch for `{key}` uses a non-path source (local paths only). Fix: point it at a `path`"
                     );
                 }
             }
@@ -1553,7 +1594,7 @@ pub fn git_fetch_flow(ui: &Ui, root: &rivet_manifest::Manifest, verbose: bool) -
 }
 
 // ---------------------------------------------------------------------------
-// Registry commands (M5)
+// Registry commands
 // ---------------------------------------------------------------------------
 
 /// Home dir for the credential store (`RIVET_HOME` override else the OS

@@ -9,8 +9,7 @@
 //! * Feature tables may chain (`"a": ["b"]` enables `b`); closure is computed
 //!   per package. Transitive (non-root) packages get their defaults (or all,
 //!   with `--all-features`); `--features` does not propagate to transitive
-//!   deps in M4 (no `pkg/feat` syntax yet — deferred to M5 with the real
-//!   registry; documented here rather than guessed).
+//!   deps (no `pkg/feat` syntax).
 //! * Active deps = non-optional deps plus optional deps named by a `dep:`
 //!   entry of an enabled feature.
 //!
@@ -27,7 +26,7 @@
 //!   until `update`; `rev` pins. A bare `git` URL without ref means the
 //!   remote default branch (`branch = "HEAD"`).
 //!
-//! Same-URL-different-refs rule (M4 decision): one URL is one logical source.
+//! Same-URL-different-refs rule: one URL is one logical source.
 //! Two packages requesting the same URL with different refs must resolve to
 //! the **same SHA** (unified); divergent SHAs are an error spelling both
 //! refs and SHAs. The `rivet-git` checkout layout keys trees by SHA so
@@ -43,15 +42,15 @@
 //!   "value":"…"},"sha","tree"}`. (PLAN.md's `ref` sketch is ambiguous; this
 //!   `kind`+`value` shape is the canonical write form. `read` additionally
 //!   accepts the single-key form `{"tag":"v1"}` for forward compatibility.)
-//! * registry: `{"kind":"registry","registry":"default","version",
-//!   "checksum"}` (`"default"` always in M4 — manifests cannot name a
-//!   registry yet).
+//! * registry: `{"kind":"registry","registry":"<url>|default","version",
+//!   "checksum"}` (`"default"` resolves via configuration at materialize
+//!   time).
 //!
 //! Offline/frozen: `offline=true` forbids network — git refs resolve from
-//! local mirrors only (missing refs error actionably), the registry uses the
-//! local index copy only (never fetched in M4). Frozen = offline resolve +
-//! [`check_locked`] against the existing lockfile (no separate flag; the CLI
-//! composes them).
+//! local mirrors only (missing refs error actionably), the registry uses
+//! local index copies (synced beforehand by the caller). Frozen = offline
+//! resolve + [`check_locked`] against the existing lockfile (no separate
+//! flag; the CLI composes them).
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -337,7 +336,7 @@ pub enum LockSource {
         /// Path as written.
         path: String,
     },
-    /// Registry package (M4: always the default registry).
+    /// Registry package (the registry URL is locked verbatim).
     Registry {
         /// Registry URL or `"default"`.
         registry: String,
@@ -359,7 +358,7 @@ pub enum LockSource {
         tree: String,
     },
     /// Installed system library (probed at build time, never fetched).
-    /// Added for M6 (C2 amendment): the `version` records the requirement
+    /// Added alongside adapter support (C2 amendment): the `version` records the requirement
     /// as written.
     System {
         /// Required version (`*` when the dep states none).
@@ -445,7 +444,9 @@ impl<'de> Deserialize<'de> for GitLockRef {
 }
 
 // ---------------------------------------------------------------------------
-// Registry index stub (M5-compatible)
+// Registry index: JSON-lines `<index-dir>/<name>` reads shared with the
+// registry crate (same field names; unknown fields ignored on read, so
+// either side can extend).
 // ---------------------------------------------------------------------------
 
 /// One index line for a package version.
@@ -454,7 +455,7 @@ impl<'de> Deserialize<'de> for GitLockRef {
 /// `{"version":"1.2.3","checksum":"sha256:…","yanked":false,
 /// "deps":[{"name":"…","req":"^1","optional":false}]}`.
 /// Checksums are stored verbatim into the lockfile. Unknown fields are
-/// ignored so M5 can extend the format without breaking this reader.
+/// ignored so the format can extend without breaking this reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexEntry {
     /// Version string.
@@ -465,9 +466,8 @@ pub struct IndexEntry {
     /// Yanked upstream (skipped unless the lock pins it — then error).
     #[serde(default)]
     pub yanked: bool,
-    /// Transitive deps (non-optional only honored in M4; optional index
-    /// deps are recorded but skipped — full `dep:`/feature tables for
-    /// registry packages arrive with M5).
+    /// Transitive deps (non-optional only honored here; optional index
+    /// deps are recorded but skipped).
     #[serde(default)]
     pub deps: Vec<IndexDep>,
 }
@@ -480,7 +480,7 @@ pub struct IndexDep {
     /// Semver requirement (caret semantics).
     #[serde(default = "default_index_req")]
     pub req: String,
-    /// Optional (skipped in M4 stub resolution).
+    /// Optional (skipped during resolution).
     #[serde(default)]
     pub optional: bool,
 }
@@ -491,16 +491,16 @@ fn default_index_req() -> String {
 
 /// Minimal JSON-lines registry index reader over a directory.
 ///
-/// M5-compatible stub: reads `<dir>/<name>` line by line. Missing file =
-/// unknown package (error). Malformed lines are errors (fail fast — a corrupt
-/// index copy must not resolve silently).
+/// Reads `<dir>/<name>` line by line. Missing file = unknown package
+/// (error). Malformed lines are errors (fail fast — a corrupt index copy
+/// must not resolve silently).
 #[derive(Debug, Clone)]
 pub struct RegistryIndex {
     dir: PathBuf,
 }
 
 impl RegistryIndex {
-    /// Point at an index directory (local copy; never fetched in M4).
+    /// Point at an index directory (a local copy; syncing is the caller's job).
     pub fn new(dir: PathBuf) -> Self {
         Self { dir }
     }
@@ -512,7 +512,7 @@ impl RegistryIndex {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::BadIndex {
                     message: format!("package `{name}` not in the local index copy"),
-                    hint: "check the package name; registry publishing arrives with M5".to_string(),
+                    hint: "check the package name, or sync the registry index".to_string(),
                 }
             } else {
                 Error::Io {
@@ -546,8 +546,7 @@ impl RegistryIndex {
 ///
 /// Tests inject fakes; real builds use [`RealProvider`] (rivet-git +
 /// filesystem). Registry manifests are not loaded through this trait —
-/// registry transitive deps come from the index stub (M5 reads real
-/// manifests).
+/// registry transitive deps come from the index.
 pub trait SourceProvider {
     /// Load the manifest in path dep directory `dir`.
     fn load_path_manifest(&self, dir: &Path) -> Result<Manifest, Error>;
@@ -1402,7 +1401,7 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
                 },
             );
             checksums.insert(name.clone(), Some(best_e.checksum.clone()));
-            // Transitive index deps (non-optional only in the M4 stub).
+            // Transitive index deps (non-optional only).
             // Re-queue only when a genuinely new requirement appears, so
             // index cycles (a -> b -> a) terminate instead of ping-ponging.
             // Transitives inherit the parent's registry.

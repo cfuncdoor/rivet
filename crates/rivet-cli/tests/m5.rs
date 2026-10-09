@@ -1,4 +1,4 @@
-//! M5 acceptance tests: registry deps end-to-end against a local `file://`
+//! Acceptance tests: registry deps end-to-end against a local `file://`
 //! registry (index + tarballs crafted in tempdirs), publish/login/search,
 //! checksums, yank, offline, install. No network.
 

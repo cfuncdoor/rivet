@@ -114,6 +114,12 @@ package/version/features/fingerprint/profile/inputs, with dep-hash
 verification on restore and `Cached` restores (`target/` wipe-safe, D52).
 `--target` selects native detection or `clang --target=` cross builds,
 recorded in the fingerprint (D53); PCH/modules surface typed errors.
+Native detection is cached at `~/.rivet/toolchain.json`, validated by
+driver existence + a live version probe (D58). Freshness assessment
+memoizes content hashes per build and snapshots per-target object hashes;
+the build reuses the snapshot for unrecompiled targets, hashing only
+archives live, and the pre-link digest doubles as the post-link record
+(D59).
 
 ## Profiles / features (M3)
 

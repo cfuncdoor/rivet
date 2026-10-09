@@ -1,4 +1,4 @@
-//! M4 acceptance tests: git deps, lockfile, update, offline, vendor, dev,
+//! Acceptance tests: git deps, lockfile, update, offline, vendor, dev,
 //! prune — all against local bare repos (`file://`), no network.
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ fn git(cwd: &Path, args: &[&str]) {
         .args(args)
         .current_dir(cwd)
         .status()
-        .expect("git binary must exist for M4 tests");
+        .expect("git binary must exist for these tests");
     assert!(status.success(), "git {args:?} failed in {}", cwd.display());
 }
 
@@ -41,7 +41,7 @@ fn git_out(cwd: &Path, args: &[&str]) -> String {
         .args(args)
         .current_dir(cwd)
         .output()
-        .expect("git binary must exist for M4 tests");
+        .expect("git binary must exist for these tests");
     assert!(
         out.status.success(),
         "git {args:?} failed in {}: {}",

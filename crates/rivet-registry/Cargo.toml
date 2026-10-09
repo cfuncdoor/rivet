@@ -2,7 +2,7 @@
 name = "rivet-registry"
 version = "0.1.0"
 edition = "2021"
-description = "Registry index/fetch/publish (M5; stub in M1)"
+description = "Package registry index, fetch, and publish"
 license = "MIT OR Apache-2.0"
 rust-version = "1.74"
 

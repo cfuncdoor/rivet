@@ -405,3 +405,24 @@ simpler option that preserves Cargo's mental model, then continue.
   lookup). Separately, `/LIBPATH` and bare lib names are linker inputs
   and must follow `/link` on the `cl` line (`D9002`/`D9024` otherwise).
   Both found wiring the real-zlib demo.
+- **D58: Native toolchain detection is cached on disk (`~/.rivet/toolchain.json`).**
+  MSVC detection (vswhere + vcvars probe) cost ~2.7s per invocation —
+  more than the rest of a no-op rebuild. The cache stores kind, driver,
+  version, msvc env, and archiver; a load validates driver (+archiver)
+  existence plus a live version-probe equality check, so upgrades,
+  uninstalls, and env drift invalidate safely. `RIVET_NO_TOOLCHAIN_CACHE`
+  (non-empty) skips it. Cross-target detection stays live (already cheap:
+  no vcvars probe). Needs `serde`+`serde_json` in `rivet-toolchain`
+  (both already pinned in the workspace).
+- **D59: Link digests reuse assess-time object hashes; archives stay live.**
+  `current_link_digest` re-hashed every object on every call (assess +
+  build check + build record ≈ 3×200 file reads, ~3s on the bench).
+  `Assessment` now snapshots per-target object `(path, hash)`; the build
+  reuses the snapshot for targets it did not recompile and only hashes
+  the (few) archives live — so dependency re-archives and swapped
+  archives still relink while objects are never read twice. Linking never
+  modifies its inputs, so the pre-link digest doubles as the post-link
+  record (the second hashing pass is gone). 200-file bench (Windows,
+  MSVC): release no-op Fresh ~0.4s wall (~0.3s in-rivet, was ~6s),
+  single-TU recompile+relink ~2.3s; debug no-op ~3.4s warm wall
+  (was ~15s).

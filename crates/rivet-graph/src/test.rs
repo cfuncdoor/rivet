@@ -8,8 +8,7 @@
 //! (tag `test-<stem>`) so the shared incremental state covers them.
 //!
 //! `devDependencies` are parsed by the manifest but not wired into test
-//! inputs yet; test targets use the package's normal dependency closure
-//! (M4 resolver work).
+//! inputs yet; test targets use the package's normal dependency closure.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

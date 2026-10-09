@@ -3,9 +3,9 @@
 //! [`resolve_units`] turns a root manifest into build-ordered [`Unit`]s:
 //! workspace members (or the single package), filtered by `-p`, plus the
 //! transitive closure of `path` dependencies. Non-path dependencies fail
-//! with milestone pointers (registry → M5, git → M4); cycles fail with the
-//! cycle spelled out. Every unit is keyed by its canonical directory so the
-//! same package reached twice builds once.
+//! without a lock flow (registry/git need `rivet.lock.json` coverage);
+//! cycles fail with the cycle spelled out. Every unit is keyed by its
+//! canonical directory so the same package reached twice builds once.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ pub enum LockedSource {
         /// Locked `sha^{tree}` (verified at materialization).
         tree: String,
     },
-    /// Registry package (fetching arrives with M5).
+    /// Registry package (fetched through the materializer).
     Registry {
         /// Registry URL or `"default"`.
         registry: String,
@@ -158,9 +158,9 @@ pub struct RegistryRequest {
 
 /// How dependency edges resolve: live manifests only, or via a lockfile.
 enum Mode<'a> {
-    /// Live resolution (path deps only; git/registry are milestone errors).
+    /// Live resolution (path deps only; git/registry need lock coverage).
     Direct,
-    /// Locked resolution (git via materializer, registry is an M5 error).
+    /// Locked resolution (git + registry via materializer).
     Locked {
         /// Lock entries by dep key.
         locked: &'a BTreeMap<String, LockedDep>,
@@ -268,8 +268,8 @@ pub fn resolve_units(
 ///
 /// Optional `path` dependencies that no enabled feature activates are
 /// filtered out (they never enter the build). Non-path dependencies still
-/// fail with milestone pointers (registry → M5, git → M4) even when
-/// optional and inactive — the M4 CLI integration wires those flags.
+/// fail without lock coverage (registry/git need the lock flow) even when
+/// optional and inactive.
 /// `root_patch` maps dep keys to scope-root patch dirs (workspace-wide
 /// overrides, applied in both modes).
 pub fn resolve_units_with_features(
@@ -283,8 +283,9 @@ pub fn resolve_units_with_features(
 }
 
 /// Resolve the build scope against a lockfile: git deps materialize from
-/// locked SHAs (verified by tree hash), registry deps are an M5 error, and
-/// anything the lock does not cover is [`Error::NotLocked`] (run update).
+/// locked SHAs (verified by tree hash), registry deps fetch through the
+/// materializer, and anything the lock does not cover is
+/// [`Error::NotLocked`] (run update).
 pub fn resolve_locked_units(
     root: &Manifest,
     profile: &str,
@@ -1141,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_and_git_deps_point_at_milestones() {
+    fn registry_and_git_deps_need_lock_flow() {
         let dir = tempfile::tempdir().unwrap();
         write_pkg(
             dir.path(),
@@ -1149,14 +1150,14 @@ mod tests {
         );
         let root = load_dir(dir.path());
         let err = resolve_units(&root, "dev", None).unwrap_err().to_string();
-        assert!(err.contains("M5"), "got: {err}");
+        assert!(err.contains("rivet update"), "got: {err}");
         write_pkg(
             dir.path(),
             "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"dependencies\":{\"z\":{\"git\":\"https://example.com/z.git\"}}}",
         );
         let root = load_dir(dir.path());
         let err = resolve_units(&root, "dev", None).unwrap_err().to_string();
-        assert!(err.contains("M4"), "got: {err}");
+        assert!(err.contains("rivet update"), "got: {err}");
     }
 
     #[test]

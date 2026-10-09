@@ -16,7 +16,7 @@
 //! * `MaterializedSource.source_dir` is the package root (contains
 //!   `rivet.json` for rivet packages); `include_dirs` (empty or
 //!   `[source_dir/include]`) joins the dependent's header search path;
-//!   `lib_hint` is always `None` in M5 — lib roots stay graph-side.
+//!   `lib_hint` is always `None` — lib roots stay graph-side.
 //! * Locked builds must redirect output like git deps (never write
 //!   `target/` into the immutable cache tree).
 
@@ -52,7 +52,7 @@ pub struct MaterializedSource {
     pub source_dir: PathBuf,
     /// `[source_dir/include]` when that dir exists, else empty.
     pub include_dirs: Vec<PathBuf>,
-    /// Reserved for future lib-root hints; always `None` in M5 (lib
+    /// Reserved for future lib-root hints; always `None` (lib
     /// discovery stays graph-side).
     pub lib_hint: Option<PathBuf>,
 }

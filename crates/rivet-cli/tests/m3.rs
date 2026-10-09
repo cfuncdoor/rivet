@@ -1,4 +1,4 @@
-//! M3 acceptance tests: profiles (opt/lto/sanitizer flags + fingerprint),
+//! Acceptance tests: profiles (opt/lto/sanitizer flags + fingerprint),
 //! features (contract C1), `rivet test`, and `rivet compile-commands`.
 //! All tests run a real C++ compiler in temp dirs.
 

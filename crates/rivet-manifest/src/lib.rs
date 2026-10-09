@@ -242,16 +242,16 @@ pub struct Manifest {
     /// Runtime dependencies (optional).
     #[serde(default)]
     pub dependencies: BTreeMap<String, Dependency>,
-    /// Dev dependencies (optional, M3+).
+    /// Dev dependencies (optional; used by `rivet test`).
     #[serde(default, rename = "devDependencies")]
     pub dev_dependencies: BTreeMap<String, Dependency>,
-    /// Build dependencies (optional, M7+).
+    /// Build dependencies (optional; used by build scripts).
     #[serde(default, rename = "buildDependencies")]
     pub build_dependencies: BTreeMap<String, Dependency>,
-    /// Feature flags (optional, M3+; parsed, unification in M4).
+    /// Feature flags (optional; parsed, unified at resolve time).
     #[serde(default)]
     pub features: BTreeMap<String, Vec<String>>,
-    /// Per-target overrides (optional, M7+ cross-compile).
+    /// Per-target overrides (optional; used for cross-compilation).
     #[serde(default)]
     pub target: BTreeMap<String, TargetOverride>,
     /// Explicit binary targets (optional; defaults to `src/main.cpp` convention).
@@ -263,10 +263,10 @@ pub struct Manifest {
     /// Build profiles (optional).
     #[serde(default)]
     pub profile: Profiles,
-    /// Workspace members (optional, M2+).
+    /// Workspace members (optional).
     #[serde(default)]
     pub workspace: Option<Workspace>,
-    /// Patch overrides (optional, M4+; parsed in M1 so typos are caught).
+    /// Patch overrides (optional; parsed early so typos are caught).
     #[serde(default)]
     pub patch: BTreeMap<String, Dependency>,
     /// Directory containing `rivet.json` (not serialized).
@@ -325,21 +325,21 @@ pub struct DependencyDetail {
     #[serde(default)]
     pub submodules: Option<bool>,
     /// Whether this dependency is optional, enabled via `features`
-    /// (`dep:<name>` entries). Optional deps are skipped unless activated
-    /// (M3 features, M4 resolver). Contract C1 — frozen.
+    /// (`dep:<name>` entries). Optional deps are skipped unless activated.
+    /// Contract C1 — frozen.
     #[serde(default)]
     pub optional: Option<bool>,
-    /// Inline package block for git deps without their own `rivet.json` (M4+).
+    /// Inline package block for git deps without their own `rivet.json`.
     #[serde(default)]
     pub package: Option<InlinePackage>,
-    /// System-library fallback (M6+).
+    /// System-library fallback.
     #[serde(default)]
     pub system: Option<bool>,
-    /// Alternate registry URL for registry deps (M5; default registry when
+    /// Alternate registry URL for registry deps (default registry when
     /// absent). Contract C4 — frozen.
     #[serde(default)]
     pub registry: Option<String>,
-    /// Foreign-package adapter (M6): how to build a non-rivet dependency.
+    /// Foreign-package adapter: how to build a non-rivet dependency.
     /// Contract C5 — frozen.
     #[serde(default)]
     pub adapter: Option<AdapterSpec>,
@@ -440,7 +440,7 @@ pub struct Profile {
     /// Link-time optimization.
     #[serde(default)]
     pub lto: bool,
-    /// Sanitizers, e.g. `["address"]` (M7+; parsed now).
+    /// Sanitizers, e.g. `["address"]`.
     #[serde(default)]
     pub sanitizers: Vec<String>,
 }
@@ -1001,7 +1001,7 @@ pub struct ResolvedBin {
     pub name: String,
     /// Absolute entry path (file or directory, as written in `bin.path`).
     pub entry: PathBuf,
-    /// `true` when the entry is a directory (M1 whole-directory semantics).
+    /// `true` when the entry is a directory (whole-directory semantics).
     pub is_dir: bool,
 }
 
@@ -1042,7 +1042,7 @@ pub struct ResolvedLib {
     /// Library name (explicit `lib.name`, else the package name).
     pub name: String,
     /// `static` | `shared` | `header-only` (as written; `shared` is rejected
-    /// at build time until M7).
+    /// at build time — it needs an export story that does not exist yet).
     pub lib_type: String,
     /// Absolute root sources (empty for header-only).
     pub roots: Vec<PathBuf>,
@@ -1177,9 +1177,9 @@ fn has_headers(dir: &Path) -> bool {
         .any(|p| is_header(&p))
 }
 
-/// Full source list for a binary target (D17).
+/// Full source list for a binary target.
 ///
-/// Directory entries keep M1 whole-directory semantics. File entries compile
+/// Directory entries keep whole-directory semantics. File entries compile
 /// the entry plus every helper (`src/**/*.cpp` minus all target roots) when
 /// the package has no lib; with a lib, the bin is just its entry file and
 /// links the archive instead.
@@ -1294,8 +1294,8 @@ impl Dependency {
 }
 
 /// `(name, absolute dir)` for every `dependencies` entry with a `path`.
-/// Only `dependencies` are built in M2 (`devDependencies` arrive with
-/// `rivet test` in M3, `buildDependencies` with build scripts in M7).
+/// Only `dependencies` are built (`devDependencies` feed `rivet test`,
+/// `buildDependencies` feed build scripts).
 pub fn path_dependencies(manifest: &Manifest) -> Vec<(String, PathBuf)> {
     manifest
         .dependencies
@@ -1305,7 +1305,7 @@ pub fn path_dependencies(manifest: &Manifest) -> Vec<(String, PathBuf)> {
 }
 
 // ---------------------------------------------------------------------------
-// Workspace member expansion (hand-rolled globs, no new deps — D21)
+// Workspace member expansion (hand-rolled globs, no new deps)
 // ---------------------------------------------------------------------------
 
 /// Match `name` against a single path-segment pattern (`*` = any run,

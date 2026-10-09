@@ -1,6 +1,7 @@
 //! Build graph of compile/link/archive steps.
 //!
-//! M2 scope: multi-file packages with content-hash incremental rebuilds.
+//! Build graph of compile/link/archive steps for multi-file packages
+//! with content-hash incremental rebuilds.
 //!
 //! Layout (per package, per profile):
 //!
@@ -32,7 +33,7 @@ pub mod state;
 pub mod test;
 pub mod workspace;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -99,20 +100,20 @@ pub enum Error {
         /// Dependency directory.
         path: String,
     },
-    /// A git dependency was encountered (M4).
-    #[error("git dependency `{name}` is not supported yet (planned for M4). See PLAN.md")]
+    /// A git dependency was encountered outside any lock flow.
+    #[error("git dependency `{name}` is not supported here (no lockfile covers it). Fix: run `rivet update` first")]
     GitDep {
         /// Dependency name.
         name: String,
     },
-    /// A registry dependency was encountered (M5).
-    #[error("registry dependency `{name}` is not supported yet (planned for M5). See PLAN.md")]
+    /// A registry dependency was encountered outside any lock flow.
+    #[error("registry dependency `{name}` is not supported here (no lockfile covers it). Fix: run `rivet update` first")]
     RegistryDep {
         /// Dependency name.
         name: String,
     },
-    /// A `patch` entry uses a non-path source (M4 supports local paths only).
-    #[error("patch for `{name}` uses a non-path source. Fix: point it at a local `path` (registry/git patches arrive later)")]
+    /// A `patch` entry uses a non-path source (only local paths supported).
+    #[error("patch for `{name}` uses a non-path source. Fix: point it at a local `path`")]
     PatchSource {
         /// Dependency key.
         name: String,
@@ -131,8 +132,8 @@ pub enum Error {
         /// Why coverage failed.
         reason: String,
     },
-    /// A locked registry package cannot be fetched yet (M5).
-    #[error("registry package `{name}` is locked but fetching is not supported yet (planned for M5). See PLAN.md")]
+    /// A locked registry package cannot be fetched by this materializer.
+    #[error("registry package `{name}` cannot be fetched by this materializer")]
     RegistryFetch {
         /// Dependency key.
         name: String,
@@ -167,8 +168,8 @@ pub enum Error {
         /// Available names, comma-joined.
         available: String,
     },
-    /// A shared library target was encountered (M7).
-    #[error("shared library `{name}` is not supported yet (planned for M7: needs an export/SONAME story). Fix: use `\"type\": \"static\"` or `\"header-only\"` for now")]
+    /// A shared library target was encountered (needs an export/SONAME story).
+    #[error("shared library `{name}` is not supported yet (needs an export/SONAME story). Fix: use `\"type\": \"static\"` or `\"header-only\"` for now")]
     SharedLib {
         /// Library name.
         name: String,
@@ -670,6 +671,12 @@ struct Assessment {
     stale_tus: Vec<StaleTu>,
     /// `(output id, output path)` needing a link/archive step.
     stale_links: Vec<(String, PathBuf)>,
+    /// Object `(path, hash)` snapshot per output id behind the
+    /// assess-time link digest. The build reuses these for targets it
+    /// did not recompile and only re-hashes the (few) archives live, so
+    /// dependency rebuilds or swapped archives are still caught while
+    /// hundreds of objects are never read twice.
+    link_objs: BTreeMap<String, LinkSnapshot>,
 }
 
 /// Assess freshness, pruning artifacts orphaned by removed sources/targets.
@@ -724,13 +731,17 @@ fn assess(
             st.remove_link(&id);
         }
     }
-    // Stale TUs.
+    // Stale TUs. Content hashes are memoized per assessment: hundreds
+    // of TUs typically share the same SDK headers, and re-hashing those
+    // per TU dominates no-op rebuilds.
+    let mut hashes: HashMap<PathBuf, Option<String>> = HashMap::new();
     let mut stale_tus = Vec::new();
     for t in &targets {
         for job in &t.jobs {
-            let src_hash = state::hash_file(&job.src_abs)?.ok_or_else(|| Error::MissingSource {
-                path: job.src_abs.display().to_string(),
-            })?;
+            let src_hash =
+                cached_hash(&mut hashes, &job.src_abs)?.ok_or_else(|| Error::MissingSource {
+                    path: job.src_abs.display().to_string(),
+                })?;
             let stale = if !usable {
                 true
             } else {
@@ -739,7 +750,7 @@ fn assess(
                     Some(rec) => {
                         !job.obj_abs.is_file()
                             || rec.hash != src_hash
-                            || deps_changed(&rec.deps, &rec.dep_hashes)?
+                            || deps_changed(&rec.deps, &rec.dep_hashes, &mut hashes)?
                     }
                 }
             };
@@ -753,15 +764,22 @@ fn assess(
         }
     }
     // Stale links: missing output or digest mismatch over current inputs.
+    // Object hashes behind each digest are snapshotted so the build can
+    // reuse them for targets it does not recompile (archives stay live).
     let mut stale_links = Vec::new();
+    let mut link_objs = BTreeMap::new();
     for t in &targets {
-        let digest = current_link_digest(plan, t, inputs, script, fingerprint)?;
-        let stale = match digest {
+        let (digest, objs) =
+            current_link_digest(plan, t, inputs, script, fingerprint, &mut hashes)?;
+        let stale = match &digest {
             None => true,
-            Some(d) => st.link(&link_id(t)).map(|s| s != &d).unwrap_or(true),
+            Some(d) => st.link(&link_id(t)).map(|s| s != d).unwrap_or(true),
         };
         if stale {
             stale_links.push((link_id(t), t.output.clone()));
+        }
+        if digest.is_some() {
+            link_objs.insert(link_id(t), objs);
         }
     }
     Ok((
@@ -769,14 +787,32 @@ fn assess(
         Assessment {
             stale_tus,
             stale_links,
+            link_objs,
         },
     ))
 }
 
+/// Content hash with per-assessment memoization (shared headers hash once).
+fn cached_hash(
+    cache: &mut HashMap<PathBuf, Option<String>>,
+    path: &Path,
+) -> Result<Option<String>, Error> {
+    if let Some(hit) = cache.get(path) {
+        return Ok(hit.clone());
+    }
+    let hash = state::hash_file(path)?;
+    cache.insert(path.to_path_buf(), hash.clone());
+    Ok(hash)
+}
+
 /// `true` when any recorded dep hash differs from disk (missing counts).
-fn deps_changed(deps: &[String], hashes: &BTreeMap<String, String>) -> Result<bool, Error> {
+fn deps_changed(
+    deps: &[String],
+    hashes: &BTreeMap<String, String>,
+    cache: &mut HashMap<PathBuf, Option<String>>,
+) -> Result<bool, Error> {
     for dep in deps {
-        let current = state::hash_file(Path::new(dep))?;
+        let current = cached_hash(cache, Path::new(dep))?;
         if current.as_ref() != hashes.get(dep) {
             return Ok(true);
         }
@@ -793,29 +829,96 @@ fn link_id(t: &TargetBuild) -> String {
 }
 
 /// Digest over current link inputs for an output, or `None` when any input
-/// is missing (object or archive not built yet). Paths join the digest
+/// is missing (object or archive not built yet), plus the object
+/// [`LinkSnapshot`] behind the digest. Paths join the digest
 /// alongside contents so a moved-but-identical input still relinks; link
-/// search dirs and bare names join as flag strings.
+/// search dirs and bare names join as flag strings. Content hashes come
+/// from the shared memo map: shared headers and archives hash once.
 fn current_link_digest(
     plan: &PackagePlan,
     t: &TargetBuild,
     inputs: &UnitInputs,
     script: &script::ScriptUse,
     fingerprint: &str,
-) -> Result<Option<String>, Error> {
-    let mut parts = Vec::new();
+    hashes: &mut HashMap<PathBuf, Option<String>>,
+) -> Result<(Option<String>, LinkSnapshot), Error> {
+    let mut objs = Vec::new();
     for job in &t.jobs {
-        match state::hash_file(&job.obj_abs)? {
-            Some(h) => parts.push(format!("{}={h}", job.obj_abs.display())),
-            None => return Ok(None),
+        match cached_hash(hashes, &job.obj_abs)? {
+            Some(h) => objs.push((job.obj_abs.clone(), h)),
+            None => return Ok((None, Vec::new())),
         }
     }
     let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, t, inputs, script);
+    let mut archive_hashes = Vec::new();
     for archive in &archives {
-        match state::hash_file(archive)? {
-            Some(h) => parts.push(format!("{}={h}", archive.display())),
+        match cached_hash(hashes, archive)? {
+            Some(h) => archive_hashes.push((archive.clone(), h)),
+            None => return Ok((None, Vec::new())),
+        }
+    }
+    let digest = link_digest_parts(fingerprint, &objs, &archive_hashes, &lib_dirs, &sys_libs);
+    Ok((Some(digest), objs))
+}
+
+/// Object `(path, hash)` snapshot behind an assess-time link digest.
+/// The build reuses these for targets it did not recompile and only
+/// re-hashes the (few) archives live.
+type LinkSnapshot = Vec<(PathBuf, String)>;
+
+/// Link digest reusing an assess-time object snapshot: objects are
+/// provably untouched (the target was not recompiled), so only the (few)
+/// archives are hashed live. Falls back to `None` when any input is
+/// missing, exactly like [`current_link_digest`].
+fn reuse_link_digest(
+    plan: &PackagePlan,
+    t: &TargetBuild,
+    inputs: &UnitInputs,
+    script: &script::ScriptUse,
+    fingerprint: &str,
+    objs: &LinkSnapshot,
+    hashes: &mut HashMap<PathBuf, Option<String>>,
+) -> Result<Option<String>, Error> {
+    if objs.len() != t.jobs.len()
+        || objs
+            .iter()
+            .zip(t.jobs.iter())
+            .any(|((path, _), job)| path != &job.obj_abs)
+    {
+        return Ok(None);
+    }
+    let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, t, inputs, script);
+    let mut archive_hashes = Vec::new();
+    for archive in &archives {
+        match cached_hash(hashes, archive)? {
+            Some(h) => archive_hashes.push((archive.clone(), h)),
             None => return Ok(None),
         }
+    }
+    Ok(Some(link_digest_parts(
+        fingerprint,
+        objs,
+        &archive_hashes,
+        &lib_dirs,
+        &sys_libs,
+    )))
+}
+
+/// Join link digest parts: object/archive path=hash pairs plus search dirs
+/// and bare lib names as flag strings.
+fn link_digest_parts(
+    fingerprint: &str,
+    objs: &[(PathBuf, String)],
+    archives: &[(PathBuf, String)],
+    lib_dirs: &[PathBuf],
+    sys_libs: &[String],
+) -> String {
+    let mut parts = Vec::new();
+    for (path, h) in objs {
+        parts.push(format!("{}={h}", path.display()));
+    }
+    for (archive, h) in archives {
+        parts.push(format!("{}={h}", archive.display()));
     }
     for dir in lib_dirs {
         parts.push(format!("L{}", dir.display()));
@@ -823,7 +926,7 @@ fn current_link_digest(
     for name in sys_libs {
         parts.push(format!("l{name}"));
     }
-    Ok(Some(state::link_digest(fingerprint, &parts)))
+    state::link_digest(fingerprint, &parts)
 }
 
 /// Full link inputs for a target: archives (own lib, script files, dep
@@ -1071,6 +1174,9 @@ pub fn build_unit(
     }
 
     // 3. Archive the static lib (if its TUs were rebuilt or it is missing).
+    // One memo map serves the lib and bin digests below so shared
+    // archives hash once.
+    let mut build_hashes: HashMap<PathBuf, Option<String>> = HashMap::new();
     if let Some(lib) = &plan.lib {
         let lib_rebuilt = summary.recompiled.iter().any(|(tag, _)| tag == &lib.tag);
         if lib_rebuilt || !lib.output.is_file() {
@@ -1107,17 +1213,75 @@ pub fn build_unit(
             }
             summary.relinked.push(lib.output.clone());
         }
-        if let Some(digest) = current_link_digest(plan, lib, inputs, &script, &fingerprint)? {
+        // Recompiled objects changed on disk: hash everything fresh.
+        // Otherwise the assess-time object snapshot is still exact and
+        // only archives hash live, so a dependency re-archive still
+        // re-archives here instead of going stale.
+        let digest = if lib_rebuilt {
+            current_link_digest(plan, lib, inputs, &script, &fingerprint, &mut build_hashes)?.0
+        } else {
+            match assessment.link_objs.get(&link_id(lib)) {
+                Some(objs) => reuse_link_digest(
+                    plan,
+                    lib,
+                    inputs,
+                    &script,
+                    &fingerprint,
+                    objs,
+                    &mut build_hashes,
+                )?,
+                None => {
+                    current_link_digest(
+                        plan,
+                        lib,
+                        inputs,
+                        &script,
+                        &fingerprint,
+                        &mut build_hashes,
+                    )?
+                    .0
+                }
+            }
+        };
+        if let Some(digest) = digest {
             st.record_link(&link_id(lib), digest);
         }
     }
 
-    // 4. Link bins whose inputs changed (digest over current files).
+    // 4. Link bins whose inputs changed. Fresh bins reuse the assess-time
+    // object snapshot (only archives hash live); linking never modifies
+    // inputs, so the pre-link digest doubles as the post-link record and
+    // no second hashing pass runs.
     for bin in &plan.bins {
-        let digest = current_link_digest(plan, bin, inputs, &script, &fingerprint)?;
-        let needs = summary.recompiled.iter().any(|(tag, _)| tag == &bin.tag)
-            || !bin.output.is_file()
-            || digest.as_ref() != st.link(&link_id(bin));
+        let bin_rebuilt = summary.recompiled.iter().any(|(tag, _)| tag == &bin.tag);
+        let digest = if bin_rebuilt {
+            current_link_digest(plan, bin, inputs, &script, &fingerprint, &mut build_hashes)?.0
+        } else {
+            match assessment.link_objs.get(&link_id(bin)) {
+                Some(objs) => reuse_link_digest(
+                    plan,
+                    bin,
+                    inputs,
+                    &script,
+                    &fingerprint,
+                    objs,
+                    &mut build_hashes,
+                )?,
+                None => {
+                    current_link_digest(
+                        plan,
+                        bin,
+                        inputs,
+                        &script,
+                        &fingerprint,
+                        &mut build_hashes,
+                    )?
+                    .0
+                }
+            }
+        };
+        let needs =
+            bin_rebuilt || !bin.output.is_file() || digest.as_ref() != st.link(&link_id(bin));
         if !needs {
             continue;
         }
@@ -1152,7 +1316,7 @@ pub fn build_unit(
             });
         }
         summary.relinked.push(bin.output.clone());
-        if let Some(digest) = current_link_digest(plan, bin, inputs, &script, &fingerprint)? {
+        if let Some(digest) = digest {
             st.record_link(&link_id(bin), digest);
         }
     }
@@ -1596,7 +1760,7 @@ mod tests {
         let err = plan_with(&m, "dev", &fake_toolchain())
             .unwrap_err()
             .to_string();
-        assert!(err.contains("M7"), "got: {err}");
+        assert!(err.contains("not supported"), "got: {err}");
     }
 
     #[test]

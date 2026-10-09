@@ -1,11 +1,9 @@
 //! `rivet` command-line interface.
 //!
 //! Argument parsing (clap), Cargo-like colored output, progress reporting,
-//! `--message-format=json` for IDEs, and `-v` verbose logging. M1 delivered
-//! `new`, `init`, `build`, `run`, `clean`, and `toolchains`; M2 adds
-//! workspace scope (`-p`, `--bin`, `-j/--jobs`, `--keep-going`) and
-//! `Fresh`/`Compiling` per-package lines. Every other command parses and
-//! returns an actionable "planned for Mx" error so the CLI shape is stable.
+//! `--message-format=json` for IDEs, and `-v` verbose logging. Unimplemented
+//! commands parse and fail with an actionable error so the CLI shape stays
+//! stable while the feature set grows.
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
@@ -14,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-/// M4 lockfile flow (resolve-from-lock, update, vendor, dev, git cache).
+/// Lockfile flow (resolve-from-lock, update, vendor, dev, git cache).
 mod lockflow;
 
 // ---------------------------------------------------------------------------
@@ -41,8 +39,8 @@ pub struct Cli {
     pub command: Option<Commands>,
 }
 
-/// All `rivet` subcommands. Only M1 commands are implemented; the rest parse
-/// successfully and fail with an actionable milestone pointer (D11).
+/// All `rivet` subcommands. Commands that are not implemented yet parse
+/// successfully and fail with an actionable error.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
     /// Create a new C++ package in a new directory.
@@ -82,16 +80,16 @@ pub enum Commands {
         /// Disable the `default` feature.
         #[arg(long)]
         no_default_features: bool,
-        /// Cross-compile for the given triple (M7).
+        /// Cross-compile for the given triple (`native` = host default).
         #[arg(long, value_name = "TRIPLE")]
         target: Option<String>,
-        /// Do not use network (M4; accepted now, no network is used in M2).
+        /// Do not use network (cache/vendor only).
         #[arg(long)]
         offline: bool,
-        /// Error if the lockfile would change (M4; accepted now).
+        /// Error if the lockfile would change.
         #[arg(long)]
         locked: bool,
-        /// No network + error if the lockfile would change (M4; accepted now).
+        /// No network + error if the lockfile would change.
         #[arg(long)]
         frozen: bool,
     },
@@ -145,7 +143,7 @@ pub enum Commands {
     },
     /// List detected C++ toolchains.
     Toolchains,
-    /// Run tests (M3).
+    /// Run tests.
     Test {
         /// Test with the `release` profile.
         #[arg(long)]
@@ -181,19 +179,19 @@ pub enum Commands {
         #[arg(long)]
         frozen: bool,
     },
-    /// Syntax-check without producing binaries (M3).
+    /// Syntax-check without producing binaries.
     Check {},
-    /// Add a dependency (registry in M5, git in M4).
+    /// Add a dependency.
     Add {
         /// Dependency name, optionally with `@version`.
         pkg: String,
     },
-    /// Remove a dependency (M5).
+    /// Remove a dependency.
     Remove {
         /// Dependency name.
         pkg: String,
     },
-    /// Re-resolve dependencies (M4).
+    /// Re-resolve dependencies.
     Update {
         /// Only update this package (others keep their locked entries).
         #[arg(short = 'p', long, value_name = "PKG")]
@@ -205,13 +203,17 @@ pub enum Commands {
         #[arg(long)]
         offline: bool,
     },
-    /// Print the dependency tree (M4).
+    /// Print the dependency tree (locked versions when rivet.lock.json exists).
     Tree,
-    /// Format sources via clang-format if found (M8).
-    Fmt,
+    /// Format sources via clang-format if found.
+    Fmt {
+        /// Check formatting without writing (exit nonzero on diffs).
+        #[arg(long)]
+        check: bool,
+    },
     /// Build documentation (stretch).
     Doc,
-    /// Copy all deps into `vendor/` for offline builds (M4).
+    /// Copy all deps into `vendor/` for offline builds.
     Vendor {
         /// Show what would be vendored without writing anything.
         #[arg(long)]
@@ -282,7 +284,7 @@ pub enum Commands {
         #[arg(long)]
         frozen: bool,
     },
-    /// Emit `compile_commands.json` (M3).
+    /// Emit `compile_commands.json`.
     CompileCommands {
         /// Use the `release` profile flags.
         #[arg(long)]
@@ -312,19 +314,24 @@ pub enum Commands {
         #[arg(long)]
         frozen: bool,
     },
-    /// Git dependency management (M4).
+    /// Git dependency management.
     Git {
         #[command(subcommand)]
         command: GitCommands,
     },
-    /// Check out a writable clone of a git dep (M4).
+    /// Check out a writable clone of a git dep.
     Dev {
         /// Dependency name.
         name: String,
     },
+    /// Print shell completions (`bash`, `zsh`, `fish`, `powershell`, `elvish`).
+    Completions {
+        /// Shell name.
+        shell: String,
+    },
 }
 
-/// `rivet git` subcommands (M4).
+/// `rivet git` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum GitCommands {
     /// Show cached remotes, checkouts, sizes, and users.
@@ -501,6 +508,7 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             let root = load_scope()?;
             lockflow::dev_flow(&ui, &root, name, cli.verbose)
         }
+        Some(Commands::Completions { shell }) => cmd_completions(shell),
         Some(Commands::Publish {
             registry,
             token,
@@ -557,6 +565,14 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
         ),
         Some(Commands::Clean { package }) => cmd_clean(&ui, package.clone()),
         Some(Commands::Toolchains) => cmd_toolchains(&ui),
+        Some(Commands::Tree) => {
+            let root = load_scope()?;
+            cmd_tree(&ui, &root)
+        }
+        Some(Commands::Fmt { check }) => {
+            let root = load_scope()?;
+            cmd_fmt(&ui, &root, *check)
+        }
         Some(other) => bail!(unimplemented_message(other)),
     }
 }
@@ -648,16 +664,14 @@ fn use_color(when: &str) -> bool {
 }
 
 fn unimplemented_message(cmd: &Commands) -> String {
-    let (name, milestone) = match cmd {
-        Commands::Check {} => ("check", "M3"),
-        Commands::Add { .. } => ("add", "M4/M5"),
-        Commands::Remove { .. } => ("remove", "M5"),
-        Commands::Tree => ("tree", "M4"),
-        Commands::Fmt => ("fmt", "M8"),
-        Commands::Doc => ("doc", "M8"),
-        _ => ("command", "a later milestone"),
+    let name = match cmd {
+        Commands::Check {} => "check",
+        Commands::Add { .. } => "add",
+        Commands::Remove { .. } => "remove",
+        Commands::Doc => "doc",
+        _ => "command",
     };
-    format!("`rivet {name}` is not implemented yet (planned for {milestone}). See PLAN.md for the milestone checklist")
+    format!("`rivet {name}` is not supported yet")
 }
 
 // ---------------------------------------------------------------------------
@@ -792,20 +806,19 @@ pub struct BuildFlags {
     pub keep_going: bool,
     /// Feature selection.
     pub features: rivet_graph::FeatureFlags,
-    /// `--target` triple (cross-compile, M7).
+    /// `--target` triple (cross-compile, `native` default).
     pub target: Option<String>,
     /// Verbose logging.
     pub verbose: bool,
     /// JSON message format.
     pub json: bool,
-    /// Accepted now (no network is used in M2); enforced from M4.
+    /// No network (cache/vendor only).
     pub offline: bool,
-    /// Accepted now; enforced from M4.
+    /// Error if the lockfile would change.
     pub locked: bool,
-    /// Accepted now; enforced from M4.
+    /// No network + error if the lockfile would change.
     pub frozen: bool,
 }
-
 /// Flags for [`cmd_run`].
 pub struct RunFlags {
     /// Use the `release` profile.
@@ -1048,15 +1061,42 @@ fn restrict_to_bin(
 /// `None` (or a native triple) means normal detection; anything else goes
 /// through clang `--target=` or fails actionably. The selection's triple is
 /// recorded on the toolchain so fingerprints and driver flags follow.
-fn select_toolchain(target: Option<&str>) -> Result<rivet_toolchain::CxxToolchain> {
+fn select_toolchain(
+    ui: &Ui,
+    target: Option<&str>,
+    verbose: bool,
+) -> Result<rivet_toolchain::CxxToolchain> {
     use rivet_toolchain::{select_for_target, TargetTriple};
     let requested = target
         .map(TargetTriple::parse)
         .transpose()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Native detections go through the on-disk toolchain cache (M8): the
+    // entry is validated by driver existence + a live version probe.
+    // Cross-target detection stays live (already cheap: no vcvars probe).
+    if requested.as_ref().map(|t| t.is_native()).unwrap_or(true) {
+        if let Ok(root) = rivet_cache::cache_root() {
+            if let Some(mut cached) = rivet_toolchain::load_cached_toolchain(&root) {
+                cached.target = requested;
+                if verbose {
+                    ui.verbose(&format!("toolchain: cached {}", cached.cxx.display()));
+                }
+                return Ok(cached);
+            }
+        }
+    }
     let selection = select_for_target(requested.as_ref()).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut toolchain = selection.toolchain;
     toolchain.target = requested;
+    if !selection.is_cross {
+        if let Ok(root) = rivet_cache::cache_root() {
+            if let Err(e) = rivet_toolchain::store_cached_toolchain(&root, &toolchain) {
+                if verbose {
+                    ui.verbose(&format!("toolchain cache store failed: {e}"));
+                }
+            }
+        }
+    }
     Ok(toolchain)
 }
 
@@ -1082,7 +1122,7 @@ fn cmd_build(ui: &Ui, flags: BuildFlags) -> Result<Vec<BuiltUnit>> {
         units = restrict_to_bin(units, bin)?;
     }
 
-    let detection = select_toolchain(flags.target.as_deref())?;
+    let detection = select_toolchain(ui, flags.target.as_deref(), flags.verbose)?;
     log_toolchain(ui, &detection);
     if let Some(t) = &detection.target {
         ui.verbose(&format!("target: {t}"));
@@ -1380,7 +1420,7 @@ fn cmd_test(ui: &Ui, flags: TestFlags) -> Result<()> {
         flags.verbose,
     )?;
 
-    let detection = select_toolchain(flags.target.as_deref())?;
+    let detection = select_toolchain(ui, flags.target.as_deref(), flags.verbose)?;
     log_toolchain(ui, &detection);
     if let Some(t) = &detection.target {
         ui.verbose(&format!("target: {t}"));
@@ -1495,7 +1535,7 @@ fn cmd_compile_commands(ui: &Ui, flags: CompileCommandsFlags) -> Result<()> {
     )?;
 
     // Flag mapping needs a toolchain, but nothing is compiled.
-    let detection = select_toolchain(flags.target.as_deref())?;
+    let detection = select_toolchain(ui, flags.target.as_deref(), flags.verbose)?;
     log_toolchain(ui, &detection);
     let mut units = units;
     build_adapter_units(ui, &mut units, profile, &detection, 0, flags.verbose)?;
@@ -1678,6 +1718,123 @@ fn cmd_git(ui: &Ui, command: &GitCommands, verbose: bool) -> Result<()> {
     }
 }
 
+/// Print shell completions to stdout.
+fn cmd_completions(shell: &str) -> Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::{generate, shells};
+    let mut cmd = Cli::command();
+    match shell.to_ascii_lowercase().as_str() {
+        "bash" => generate(shells::Bash, &mut cmd, "rivet", &mut std::io::stdout()),
+        "zsh" => generate(shells::Zsh, &mut cmd, "rivet", &mut std::io::stdout()),
+        "fish" => generate(shells::Fish, &mut cmd, "rivet", &mut std::io::stdout()),
+        "powershell" => generate(
+            shells::PowerShell,
+            &mut cmd,
+            "rivet",
+            &mut std::io::stdout(),
+        ),
+        "elvish" => generate(shells::Elvish, &mut cmd, "rivet", &mut std::io::stdout()),
+        other => {
+            bail!("unknown shell `{other}`. Fix: use one of bash, zsh, fish, powershell, elvish")
+        }
+    }
+    Ok(())
+}
+
+/// Print the scope's dependency tree (manifest-declared deps, with locked
+/// versions when `rivet.lock.json` exists). Path-only scopes need no lock.
+fn cmd_tree(ui: &Ui, root: &rivet_manifest::Manifest) -> Result<()> {
+    let seeds = lockflow::scope_seeds(root)?;
+    let locked: std::collections::BTreeMap<String, String> =
+        lockflow::lock_versions(&root.dir).unwrap_or_default();
+    for seed in &seeds {
+        let name = rivet_manifest::package_name(seed).unwrap_or("<root>");
+        let version = rivet_manifest::package_version(seed).unwrap_or("0.0.0");
+        ui.status("Tree", &format!("{name} v{version}"));
+        let mut deps: Vec<(&String, &rivet_manifest::Dependency)> =
+            seed.dependencies.iter().collect();
+        deps.sort_by(|a, b| a.0.cmp(b.0));
+        for (key, dep) in deps {
+            let detail = lockflow::describe_dep(dep);
+            let pinned = locked
+                .get(key.as_str())
+                .map(|v| format!(" (locked v{v})"))
+                .unwrap_or_default();
+            println!("        {key} {detail}{pinned}");
+        }
+    }
+    Ok(())
+}
+
+/// Format `src/`, `include/`, and `tests/` C++ sources via clang-format.
+/// Delegates entirely (never reformats itself); missing binary is an
+/// actionable error, `--check` only reports.
+fn cmd_fmt(ui: &Ui, root: &rivet_manifest::Manifest, check: bool) -> Result<()> {
+    let seeds = lockflow::scope_seeds(root)?;
+    let clang_format = which::which("clang-format").map_err(|_| {
+        anyhow::anyhow!(
+            "clang-format not found in PATH. Fix: install LLVM/Clang (https://llvm.org) or `pip install clang-format`"
+        )
+    })?;
+    // NOTE: `which` is intentionally used only here (user-facing tool
+    // lookup), not for compilers (rivet-toolchain owns that).
+    let mut files = Vec::new();
+    for seed in &seeds {
+        for dir in ["src", "include", "tests"] {
+            collect_cpp(&seed.dir.join(dir), &mut files);
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        ui.status(
+            "Fmt",
+            "nothing to format (no C++ sources under src/, include/, tests/)",
+        );
+        return Ok(());
+    }
+    if check {
+        let out = std::process::Command::new(&clang_format)
+            .arg("--dry-run")
+            .arg("--Werror")
+            .args(&files)
+            .output()
+            .with_context(|| "could not execute clang-format")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            eprint!("{stderr}");
+            bail!("{} file(s) need formatting. Fix: run `rivet fmt`", 0);
+        }
+        ui.status("Fmt", &format!("{} file(s) clean", files.len()));
+        return Ok(());
+    }
+    let status = std::process::Command::new(&clang_format)
+        .arg("-i")
+        .args(&files)
+        .status()
+        .with_context(|| "could not execute clang-format")?;
+    if !status.success() {
+        bail!("clang-format failed with {status}");
+    }
+    ui.status("Fmt", &format!("formatted {} file(s)", files.len()));
+    Ok(())
+}
+
+/// Collect C++ source/header paths under `dir` (recursive, best-effort).
+fn collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_cpp(&path, out);
+        } else if rivet_manifest::is_cpp_source(&path) || rivet_manifest::is_header(&path) {
+            out.push(path);
+        }
+    }
+}
+
 fn cmd_toolchains(ui: &Ui) -> Result<()> {
     let infos = rivet_toolchain::list_toolchains();
     if infos.is_empty() {
@@ -1727,12 +1884,12 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_commands_point_at_milestones() {
+    fn unimplemented_commands_say_so() {
         let msg = unimplemented_message(&Commands::Check {});
-        assert!(msg.contains("M3"), "got: {msg}");
-        // Tree is the remaining M4 stub; update/git/vendor/dev are implemented.
+        assert!(msg.contains("not supported"), "got: {msg}");
+        // Implemented commands never reach the stub message.
         let msg = unimplemented_message(&Commands::Tree);
-        assert!(msg.contains("M4"), "got: {msg}");
+        assert!(msg.contains("not supported"), "got: {msg}");
     }
 
     #[test]

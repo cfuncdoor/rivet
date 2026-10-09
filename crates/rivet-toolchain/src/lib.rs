@@ -72,14 +72,14 @@ pub enum Error {
         tried: String,
     },
     /// Precompiled headers need per-TU ordering the build graph has no
-    /// model for yet (M7 verdict: actionable error, not silent fallback).
+    /// model for yet (actionable error, not silent fallback).
     #[error("precompiled headers are not supported yet ({reason}). Fix: keep headers in `include/` and `#include` them normally")]
     PchNotSupported {
         /// Why PCH cannot be expressed in the flag model.
         reason: String,
     },
     /// C++20 modules need per-toolchain scanning the build graph has no
-    /// model for yet (M7 verdict: actionable error, not silent fallback).
+    /// model for yet (actionable error, not silent fallback).
     #[error(
         "C++20 modules are not supported yet ({reason}). Fix: keep using header-based includes"
     )]
@@ -208,7 +208,7 @@ impl CxxToolchain {
     /// (only when set — native `None` keeps the historic format byte for
     /// byte, so native builds never rebuild spuriously).
     ///
-    /// Format (M3, also consumed by `rivet-graph` link digests; M4 lockfile
+    /// Format (also consumed by `rivet-graph` link digests; lockfile
     /// readers must treat it as opaque but stable within a toolchain):
     /// `<kind>|<version>|std=<std>|opt=<n>|debug=<0|1>|defines=<;>|includes=<;>`
     /// `|lto=<0|1>|sanitizers=<csv>|features=<csv>[|target=<triple>]`.
@@ -237,13 +237,14 @@ impl CxxToolchain {
         }
     }
 
-    /// Fingerprint plus the `--target` selection (M7).
+    /// Fingerprint plus the `--target` selection.
     ///
     /// This is `fingerprint()` with [`TargetSelection::target_suffix`]
     /// appended (`|target=native` by default, `|target=<triple>` when
     /// `--target` names one). `fingerprint()` itself is byte-identical to
-    /// M3 so native builds never rebuild spuriously; the coordinator uses
-    /// this variant so a target switch rebuilds exactly once.
+    /// earlier releases so native builds never rebuild spuriously; the
+    /// coordinator uses this variant so a target switch rebuilds exactly
+    /// once.
     pub fn fingerprint_with_target(
         &self,
         opts: &CompileOptions,
@@ -256,7 +257,7 @@ impl CxxToolchain {
         }
     }
 
-    /// Precompiled-header *create* flags (M7 verdict: unsupported).
+    /// Precompiled-header *create* flags (unsupported: actionable error).
     ///
     /// MSVC needs `/Yc` on exactly one TU built before all `/Yu` consumers
     /// (plus a shared `/Fp` file); GCC/Clang need the `.gch` built first
@@ -264,7 +265,7 @@ impl CxxToolchain {
     /// compiles every TU uniformly with no ordering, so no flag list here
     /// could be correct — this returns an actionable error instead of
     /// silently emitting half a PCH setup. The graph needs a PCH-aware
-    /// planning step first (future work, not M7).
+    /// planning step first.
     pub fn pch_create_flags(
         &self,
         _header: &Path,
@@ -276,7 +277,7 @@ impl CxxToolchain {
         })
     }
 
-    /// Precompiled-header *use* flags (M7 verdict: unsupported — see
+    /// Precompiled-header *use* flags (unsupported — see
     /// [`CxxToolchain::pch_create_flags`]).
     pub fn pch_use_flags(
         &self,
@@ -288,13 +289,13 @@ impl CxxToolchain {
         })
     }
 
-    /// C++20 module flags (M7 verdict: unsupported).
+    /// C++20 module flags (unsupported: actionable error).
     ///
     /// Module compilation needs a compiler-specific dependency scan first
     /// (MSVC `/scanDependencies`, Clang `-fmodule-mapper`/`--precompile`
     /// DAG, GCC `-fmodules-ts` BMI ordering) to discover the build DAG
     /// before compiling anything. Flags alone cannot express that; the
-    /// graph needs module-aware planning first (future work, not M7).
+    /// graph needs module-aware planning first.
     pub fn cxx_module_flags(&self, _opts: &CompileOptions) -> Result<Vec<OsString>, Error> {
         Err(Error::CxxModulesNotSupported {
             reason: "compilers disagree on module scanning (`/scanDependencies` vs BMI DAGs) and the build graph has no module-aware planning step yet".to_string(),
@@ -351,7 +352,7 @@ impl CxxToolchain {
 
     /// Shared flag core for a compile-only step (no dep tracking, no env).
     ///
-    /// LTO/sanitizer mapping (M3 profiles): MSVC-like `/GL` + GNU/Clang
+    /// LTO/sanitizer mapping: MSVC-like `/GL` + GNU/Clang
     /// `-flto`; sanitizers as `/fsanitize=<csv>` (MSVC-like, validated to
     /// `address`-only by [`CxxToolchain::validate_options`]) or
     /// `-fsanitize=<csv>` (GNU/Clang). `clang-cl` follows the MSVC mapping.
@@ -648,13 +649,13 @@ pub struct CompileOptions {
     pub defines: Vec<String>,
     /// Extra include directories.
     pub include_dirs: Vec<PathBuf>,
-    /// Link-time optimization (M3 profiles).
+    /// Link-time optimization.
     pub lto: bool,
-    /// Sanitizers, e.g. `["address"]` (M3 profiles; MSVC supports only
-    /// `address` — see [`CxxToolchain::validate_options`]).
+    /// Sanitizers, e.g. `["address"]` (MSVC supports only `address` — see
+    /// [`CxxToolchain::validate_options`]).
     pub sanitizers: Vec<String>,
-    /// Enabled features, sorted (M3 contract C1; fingerprint only — no flags
-    /// are derived from features).
+    /// Enabled features, sorted (fingerprint only — no flags are derived
+    /// from features).
     pub features: Vec<String>,
 }
 
@@ -837,6 +838,109 @@ pub fn detect_verbose() -> Result<Detection, Error> {
 /// Detect the default toolchain.
 pub fn detect() -> Result<CxxToolchain, Error> {
     detect_verbose().map(|d| d.toolchain)
+}
+
+/// Detection cache file name under the cache root.
+const TOOLCHAIN_CACHE_FILE: &str = "toolchain.json";
+
+/// Cached toolchain record. Env vars round-trip lossy: a mangled value
+/// breaks compilation loudly (missing `INCLUDE`), never silently, and any
+/// version drift invalidates the entry.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedToolchain {
+    kind: String,
+    cxx: PathBuf,
+    version: String,
+    msvc_env: Vec<(String, String)>,
+    ar: Option<PathBuf>,
+    found_via: String,
+}
+
+/// Load a cached toolchain: the driver (+ archiver, when recorded) must
+/// still exist and a live version probe must equal the recorded string.
+/// Anything else is a miss (the caller runs full detection). Set
+/// `RIVET_NO_TOOLCHAIN_CACHE` (non-empty) to skip the cache.
+pub fn load_cached_toolchain(cache_root: &Path) -> Option<CxxToolchain> {
+    if std::env::var_os("RIVET_NO_TOOLCHAIN_CACHE").is_some_and(|v| !v.is_empty()) {
+        return None;
+    }
+    let text = std::fs::read_to_string(cache_root.join(TOOLCHAIN_CACHE_FILE)).ok()?;
+    let cached: CachedToolchain = serde_json::from_str(&text).ok()?;
+    let kind = match cached.kind.as_str() {
+        "msvc" => ToolchainKind::Msvc,
+        "clang-cl" => ToolchainKind::ClangCl,
+        "clang" => ToolchainKind::Clang,
+        "gcc" => ToolchainKind::Gcc,
+        "mingw" => ToolchainKind::Mingw,
+        _ => return None,
+    };
+    if !cached.cxx.is_file() {
+        return None;
+    }
+    if cached.ar.as_ref().is_some_and(|ar| !ar.is_file()) {
+        return None;
+    }
+    let probe_args: &[OsString] = if matches!(kind, ToolchainKind::Msvc | ToolchainKind::ClangCl) {
+        &[]
+    } else {
+        &[OsString::from("--version")]
+    };
+    if query_version(&cached.cxx, probe_args).trim() != cached.version.trim() {
+        return None;
+    }
+    let msvc_env = if cached.msvc_env.is_empty() {
+        None
+    } else {
+        Some(
+            cached
+                .msvc_env
+                .into_iter()
+                .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+                .collect(),
+        )
+    };
+    Some(CxxToolchain {
+        kind,
+        cxx: cached.cxx,
+        version: cached.version,
+        msvc_env,
+        ar: cached.ar,
+        target: None,
+        found_via: cached.found_via,
+    })
+}
+
+/// Persist a detected toolchain for fast reuse (best-effort; the caller
+/// logs failures at `-v` and proceeds uncached).
+pub fn store_cached_toolchain(cache_root: &Path, tc: &CxxToolchain) -> Result<(), Error> {
+    let cached = CachedToolchain {
+        kind: tc.kind.to_string(),
+        cxx: tc.cxx.clone(),
+        version: tc.version.clone(),
+        msvc_env: tc
+            .msvc_env
+            .as_ref()
+            .map(|env| {
+                env.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string_lossy().into_owned(),
+                            v.to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ar: tc.ar.clone(),
+        found_via: tc.found_via.clone(),
+    };
+    let text = serde_json::to_string_pretty(&cached).map_err(|e| Error::CommandFailed {
+        what: "serialize toolchain cache".to_string(),
+        message: e.to_string(),
+    })?;
+    std::fs::create_dir_all(cache_root)?;
+    std::fs::write(cache_root.join(TOOLCHAIN_CACHE_FILE), text)?;
+    Ok(())
 }
 
 /// Probe every known toolchain for `rivet toolchains`.
@@ -1153,7 +1257,8 @@ fn msvc_from_cl_path(cl: &Path, via: &str, log: &mut Vec<String>) -> Result<CxxT
 /// - clang-cl: `llvm-lib`, else `lib` in `PATH`.
 /// - clang/gcc/MinGW: `ar`, else `llvm-ar` in `PATH`.
 ///
-/// (Cross-prefixed binutils, e.g. `x86_64-linux-gnu-ar`, are M7 work.)
+/// (Cross-prefixed binutils, e.g. `x86_64-linux-gnu-ar`, need explicit
+/// lookup support that does not exist yet.)
 fn detect_archiver(kind: ToolchainKind, cxx: &Path) -> Option<PathBuf> {
     match kind {
         ToolchainKind::Msvc => {
@@ -1576,7 +1681,7 @@ mod tests {
         let tc = fake(ToolchainKind::Gcc);
         let opts = CompileOptions::default();
         let base = tc.fingerprint(&opts);
-        // The M3 format is untouched (no spurious rebuilds) …
+        // The base format is untouched (no spurious rebuilds) …
         assert!(!base.contains("|target="), "got: {base}");
         // … and the target variant only appends.
         assert_eq!(
@@ -1616,5 +1721,64 @@ mod tests {
         let gcc = fake(ToolchainKind::Gcc);
         assert!(gcc.pch_use_flags(Path::new("pch.h"), &opts).is_err());
         assert!(gcc.cxx_module_flags(&opts).is_err());
+    }
+
+    #[test]
+    fn toolchain_cache_missing_file_is_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(load_cached_toolchain(dir.path()).is_none());
+    }
+
+    #[test]
+    fn toolchain_cache_corrupt_file_is_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("toolchain.json"), "{oops").expect("write");
+        assert!(load_cached_toolchain(dir.path()).is_none());
+    }
+
+    #[test]
+    fn toolchain_cache_unknown_kind_is_miss() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let driver = dir.path().join("cxx");
+        std::fs::write(&driver, b"fake").expect("write");
+        let text = format!(
+            "{{\"kind\":\"icc\",\"cxx\":{},\"version\":\"test\",\"msvc_env\":[],\"ar\":null,\"found_via\":\"test\"}}",
+            serde_json::to_string(&driver).expect("json"),
+        );
+        std::fs::write(dir.path().join("toolchain.json"), text).expect("write");
+        assert!(load_cached_toolchain(dir.path()).is_none());
+    }
+
+    #[test]
+    fn toolchain_cache_roundtrip_live_detection() {
+        let Ok(detected) = detect() else {
+            eprintln!("SKIP: no toolchain for cache roundtrip");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_cached_toolchain(dir.path(), &detected).expect("store");
+        let back = load_cached_toolchain(dir.path()).expect("load");
+        assert_eq!(back.cxx, detected.cxx);
+        assert_eq!(back.version, detected.version);
+        assert_eq!(back.kind.to_string(), detected.kind.to_string());
+        assert_eq!(back.ar, detected.ar);
+        assert_eq!(back.msvc_env, detected.msvc_env);
+        assert!(back.target.is_none(), "cache stores no target triple");
+    }
+
+    #[test]
+    fn toolchain_cache_version_drift_is_miss() {
+        let Ok(detected) = detect() else {
+            eprintln!("SKIP: no toolchain for cache drift check");
+            return;
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        store_cached_toolchain(dir.path(), &detected).expect("store");
+        let path = dir.path().join("toolchain.json");
+        let text = std::fs::read_to_string(&path).expect("read");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        value["version"] = serde_json::Value::String("0.0-stale".to_string());
+        std::fs::write(&path, serde_json::to_string_pretty(&value).expect("json")).expect("write");
+        assert!(load_cached_toolchain(dir.path()).is_none());
     }
 }

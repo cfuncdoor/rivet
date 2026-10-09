@@ -154,6 +154,11 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
   `cargo update`, never commit). The coordinator wires graph+CLI afterwards
   and returns API summaries for DECISIONS.md.
 
-## M8 — Polish [NOT STARTED]
-- [ ] docs/ book, shell completions, installers + release binaries,
-      GH Actions matrix (win/linux × msvc/gcc/clang), 200-file benchmark vs CMake+Ninja
+## M8 — Polish [IN PROGRESS]
+- [x] shell completions, `tree`/`fmt` commands, installers (`install.sh`,
+      `install.ps1`), `README.md`, milestone scrub
+- [x] no-op rebuild optimization (toolchain cache + link-digest reuse);
+      200-file bench: release Fresh ~0.4s wall (~0.3s in-rivet), single-TU
+      recompile+relink ~2.3s; debug Fresh ~3.4s warm wall (was ~15s)
+- [ ] docs/ book, GH Actions matrix (win/linux × msvc/gcc/clang),
+      200-file benchmark vs CMake+Ninja

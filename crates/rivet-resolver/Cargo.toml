@@ -2,7 +2,7 @@
 name = "rivet-resolver"
 version = "0.1.0"
 edition = "2021"
-description = "SemVer resolution producing rivet.lock.json (M4; stub in M1)"
+description = "SemVer resolution producing rivet.lock.json"
 license = "MIT OR Apache-2.0"
 rust-version = "1.74"
 

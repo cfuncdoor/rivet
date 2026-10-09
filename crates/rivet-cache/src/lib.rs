@@ -1,6 +1,6 @@
 //! Global cache in `~/.rivet` (registry, sources, git, built artifacts).
 //!
-//! The M7 artifact cache stores immutable build outputs under
+//! The artifact cache stores immutable build outputs under
 //! `<root>/artifacts/<key>/` so a later build with identical inputs can
 //! skip compilation entirely. The key (see [`artifact_key`]) hashes the
 //! package id, sorted features, toolchain fingerprint, profile, sorted
@@ -20,7 +20,7 @@
 //!
 //! Hook point for a future remote cache: consult it on local miss inside
 //! [`lookup`] (download + [`store`]), and upload after [`store`]. This crate
-//! stays local-only in M7.
+//! stays local-only.
 
 use std::path::{Path, PathBuf};
 

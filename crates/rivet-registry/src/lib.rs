@@ -1,11 +1,11 @@
 //! Package registry client: index reads, tarball fetch + verify + extract,
 //! deterministic packaging, login tokens, publish requests, search, and the
-//! materialize API consumed by the CLI integrator.
+//! materialize API consumed by the CLI.
 //!
-//! Milestone M5. This crate is intentionally standalone: it shares the
-//! [`RegistryIndex`] JSON-lines shape with `rivet-resolver` (contract C2/C4)
-//! but takes no dependency on it, so index files written by either side stay
-//! mutually readable.
+//! This crate is intentionally standalone: it shares the [`RegistryIndex`]
+//! JSON-lines shape with `rivet-resolver` (contract C2/C4) but takes no
+//! dependency on it, so index files written by either side stay mutually
+//! readable.
 //!
 //! # Index layouts
 //!
@@ -55,14 +55,14 @@
 //! (see [`auth`]). Unix files are chmodded `0600` best-effort; Windows has
 //! no std chmod equivalent, so login warns there.
 //!
-//! # Publish wire format (M5)
+//! # Publish wire format
 //!
 //! `PUT <registry-url>/publish/<name>/<version>` with the gzip tarball as
 //! the body, `Content-Type: application/gzip`, `Authorization: Bearer
 //! <token>`, `X-Rivet-Checksum: sha256:…`, plus optional
 //! `X-Rivet-Description` / `X-Rivet-Deps` (JSON) metadata headers. The
 //! registry server arrives later; [`publish::build_publish_request`]
-//! constructs the request for unit tests and the future CLI.
+//! constructs the request for unit tests and the CLI.
 
 mod auth;
 mod fetch;

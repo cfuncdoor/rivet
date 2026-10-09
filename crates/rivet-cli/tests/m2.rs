@@ -1,4 +1,4 @@
-//! M2 acceptance tests: multi-file builds, content-hash incrementality,
+//! Acceptance tests: multi-file builds, content-hash incrementality,
 //! depfile header tracking, static lib + bin, path deps, workspaces.
 //! All tests run a real C++ compiler in temp dirs.
 
@@ -547,7 +547,7 @@ fn keep_going_reports_all_failures() {
 }
 
 #[test]
-fn shared_and_registry_deps_fail_with_milestones() {
+fn shared_and_unindexed_deps_fail_actionably() {
     // No compiler needed: both fail during planning, before detection.
     let dir = TempDir::new().unwrap();
     let pkg = dir.path().join("app");
@@ -561,7 +561,7 @@ fn shared_and_registry_deps_fail_with_milestones() {
         .arg("build")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("M7"));
+        .stderr(predicate::str::contains("not supported"));
 
     let pkg2 = dir.path().join("app2");
     write_pkg(
@@ -574,5 +574,5 @@ fn shared_and_registry_deps_fail_with_milestones() {
         .arg("build")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("M5"));
+        .stderr(predicate::str::contains("not in the local index copy"));
 }

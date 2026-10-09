@@ -1,4 +1,4 @@
-//! Registry index reads: local directory (primary, M4-compatible) and sparse
+//! Registry index reads: local directory (primary) and sparse
 //! HTTPS (`<registry-url>/index/<name>`), with yank filtering and semver
 //! selection using the same `semver`-crate semantics as `rivet-resolver`
 //! (caret requirements, max satisfying version wins, pre-releases only match
@@ -98,7 +98,7 @@ enum IndexSource {
     Sparse(String),
 }
 
-/// M4-compatible JSON-lines registry index reader.
+/// JSON-lines registry index reader.
 #[derive(Debug, Clone)]
 pub struct RegistryIndex {
     source: IndexSource,

@@ -1,9 +1,9 @@
-//! Feature activation (contract C1 — frozen, shared with the M4 resolver).
+//! Feature activation (contract C1 — frozen, shared with the resolver).
 //!
 //! A package's `features` table maps feature names to entries. An entry is
 //! either `dep:<name>` (enables the optional dependency `<name>`) or another
 //! feature name: a same-package name enables it transitively; anything else
-//! (e.g. cross-package `other/feat` syntax) is left for the M4 resolver and
+//! (e.g. cross-package `other/feat` syntax) is left for the resolver and
 //! ignored here.
 //!
 //! Enabled features per package = union of: `default` (unless
@@ -36,7 +36,7 @@ pub struct FeatureFlags {
 /// Errors on unknown requested names and on `dep:` entries (of enabled
 /// features only) that name nonexistent or non-optional dependencies.
 ///
-/// This is the strict per-package helper the M4 resolver reuses with
+/// This is the strict per-package helper the resolver reuses with
 /// package-targeted request lists (e.g. from the lockfile's per-package
 /// `features`). Command-line requests, which name features of the selected
 /// packages, go through [`activated_features_lenient`] + a scope-wide
@@ -85,8 +85,8 @@ pub fn activated_features(
             if table.contains_key(entry) && enabled.insert(entry.clone()) {
                 queue.push_back(entry.clone());
             }
-            // Anything else (e.g. `other-pkg/feat`) belongs to the M4
-            // resolver's cross-package unification; ignored here (D24).
+            // Anything else (e.g. `other-pkg/feat`) belongs to cross-package
+            // unification in the resolver; ignored here.
         }
     }
     // Validate `dep:` entries of enabled features (disabled features may

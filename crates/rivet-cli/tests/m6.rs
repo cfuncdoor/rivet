@@ -1,4 +1,4 @@
-//! M6 acceptance tests: foreign adapters end-to-end (CMake), system
+//! Acceptance tests: foreign adapters end-to-end (CMake), system
 //! probing errors, git+adapter combos. CMake tests skip when `cmake` is
 //! absent; the real-zlib test additionally needs `RIVET_TEST_NETWORK=1`.
 
@@ -69,7 +69,7 @@ fn git(cwd: &Path, args: &[&str]) {
         .args(args)
         .current_dir(cwd)
         .status()
-        .expect("git binary must exist for M6 tests");
+        .expect("git binary must exist for these tests");
     assert!(status.success(), "git {args:?} failed in {}", cwd.display());
 }
 

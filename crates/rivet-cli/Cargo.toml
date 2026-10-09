@@ -18,6 +18,8 @@ rivet-adapters = { path = "../rivet-adapters" }
 rivet-buildscript = { path = "../rivet-buildscript" }
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "color"] }
+clap_complete = "4.5"
+which = "7.0"
 serde_json = "1.0"
 
 [dev-dependencies]

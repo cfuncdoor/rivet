@@ -2,7 +2,7 @@
 name = "rivet-cache"
 version = "0.1.0"
 edition = "2021"
-description = "Global cache in ~/.rivet (stub in M1)"
+description = "Global cache in ~/.rivet (registry, sources, git, built artifacts)"
 license = "MIT OR Apache-2.0"
 rust-version = "1.74"
 

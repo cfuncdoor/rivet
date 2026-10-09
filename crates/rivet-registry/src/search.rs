@@ -2,7 +2,7 @@
 //! name/description, returning the latest non-yanked version per package.
 //!
 //! Only local index copies are searchable (a sparse registry has no package
-//! listing endpoint in M5 — the CLI syncs an index copy first, then
+//! listing endpoint — the CLI syncs an index copy first, then
 //! searches it offline).
 
 use std::path::Path;

@@ -44,6 +44,7 @@
               "rev": { "type": "string" },
               "subdir": { "type": "string" },
               "submodules": { "type": "boolean" },
+              "optional": { "type": "boolean" },
               "package": {
                 "type": "object",
                 "required": ["name"],

@@ -323,6 +323,11 @@ pub struct DependencyDetail {
     /// Whether to fetch git submodules.
     #[serde(default)]
     pub submodules: Option<bool>,
+    /// Whether this dependency is optional, enabled via `features`
+    /// (`dep:<name>` entries). Optional deps are skipped unless activated
+    /// (M3 features, M4 resolver). Contract C1 — frozen.
+    #[serde(default)]
+    pub optional: Option<bool>,
     /// Inline package block for git deps without their own `rivet.json` (M4+).
     #[serde(default)]
     pub package: Option<InlinePackage>,
@@ -1203,6 +1208,14 @@ impl Dependency {
         match self {
             Self::Detailed(d) => d.path.as_deref(),
             Self::Simple(_) => None,
+        }
+    }
+
+    /// `true` when this dep is optional (activated via `features`).
+    pub fn is_optional(&self) -> bool {
+        match self {
+            Self::Detailed(d) => d.optional.unwrap_or(false),
+            Self::Simple(_) => false,
         }
     }
 

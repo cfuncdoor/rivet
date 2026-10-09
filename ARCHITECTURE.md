@@ -91,6 +91,19 @@ scratch dir (same-name collisions refused). `publish` (deterministic
 packaging, bearer auth, `--dry-run`), `login` (token store), `search`
 (local index), `install` (`~/.rivet/bin`) round out package management.
 
+## Foreign adapters (M6)
+
+Non-rivet sources build through `rivet-adapters`: CMake (`cmake -S/-B`
++ `cmake --build`, static-preferred discovery), Meson/Make best-effort,
+`pkg-config`/`system` probes for installed libraries. Schemaless deps
+resolve via the inline `package` block; `system: true` locks a system
+entry and probes at build. Adapter units build into scratch dirs under
+their target tree (never into immutable checkouts) with
+source+spec+toolchain fingerprint gating; outputs (includes, lib files,
+bare names, defines) feed dependents' compile and link lines. An adapter
+plus explicit `bin`/`lib` targets is contradictory and errors; lib
+conventions defer to the adapter.
+
 ## Profiles / features (M3)
 
 Manifest `profile.dev|release` carry `opt`/`debug`/`lto`/`sanitizers`

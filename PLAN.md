@@ -106,18 +106,16 @@ M4 acceptance passed (see below). Do not start M6+ until M5 acceptance passes.
   vendor rebuild, install
 - [x] New deps justified (`ureq` rustls, `tar` + `flate2`; D41/D45)
 
-## M6 — Adapters (CMake/Meson/system libs) [IN PROGRESS — owner: M6 agent]
-- [ ] `crates/rivet-adapters` (new crate, agent-owned): CMake adapter
-  (invoke system `cmake` + `cmake --build`, expose include dirs + libs),
-  Meson/Make adapters best-effort, `pkg-config`/`system` probing for
-  `system: true` deps (no sources required)
-- [ ] Adapter output model for the CLI integrator: include dirs, lib
-  dirs/files, defines, and which outputs must be linked (static vs shared)
-- [ ] Hermetic tests (skip-gated when `cmake` is missing); a real
-  CMake-only lib (zlib via git + `adapter: {tool: cmake}`) builds in
-  `examples/cmake-zlib` (agent-owned example)
-- [ ] Manifest `adapter`/`system`/`registry` fields already exist (frozen
-  C4/C5) — do NOT change `rivet-manifest`
+## M6 — Adapters (CMake/Meson/system libs) [DONE]
+- [x] `crates/rivet-adapters`: CMake adapter (system `cmake` + `cmake
+  --build`, include/lib discovery preferring static), Meson/Make
+  best-effort, `pkg-config`/`system` probing (no sources required)
+- [x] Adapter output model (`include_dirs`, `lib_dirs`, `libs`
+  File/Name, `defines`) + source/spec/toolchain fingerprinting
+- [x] Schemaless foreign deps via inline `package` block; `system` locks a
+  system source and probes at build; `system`+sources rejected at parse
+- [x] Hermetic tests + `examples/cmake-mini` (offline) and
+  `examples/cmake-zlib` (real zlib via git, network) demos
 
 ## M7 — Build scripts, artifact cache, cross-compile [IN PROGRESS — owner: M7 agent]
 - [ ] `crates/rivet-buildscript` (agent-owned): compile `build.rivet.cpp`

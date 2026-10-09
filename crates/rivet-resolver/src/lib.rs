@@ -358,6 +358,13 @@ pub enum LockSource {
         /// `sha^{tree}` at resolve time.
         tree: String,
     },
+    /// Installed system library (probed at build time, never fetched).
+    /// Added for M6 (C2 amendment): the `version` records the requirement
+    /// as written.
+    System {
+        /// Required version (`*` when the dep states none).
+        version: String,
+    },
 }
 
 /// A locked git ref: `{"kind":"tag"|"branch"|"rev","value":"…"}`.
@@ -1004,6 +1011,9 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
         let mut checksums: BTreeMap<String, Option<String>> = BTreeMap::new();
         let mut enabled_by: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         let mut registry_reqs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        // Requested registry per package (first wins; conflicts error out
+        // at request time). Transitive index deps inherit their parent's.
+        let mut registry_urls: BTreeMap<String, String> = BTreeMap::new();
         // Same-URL rule state: url -> (kind, value, sha).
         let mut git_urls: BTreeMap<String, (String, String, String)> = BTreeMap::new();
 
@@ -1042,9 +1052,59 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
             }
 
             for (dep_name, dep) in active_deps(&manifest, &activated) {
+                if is_system_dep(&dep) {
+                    // Installed system library: no sources, no manifest.
+                    // The version records the requirement as written (`*`
+                    // when absent); presence is probed at build time.
+                    let req = match &dep {
+                        Dependency::Simple(s) => s.clone(),
+                        Dependency::Detailed(d) => {
+                            d.version.clone().unwrap_or_else(|| "*".to_string())
+                        }
+                    };
+                    if let Some(prev) = versions.get(&dep_name) {
+                        if prev != &req {
+                            return Err(Error::DuplicatePackage {
+                                name: dep_name.clone(),
+                                detail: format!("system dep version {prev} vs {req}"),
+                                hint: "unify on one requirement for the system dependency"
+                                    .to_string(),
+                            });
+                        }
+                    } else {
+                        versions.insert(dep_name.clone(), req.clone());
+                        sources.insert(dep_name.clone(), LockSource::System { version: req });
+                        checksums.insert(dep_name.clone(), None);
+                    }
+                    parent
+                        .entry(dep_name.clone())
+                        .or_insert_with(|| key.clone());
+                    continue;
+                }
                 if let Some(path) = dep.path().map(str::to_string) {
                     let dir = manifest.dir.join(&path);
-                    let child = self.provider.load_path_manifest(&dir)?;
+                    // Adapter/system foreign sources may carry no rivet.json:
+                    // fall back to the inline `package` block like git deps.
+                    let child = match self.provider.load_path_manifest(&dir) {
+                        Ok(m) => m,
+                        Err(Error::MissingManifest { .. }) => match &dep {
+                            Dependency::Detailed(d)
+                                if d.adapter.is_some() || is_system_dep(&dep) =>
+                            {
+                                inline_for(&dep_name, &d.package)?
+                            }
+                            _ => {
+                                return Err(Error::MissingManifest {
+                                    where_: dir.display().to_string(),
+                                    message: format!(
+                                        "path dep `{dep_name}` has no rivet.json"
+                                    ),
+                                    hint: "add a rivet.json there or use an inline `package = { name, version }` block (required without rivet.json when an adapter applies)".to_string(),
+                                });
+                            }
+                        },
+                        Err(other) => return Err(other),
+                    };
                     let child_pkg =
                         child
                             .package
@@ -1225,13 +1285,36 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
                             d.version.clone().unwrap_or_else(|| "*".to_string())
                         }
                     };
+                    let url = match &dep {
+                        Dependency::Detailed(d) => {
+                            d.registry.clone().unwrap_or_else(|| "default".to_string())
+                        }
+                        Dependency::Simple(_) => "default".to_string(),
+                    };
                     // Validate req shape now (actionable, even if unified later).
                     semver::VersionReq::parse(&req).map_err(|e| Error::InvalidReq {
                         dep: dep_name.clone(),
                         req: req.clone(),
                         detail: e.to_string(),
                     })?;
-                    registry_reqs.entry(dep_name).or_default().push(req);
+                    registry_reqs.entry(dep_name.clone()).or_default().push(req);
+                    match registry_urls.entry(dep_name.clone()) {
+                        std::collections::btree_map::Entry::Vacant(e) => {
+                            e.insert(url);
+                        }
+                        std::collections::btree_map::Entry::Occupied(e) => {
+                            if e.get() != &url {
+                                return Err(Error::DuplicatePackage {
+                                    name: dep_name.clone(),
+                                    detail: format!(
+                                        "same package requested from two registries (`{}` vs `{url}`)",
+                                        e.get()
+                                    ),
+                                    hint: "unify on one registry for the package".to_string(),
+                                });
+                            }
+                        }
+                    }
                 }
             }
             expanded.insert(key.clone());
@@ -1306,10 +1389,14 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
             // Non-empty (checked above): the maximum satisfying version wins.
             let best_e: &IndexEntry = matching.last().map(|(_, e)| *e).unwrap_or(&entries[0]);
             versions.insert(name.clone(), best_e.version.clone());
+            let registry = registry_urls
+                .get(&name)
+                .cloned()
+                .unwrap_or_else(|| "default".to_string());
             sources.insert(
                 name.clone(),
                 LockSource::Registry {
-                    registry: "default".to_string(),
+                    registry: registry.clone(),
                     version: best_e.version.clone(),
                     checksum: best_e.checksum.clone(),
                 },
@@ -1318,6 +1405,7 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
             // Transitive index deps (non-optional only in the M4 stub).
             // Re-queue only when a genuinely new requirement appears, so
             // index cycles (a -> b -> a) terminate instead of ping-ponging.
+            // Transitives inherit the parent's registry.
             let transitive: Vec<IndexDep> = best_e.deps.clone();
             for dep in &transitive {
                 if dep.optional {
@@ -1328,6 +1416,9 @@ impl<'a, P: SourceProvider> Resolver<'a, P> {
                     continue;
                 }
                 reqs.push(dep.req.clone());
+                registry_urls
+                    .entry(dep.name.clone())
+                    .or_insert_with(|| registry.clone());
                 if done_registry.contains(&dep.name) {
                     done_registry.remove(&dep.name);
                 }
@@ -1402,6 +1493,29 @@ fn inline_manifest(
     })?;
     let text = format!("{{\"package\": {{\"name\": \"{name}\", \"version\": \"{version}\"}}}}");
     Ok(rivet_manifest::parse_str(&text)?)
+}
+
+/// Synthesize a leaf manifest from an inline `package` block (adapter and
+/// system deps without their own `rivet.json`).
+fn inline_for(
+    dep_name: &str,
+    inline: &Option<rivet_manifest::InlinePackage>,
+) -> Result<Manifest, Error> {
+    let inline = inline.as_ref().ok_or_else(|| Error::MissingManifest {
+        where_: dep_name.to_string(),
+        message: "foreign dep has no rivet.json and no inline `package` block".to_string(),
+        hint: "add a rivet.json to the source or an inline `package = { name, version }` block"
+            .to_string(),
+    })?;
+    inline_manifest(dep_name, inline.name.clone(), inline.version.clone())
+}
+
+/// `true` for `{"system": true}` deps (probed, never built from sources).
+fn is_system_dep(dep: &Dependency) -> bool {
+    match dep {
+        Dependency::Detailed(d) => d.system.unwrap_or(false),
+        Dependency::Simple(_) => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1661,6 +1775,68 @@ mod tests {
         let lock2 = resolve_with(&root_off, &opts, idx.path(), &p).expect("resolve");
         assert_eq!(lock2.packages.len(), 1);
         assert_eq!(lock2.packages[0].name, "opt");
+    }
+
+    #[test]
+    fn system_dep_locks_without_sources() {
+        let root = root_manifest("\"z\": {\"system\": true, \"version\": \"1.2\"}", "");
+        let idx = temp_index(&[]);
+        let p = TestProvider::new();
+        let lock = resolve_with(&root, &ResolveOpts::default(), idx.path(), &p).expect("resolve");
+        assert_eq!(lock.packages.len(), 1);
+        match &lock.packages[0].source {
+            LockSource::System { version } => assert_eq!(version, "1.2"),
+            other => panic!("expected system source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn per_dep_registry_url_locked() {
+        let root = root_manifest(
+            "\"a\": {\"version\": \"1\", \"registry\": \"https://r.example.com\"}",
+            "",
+        );
+        let idx = temp_index(&[("a", &index_line("1.2.0", "sha256:x", false, ""))]);
+        let p = TestProvider::new();
+        let lock = resolve_with(&root, &ResolveOpts::default(), idx.path(), &p).expect("resolve");
+        match &lock.packages[0].source {
+            LockSource::Registry { registry, .. } => {
+                assert_eq!(registry, "https://r.example.com")
+            }
+            other => panic!("expected registry source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adapter_path_dep_uses_inline_block() {
+        let root = root_manifest(
+            "\"mini\": {\"path\": \"../mini\", \"adapter\": {\"tool\": \"cmake\"}, \"package\": {\"name\": \"mini\", \"version\": \"0.3.0\"}}",
+            "",
+        );
+        // No seeded manifest: the inline block substitutes (adapter source).
+        let idx = temp_index(&[]);
+        let p = TestProvider::new();
+        let lock = resolve_with(&root, &ResolveOpts::default(), idx.path(), &p).expect("resolve");
+        assert_eq!(lock.packages.len(), 1);
+        assert_eq!(lock.packages[0].name, "mini");
+        assert_eq!(lock.packages[0].version, "0.3.0");
+        match &lock.packages[0].source {
+            LockSource::Path { path } => assert_eq!(path, "../mini"),
+            other => panic!("expected path source, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adapter_path_dep_without_inline_errors() {
+        let root = root_manifest(
+            "\"mini\": {\"path\": \"../mini\", \"adapter\": {\"tool\": \"cmake\"}}",
+            "",
+        );
+        let idx = temp_index(&[]);
+        let p = TestProvider::new();
+        let err =
+            resolve_with(&root, &ResolveOpts::default(), idx.path(), &p).expect_err("missing");
+        assert!(matches!(err, Error::MissingManifest { .. }), "got: {err}");
     }
 
     #[test]

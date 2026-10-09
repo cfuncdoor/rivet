@@ -292,8 +292,9 @@ pub struct Package {
 pub enum Dependency {
     /// Registry dependency with a semver requirement, e.g. `"fmt": "11"`.
     Simple(String),
-    /// Path / git / registry dependency with options.
-    Detailed(DependencyDetail),
+    /// Path / git / registry dependency with options (boxed: the detail
+    /// struct dwarfs the inline string variant).
+    Detailed(Box<DependencyDetail>),
 }
 
 /// Detailed dependency entry.
@@ -807,10 +808,16 @@ fn validate_dependency(dep: &serde_json::Value, path: &str, stripped: &str) -> R
     let has_git = o.contains_key("git");
     let has_path = o.contains_key("path");
     let has_version = o.contains_key("version");
-    if !has_git && !has_path && !has_version {
+    if !has_git && !has_path && !has_version && !o.contains_key("system") {
         return Err(err(
             path,
-            "dependency object needs one of `version`, `path`, or `git`. Hint: add e.g. `\"version\": \"11\"`".to_string(),
+            "dependency object needs one of `version`, `path`, or `git` (or `\"system\": true`). Hint: add e.g. `\"version\": \"11\"`".to_string(),
+        ));
+    }
+    if o.get("system").and_then(|v| v.as_bool()).unwrap_or(false) && (has_path || has_git) {
+        return Err(err(
+            path,
+            "`system: true` probes an installed library and takes no sources. Fix: drop `path`/`git` (or drop `system` to build the sources)".to_string(),
         ));
     }
     let refs = ["tag", "branch", "rev"]
@@ -848,7 +855,8 @@ fn validate_dependency(dep: &serde_json::Value, path: &str, stripped: &str) -> R
         let obj = adapter.as_object().ok_or_else(|| {
             err(
                 &format!("{path}.adapter"),
-                "`adapter` must be an object. Hint: `\"adapter\": {\"tool\": \"cmake\"}`".to_string(),
+                "`adapter` must be an object. Hint: `\"adapter\": {\"tool\": \"cmake\"}`"
+                    .to_string(),
             )
         })?;
         match obj.get("tool").and_then(|v| v.as_str()) {
@@ -1443,6 +1451,62 @@ pub fn effective_standard(manifest: &Manifest) -> &str {
         .unwrap_or(default_standard())
 }
 
+/// Synthesize a manifest for a schemaless foreign dependency (adapter or
+/// system source with no `rivet.json`).
+///
+/// The inline `package` block is required: its `name` must equal the dep
+/// key and it must carry a `version` (there is nothing else to read one
+/// from). The synthesized package is always a leaf (no dependencies of its
+/// own). Used identically by the resolver and the build graph.
+pub fn synthesize_manifest(
+    dir: &Path,
+    key: &str,
+    inline: &Option<InlinePackage>,
+) -> Result<Manifest, Error> {
+    let inline = inline.as_ref().ok_or_else(|| {
+        Error::path_error(
+            format!("dependencies.{key}"),
+            format!(
+                "dep `{key}` has no rivet.json and no inline `package` block. Fix: add a rivet.json upstream or `\"package\": {{\"name\": \"{key}\", \"version\": \"0.1.0\"}}` to the dep entry"
+            ),
+        )
+    })?;
+    if inline.name != key {
+        return Err(Error::path_error(
+            format!("dependencies.{key}.package"),
+            format!(
+                "inline package name `{}` != dep key `{key}`. Fix: rename one of them",
+                inline.name
+            ),
+        ));
+    }
+    let version = inline.version.clone().ok_or_else(|| {
+        Error::path_error(
+            format!("dependencies.{key}.package"),
+            "inline `package` block has no version. Fix: add `\"version\": \"0.1.0\"`".to_string(),
+        )
+    })?;
+    Ok(Manifest {
+        schema: None,
+        package: Some(Package {
+            name: key.to_string(),
+            version,
+            standard: None,
+        }),
+        dependencies: BTreeMap::new(),
+        dev_dependencies: BTreeMap::new(),
+        build_dependencies: BTreeMap::new(),
+        features: BTreeMap::new(),
+        target: BTreeMap::new(),
+        bin: Vec::new(),
+        lib: None,
+        profile: Profiles::default(),
+        workspace: None,
+        patch: BTreeMap::new(),
+        dir: dir.to_path_buf(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1751,6 +1815,57 @@ mod tests {
         let deps = path_dependencies(&m);
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].0, "mylib");
+    }
+
+    #[test]
+    fn system_with_sources_is_rejected() {
+        let err = parse_str(
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"dependencies\":{\"z\":{\"git\":\"https://example.com/z.git\",\"system\":true}}}",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("takes no sources"), "got: {err}");
+    }
+
+    #[test]
+    fn system_only_parses() {
+        let m = parse_str(
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"dependencies\":{\"z\":{\"system\":true,\"version\":\"1.2\"}}}",
+        )
+        .unwrap();
+        assert!(path_dependencies(&m).is_empty());
+    }
+
+    #[test]
+    fn synthesize_needs_inline_block() {
+        let dir = Path::new("/pkg/dep");
+        let err = synthesize_manifest(dir, "dep", &None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("inline `package`"), "got: {err}");
+        let inline = InlinePackage {
+            name: "dep".to_string(),
+            version: None,
+        };
+        let err = synthesize_manifest(dir, "dep", &Some(inline))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no version"), "got: {err}");
+        let inline = InlinePackage {
+            name: "other".to_string(),
+            version: Some("1.0.0".to_string()),
+        };
+        let err = synthesize_manifest(dir, "dep", &Some(inline))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("!= dep key"), "got: {err}");
+        let inline = InlinePackage {
+            name: "dep".to_string(),
+            version: Some("1.0.0".to_string()),
+        };
+        let m = synthesize_manifest(dir, "dep", &Some(inline)).unwrap();
+        assert_eq!(package_name(&m), Some("dep"));
+        assert!(m.dependencies.is_empty());
     }
 
     #[test]

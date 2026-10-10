@@ -1,6 +1,10 @@
 {
   "name": "rivet",
   "displayName": "Rivet (Cargo for C++)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cfuncdoor/rivet.git"
+  },
   "description": "Configures C/C++ IntelliSense from your rivet build, so project and dependency headers resolve with no squiggles.",
   "version": "0.1.0",
   "publisher": "cfuncdoor",

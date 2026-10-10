@@ -1,5 +1,6 @@
 //! Tool lookup + subprocess runner shared by all adapters.
 
+#[cfg(windows)]
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -15,6 +15,12 @@ use super::Error;
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
 /// FNV-1a 64 prime.
 const FNV_PRIME: u64 = 0x100000001b3;
+/// Adapter behavior version, folded into every fingerprint. Bump on any
+/// behavior-affecting adapter change that the spec alone would not
+/// capture (default flags, discovery rules, output layout).
+/// v1: static-CRT defaults (`CMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`,
+/// meson `b_vscrt=mt`).
+const FINGERPRINT_VERSION: u64 = 1;
 
 /// Feed `bytes` into the FNV-1a 64 accumulator.
 fn feed(mut hash: u64, bytes: &[u8]) -> u64 {
@@ -99,8 +105,11 @@ fn spec_string(spec: &AdapterSpec, options: &BTreeMap<String, String>) -> String
 ///
 /// Any change — source bytes added/removed/modified, target list or
 /// option edited, toolchain fingerprint changed — flips the value, so the
-/// integrator can treat inequality as "rebuild". The format is stable
-/// within a rivet release but not a cross-version contract.
+/// integrator can treat inequality as "rebuild". [`FINGERPRINT_VERSION`]
+/// is fed in too: bump it whenever adapter *behavior* changes without a
+/// spec change (e.g. new default flags), so existing build dirs rebuild
+/// once instead of going stale. The format is stable within a rivet
+/// release but not a cross-version contract.
 pub fn fingerprint(
     source_dir: &Path,
     spec: &AdapterSpec,
@@ -115,6 +124,7 @@ pub fn fingerprint(
         });
     }
     let mut hash = FNV_OFFSET;
+    hash = feed(hash, &FINGERPRINT_VERSION.to_le_bytes());
     // Bind the absolute location too: two different checkouts with
     // identical bytes still rebuild independently (their outputs live in
     // different scratch dirs).

@@ -4,9 +4,9 @@
 //! ```text
 //! cmake -S <src> -B <build> -DCMAKE_BUILD_TYPE=<type>
 //!       -DCMAKE_INSTALL_PREFIX=<build>/install
+//!       -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
 //!       [-DCMAKE_CXX_COMPILER=<tc.cxx> [-DCMAKE_C_COMPILER=<sibling>]]
 //!       [-Dkey=value ...]
-//! cmake --build <build> --config <type> [--target t ...] [--parallel N]
 //! ```
 //! `--config` is required by multi-config generators (Visual Studio is the
 //! Windows default) and ignored by single-config ones. One `--target` flag
@@ -112,11 +112,30 @@ pub(crate) fn configure_args(
             }
         }
     }
+    // Rivet never sets a C runtime flag, so its objects always use the
+    // driver default (`/MT` on MSVC). The foreign build must agree or
+    // the link fails with LNK2038 (`_ITERATOR_DEBUG_LEVEL` /
+    // `RuntimeLibrary` mismatch against CMake's own `/MDd` default), so
+    // pin the static CRT unless the spec overrides it. Inert for
+    // non-MSVC generators (needs CMake 3.15+; older ones warn that the
+    // variable was not used and keep their default).
+    if !spec_has_option(spec, "CMAKE_MSVC_RUNTIME_LIBRARY") {
+        args.push(OsString::from("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"));
+    }
     for (key, value) in &spec.options {
         let key = key.strip_prefix("-D").unwrap_or(key);
         args.push(OsString::from(format!("-D{key}={value}")));
     }
     args
+}
+
+/// `true` when `spec.options` sets `key`, with or without a `-D` prefix
+/// (the configure loop accepts both spellings).
+fn spec_has_option(spec: &AdapterSpec, key: &str) -> bool {
+    spec.options.keys().any(|k| {
+        let bare = k.strip_prefix("-D").unwrap_or(k);
+        bare == key
+    })
 }
 
 /// `cmake --build dir --config type [--target t …] [--parallel N]`.
@@ -230,6 +249,33 @@ mod tests {
             !args.iter().any(|a| a.starts_with("-DCMAKE_CXX_COMPILER=")),
             "got: {args:?}"
         );
+        // Static CRT default (matches rivet's own objects).
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"),
+            "got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn configure_args_runtime_override_wins() {
+        let ctx = AdapterCtx::new(PathBuf::from("build"));
+        for key in ["CMAKE_MSVC_RUNTIME_LIBRARY", "-DCMAKE_MSVC_RUNTIME_LIBRARY"] {
+            let s = spec(&[], &[(key, "MultiThreadedDebug")]);
+            let args = args_to_strings(&configure_args(Path::new("src"), &s, &ctx));
+            assert_eq!(
+                args.iter()
+                    .filter(|a| a.starts_with("-DCMAKE_MSVC_RUNTIME_LIBRARY="))
+                    .count(),
+                1,
+                "got: {args:?}"
+            );
+            assert!(
+                args.iter()
+                    .any(|a| a == "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebug"),
+                "got: {args:?}"
+            );
+        }
     }
 
     #[test]

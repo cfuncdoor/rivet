@@ -35,10 +35,16 @@ Non-rivet sources build through adapters — `cmake`, `meson`, `make`,
 into immutable checkouts), gated by source+spec+toolchain fingerprints.
 The `sources` adapter compiles a schemaless tree's top-level C++
 sources with the rivet toolchain into a static archive (subdirectories
-are ignored; flags follow the profile like native builds).
+are ignored; flags follow the profile like native builds, always at
+the default `c++17` — a dep needing newer features needs a real build
+system or manifest).
 Adapter outputs (includes, archives, bare names, defines) feed
 dependents like native targets. Bare `.dll`s never link (only import
 libs do); on MSVC, linker inputs follow `/link` (D57).
+Rivet never sets a C-runtime flag (driver default `/MT`), so the
+cmake/meson adapters pin the static CRT (`MultiThreaded` /
+`b_vscrt=mt`, overridable via `options`) — otherwise their own
+`/MDd` default fails the link with LNK2038 against rivet objects.
 
 ## Caching and targets
 

@@ -32,8 +32,11 @@ strict-JSON, sorted-key lockfile `rivet.lock.json`.
 ## Fields
 
 - `package`: `name` (`[a-zA-Z0-9_-]+`), `version` (SemVer
-  `major.minor.patch`), optional `standard` (e.g. `c++17`, default
-  `c++17`).
+  `major.minor.patch`), optional `standard` (`c++11` through `c++26`,
+  plus `c++latest` for newest-the-toolchain-knows — `/std:c++latest`
+  MSVC-like, `-std=c++2b` on GNU/Clang; anything else passes through
+  verbatim, so naming one your compiler predates fails at the driver;
+  default `c++17`).
 - `dependencies` / `build_dependencies`: map of name → requirement.
   A bare string is a registry semver requirement. The detail object
   supports `version` (registry), `path`, `git` + exactly one of

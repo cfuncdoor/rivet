@@ -1,12 +1,17 @@
 //! Meson adapter (best-effort): `meson setup` + `meson compile`.
 //!
 //! ```text
-//! meson setup <build> <src> --buildtype=<debug|release> [-Dkey=value ...]
+//! meson setup <build> <src> --buildtype=<debug|release> -Db_vscrt=mt
+//!             [-Dkey=value ...]
 //! meson setup --reconfigure <build> [-Dkey=value ...]   # when configured
 //! meson compile -C <build> [targets ...]
 //! ```
 //! Only the `meson` binary is ever executed. A missing `meson` is
 //! [`Error::ToolMissing`] — never a silent fallback to another tool.
+//!
+//! The `b_vscrt=mt` default pins the static CRT to match rivet's own
+//! objects (driver default `/MT`); it is inert off-MSVC and removable
+//! by overriding `b_vscrt` in `options`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -92,6 +97,11 @@ pub(crate) fn setup_args(source_dir: &Path, spec: &AdapterSpec, ctx: &AdapterCtx
         "--buildtype={}",
         meson_buildtype(&ctx.build_type)
     )));
+    // Static CRT to match rivet's objects (see module docs); a spec
+    // `b_vscrt` wins.
+    if !spec.options.contains_key("b_vscrt") {
+        args.push(OsString::from("-Db_vscrt=mt"));
+    }
     for (key, value) in &spec.options {
         args.push(OsString::from(format!("-D{key}={value}")));
     }
@@ -167,6 +177,8 @@ mod tests {
             args.contains(&"-Dwerror=false".to_string()),
             "got: {args:?}"
         );
+        // Static CRT default (matches rivet's own objects).
+        assert!(args.contains(&"-Db_vscrt=mt".to_string()), "got: {args:?}");
 
         // With the configured marker present, srcdir is dropped in favor
         // of --reconfigure.
@@ -199,6 +211,23 @@ mod tests {
         assert_eq!(meson_buildtype("Debug"), "debug");
         assert_eq!(meson_buildtype("Release"), "release");
         assert_eq!(meson_buildtype("plain"), "plain");
+    }
+
+    #[test]
+    fn vscrt_override_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = AdapterCtx::new(dir.path().join("build"));
+        let args = args_to_strings(&setup_args(
+            Path::new("src"),
+            &spec(&[], &[("b_vscrt", "mtd")]),
+            &ctx,
+        ));
+        assert_eq!(
+            args.iter().filter(|a| a.starts_with("-Db_vscrt=")).count(),
+            1,
+            "got: {args:?}"
+        );
+        assert!(args.contains(&"-Db_vscrt=mtd".to_string()), "got: {args:?}");
     }
 
     #[test]

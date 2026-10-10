@@ -356,6 +356,10 @@ impl CxxToolchain {
     /// `-flto`; sanitizers as `/fsanitize=<csv>` (MSVC-like, validated to
     /// `address`-only by [`CxxToolchain::validate_options`]) or
     /// `-fsanitize=<csv>` (GNU/Clang). `clang-cl` follows the MSVC mapping.
+    /// `standard = "c++latest"` (newest the toolchain knows) maps to
+    /// `/std:c++latest` MSVC-like and `-std=c++2b` on GNU/Clang (which
+    /// have no `c++latest` spelling); every other standard passes through
+    /// verbatim, so naming one your compiler predates fails at the driver.
     fn push_common_args(&self, args: &mut Vec<OsString>, opts: &CompileOptions) {
         if self.is_msvc_like() {
             args.push(OsString::from("/nologo"));
@@ -387,7 +391,12 @@ impl CxxToolchain {
                 args.push(s);
             }
         } else {
-            args.push(OsString::from(format!("-std={}", opts.std)));
+            let std = if opts.std == "c++latest" {
+                "c++2b".to_string()
+            } else {
+                opts.std.clone()
+            };
+            args.push(OsString::from(format!("-std={std}")));
             args.push(OsString::from(format!("-O{}", opts.opt.min(3))));
             if opts.debug {
                 args.push(OsString::from("-g"));
@@ -1482,6 +1491,20 @@ mod tests {
         };
         let args = tc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
         assert!(args.iter().any(|a| a == "-std=c++20"), "got: {args:?}");
+    }
+
+    #[test]
+    fn latest_standard_maps_per_family() {
+        let opts = CompileOptions {
+            std: "c++latest".to_string(),
+            ..Default::default()
+        };
+        let msvc = fake(ToolchainKind::Msvc);
+        let a = msvc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts);
+        assert!(a.iter().any(|a| a == "/std:c++latest"), "got: {a:?}");
+        let gcc = fake(ToolchainKind::Gcc);
+        let a = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
+        assert!(a.iter().any(|a| a == "-std=c++2b"), "got: {a:?}");
     }
 
     #[test]

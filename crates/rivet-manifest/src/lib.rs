@@ -480,7 +480,15 @@ pub struct Workspace {
 // Parsing + validation
 // ---------------------------------------------------------------------------
 
-const KNOWN_STANDARDS: &[&str] = &["c++11", "c++14", "c++17", "c++20", "c++23", "c++26"];
+const KNOWN_STANDARDS: &[&str] = &[
+    "c++11",
+    "c++14",
+    "c++17",
+    "c++20",
+    "c++23",
+    "c++26",
+    "c++latest",
+];
 const KNOWN_LIB_TYPES: &[&str] = &["static", "shared", "header-only"];
 
 /// Parse a manifest from JSONC source text.
@@ -1605,6 +1613,17 @@ mod tests {
         let err = parse_str(src).unwrap_err().to_string();
         assert!(err.contains("package.standard"), "got: {err}");
         assert!(err.contains("c++20"), "got: {err}");
+    }
+
+    #[test]
+    fn latest_standard_parses() {
+        let src =
+            "{\"package\": { \"name\": \"a\", \"version\": \"0.1.0\", \"standard\": \"c++latest\" }}";
+        let m = parse_str(src).unwrap();
+        assert_eq!(
+            m.package.as_ref().unwrap().standard.as_deref(),
+            Some("c++latest")
+        );
     }
 
     #[test]

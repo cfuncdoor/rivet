@@ -64,7 +64,7 @@ Conventions need no configuration: `src/main.cpp` is the binary,
 | `rivet run [-- args]` | build and run a binary |
 | `rivet test` | build and run `tests/` |
 | `rivet update [-p pkg]` | re-resolve git deps, rewrite the lockfile |
-| `rivet add/remove` | (registry workflows) |
+| `rivet add <spec>` / `remove <dep>` | add (`name[@v]`, `owner/repo[@ref]`, git URL; verified + reverted on failure) / remove |
 | `rivet publish/login/search` | registry workflows |
 | `rivet git list/prune/fetch` | inspect the shared git cache |
 | `rivet vendor` | copy all sources into `vendor/` for offline builds |

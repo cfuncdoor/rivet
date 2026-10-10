@@ -192,10 +192,12 @@ fn prepare_registry_index(
             let missing_or_refresh = !file.is_file() || (refresh && !is_default);
             if missing_or_refresh && !offline {
                 if is_default {
-                    // Default index is user-managed; without RIVET_REGISTRY
-                    // there is nothing to sync from (resolver errors below).
-                    if default_registry_url().is_ok() {
-                        sync_index_file(url, name, &dir, verbose)?;
+                    // Default index is user-managed, but when RIVET_REGISTRY
+                    // points somewhere the missing/stale file syncs from it
+                    // (previously this synced from the literal "default/…",
+                    // which always failed).
+                    if let Ok(concrete) = default_registry_url() {
+                        sync_index_file(&concrete, name, &dir, verbose)?;
                     }
                     continue;
                 }
@@ -1435,6 +1437,498 @@ fn add_patch_entry(root: &rivet_manifest::Manifest, key: &str, rel: &str) -> Res
 }
 
 // ---------------------------------------------------------------------------
+// Add / remove
+// ---------------------------------------------------------------------------
+
+/// Parsed `rivet add` spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddSpec {
+    /// Registry dep: (dep key, semver req; `None` = latest at update).
+    Registry { name: String, req: Option<String> },
+    /// Git dep: (dep key, clone URL, raw `@ref` or `None` = default branch).
+    Git {
+        key: String,
+        url: String,
+        raw_ref: Option<String>,
+    },
+}
+
+impl AddSpec {
+    fn key(&self) -> &str {
+        match self {
+            Self::Registry { name, .. } => name,
+            Self::Git { key, .. } => key,
+        }
+    }
+}
+
+/// Split `head@ref` at the last `@`, but only when it follows the last
+/// `/` — so scp-like `git@host:path`, `user@host` URLs, and `file://`
+/// paths keep their `@`, while `name@req`, `owner/repo@ref`, and
+/// `https://…/repo@tag` split. `@` and `/` are ASCII, so byte slicing
+/// is safe. Returns (head, optional ref, which may be empty).
+fn split_at_ref(spec: &str) -> (&str, Option<&str>) {
+    let at = match spec.rfind('@') {
+        Some(i) => i,
+        None => return (spec, None),
+    };
+    if spec.rfind('/').is_some_and(|s| s > at) {
+        return (spec, None);
+    }
+    (&spec[..at], Some(&spec[at + 1..]))
+}
+
+/// Repo name from a git URL path (last segment, `.git` stripped). A bare
+/// host (`https://github.com/`) is rejected: there is no repo to name.
+fn repo_name_from_url(url: &str) -> Result<String> {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let path = without_scheme
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(without_scheme);
+    let trimmed = path.trim_end_matches('/');
+    if !trimmed.contains('/') {
+        bail!("could not infer a dependency name from `{url}`. Fix: `rivet add owner/repo[@ref]` or a URL ending in `/name[.git]`");
+    }
+    let last = trimmed.rsplit('/').next().unwrap_or("");
+    let name = last.strip_suffix(".git").unwrap_or(last);
+    if name.is_empty() {
+        bail!("could not infer a dependency name from `{url}`. Fix: `rivet add owner/repo[@ref]` or a URL ending in `/name[.git]`");
+    }
+    Ok(name.to_string())
+}
+
+/// `owner`/`repo` path characters (`[A-Za-z0-9_.-]`, non-empty).
+fn is_path_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Parse a `rivet add` spec (pure; no network):
+/// - `name` / `name@req` → registry dep (`None` req = latest at update).
+/// - `owner/repo[@ref]` → GitHub git dep (`repo` key).
+/// - `<url>[@ref]` (any `://` URL, or scp-like `user@host:path`) → git dep.
+fn parse_add_spec(spec: &str) -> Result<AddSpec> {
+    if spec.is_empty() {
+        bail!("empty dependency spec. Fix: `rivet add <name>[@version]`, `owner/repo[@ref]`, or a git URL");
+    }
+    if spec.contains(char::is_whitespace) {
+        bail!("dependency spec `{spec}` contains whitespace. Fix: quote the whole spec, e.g. `rivet add \"owner/repo@tag\"`");
+    }
+    let (head, raw_ref) = split_at_ref(spec);
+    if raw_ref == Some("") {
+        bail!("empty `@ref` in `{spec}`. Fix: drop the trailing `@` or give a version, tag, branch, or SHA");
+    }
+    if head.is_empty() {
+        bail!("missing dependency name in `{spec}`. Fix: `rivet add <name>[@version]`, `owner/repo[@ref]`, or a git URL");
+    }
+    if head.contains("://") {
+        let key = repo_name_from_url(head)?;
+        return Ok(AddSpec::Git {
+            key,
+            url: head.to_string(),
+            raw_ref: raw_ref.map(str::to_string),
+        });
+    }
+    if head.contains('/') {
+        // scp-like `user@host:path` (no `://`): verbatim URL, keyed by path.
+        if head.contains('@') && head.contains(':') {
+            let path = head.rsplit(':').next().unwrap_or(head);
+            let key = repo_name_from_url(&format!("x://{path}"))?;
+            return Ok(AddSpec::Git {
+                key,
+                url: head.to_string(),
+                raw_ref: raw_ref.map(str::to_string),
+            });
+        }
+        let mut parts = head.split('/');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(owner), Some(repo), None) if is_path_segment(owner) && is_path_segment(repo) => {
+                return Ok(AddSpec::Git {
+                    key: repo.to_string(),
+                    url: format!("https://github.com/{owner}/{repo}.git"),
+                    raw_ref: raw_ref.map(str::to_string),
+                });
+            }
+            _ => bail!("cannot parse `{spec}` as `owner/repo`. Fix: exactly `owner/repo[@ref]` (e.g. `ocornut/imgui@1.91.4`), a full git URL, or a registry `name[@version]`"),
+        }
+    }
+    Ok(AddSpec::Registry {
+        name: head.to_string(),
+        req: raw_ref.map(str::to_string),
+    })
+}
+
+/// A probed git ref and what to write for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbedRef {
+    Tag(String),
+    Branch(String),
+    Rev(String),
+}
+
+/// 40 lowercase/uppercase hex chars.
+fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Resolve a raw `@ref` against the mirror (fetching): exact tag, then
+/// `v`-prefixed tag, then branch. A 40-hex ref resolves as a SHA pin.
+/// `None` tracks the remote default branch (`Branch("HEAD")`, a
+/// first-class manifest value). Returns (ref, resolved SHA).
+fn probe_git_ref(
+    git: &rivet_git::GitCache,
+    key: &str,
+    url: &str,
+    raw: Option<&str>,
+) -> Result<(ProbedRef, String)> {
+    match raw {
+        None => {
+            let sha = git
+                .resolve_ref(key, url, &rivet_git::GitRef::Branch("HEAD".to_string()))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((ProbedRef::Branch("HEAD".to_string()), sha))
+        }
+        Some(r) if is_full_sha(r) => {
+            let sha = git
+                .resolve_ref(key, url, &rivet_git::GitRef::Rev(r.to_string()))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((ProbedRef::Rev(sha.clone()), sha))
+        }
+        Some(r) => {
+            let mut tried = Vec::new();
+            for candidate in [
+                rivet_git::GitRef::Tag(r.to_string()),
+                rivet_git::GitRef::Tag(format!("v{r}")),
+                rivet_git::GitRef::Branch(r.to_string()),
+            ] {
+                match git.resolve_ref(key, url, &candidate) {
+                    Ok(sha) => {
+                        let probed = match candidate {
+                            rivet_git::GitRef::Tag(t) => ProbedRef::Tag(t),
+                            rivet_git::GitRef::Branch(b) => ProbedRef::Branch(b),
+                            rivet_git::GitRef::Rev(s) => ProbedRef::Rev(s),
+                        };
+                        return Ok((probed, sha));
+                    }
+                    Err(e) => tried.push(format!("{} ({e})", candidate.describe())),
+                }
+            }
+            bail!("could not resolve `{r}` in `{url}`. Tried: {}. Fix: give an exact tag (a `v`-prefix is tried automatically), branch, or full SHA", tried.join("; "))
+        }
+    }
+}
+
+/// Foreign layout of a materialized checkout (top-level files only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignLayout {
+    /// Own `rivet.json`: plain git entry, nothing to generate.
+    Manifest,
+    Cmake,
+    Meson,
+    Make,
+    /// No manifest and no recognized build: inline package without an
+    /// adapter (resolves and builds vacuously; warned about).
+    Bare,
+}
+
+/// Adapter tool for a layout (`None` for manifest-carrying or bare trees).
+fn adapter_for_layout(layout: ForeignLayout) -> Option<&'static str> {
+    match layout {
+        ForeignLayout::Manifest | ForeignLayout::Bare => None,
+        ForeignLayout::Cmake => Some("cmake"),
+        ForeignLayout::Meson => Some("meson"),
+        ForeignLayout::Make => Some("make"),
+    }
+}
+
+fn sniff_foreign_layout(dir: &Path) -> ForeignLayout {
+    if dir.join("rivet.json").is_file() {
+        return ForeignLayout::Manifest;
+    }
+    if dir.join("CMakeLists.txt").is_file() {
+        return ForeignLayout::Cmake;
+    }
+    if dir.join("meson.build").is_file() {
+        return ForeignLayout::Meson;
+    }
+    if ["Makefile", "makefile", "GNUmakefile"]
+        .iter()
+        .any(|f| dir.join(f).is_file())
+    {
+        return ForeignLayout::Make;
+    }
+    ForeignLayout::Bare
+}
+
+/// Up to 8 top-level C++ source/header names (for the bare-tree warning).
+fn sample_sources(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let entries = std::fs::read_dir(dir)
+        .map(|r| r.collect::<Vec<_>>())
+        .unwrap_or_default();
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        if matches!(ext, "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" | "hh") {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    out.truncate(8);
+    out
+}
+
+/// Inline `package.version` for a git dep: tags shed one leading `v`
+/// when a digit follows (`v1.91.4` → `1.91.4`, like the zlib example);
+/// branches and SHAs carry no version, so `0.1.0` (the same placeholder
+/// the missing-manifest error suggests).
+fn inline_version_for(probed: &ProbedRef) -> String {
+    match probed {
+        ProbedRef::Tag(t) => {
+            let stripped = t.strip_prefix('v').or_else(|| t.strip_prefix('V'));
+            match stripped {
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest.to_string(),
+                _ => t.clone(),
+            }
+        }
+        ProbedRef::Branch(_) | ProbedRef::Rev(_) => "0.1.0".to_string(),
+    }
+}
+
+/// Manifest entry JSON for a probed git dep over an inspected layout.
+fn git_dep_entry(
+    key: &str,
+    url: &str,
+    probed: &ProbedRef,
+    layout: ForeignLayout,
+) -> serde_json::Value {
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "git".to_string(),
+        serde_json::Value::String(url.to_string()),
+    );
+    match probed {
+        ProbedRef::Tag(t) => entry.insert("tag".to_string(), serde_json::Value::String(t.clone())),
+        ProbedRef::Branch(b) => {
+            entry.insert("branch".to_string(), serde_json::Value::String(b.clone()))
+        }
+        ProbedRef::Rev(s) => entry.insert("rev".to_string(), serde_json::Value::String(s.clone())),
+    };
+    if layout != ForeignLayout::Manifest {
+        if let Some(tool) = adapter_for_layout(layout) {
+            entry.insert("adapter".to_string(), serde_json::json!({"tool": tool}));
+        }
+        entry.insert(
+            "package".to_string(),
+            serde_json::json!({"name": key, "version": inline_version_for(probed)}),
+        );
+    }
+    serde_json::Value::Object(entry)
+}
+
+/// Insert or remove one `dependencies`-table entry in the scope manifest
+/// (serde rewrite like `add_patch_entry`; returns whether it changed).
+fn edit_manifest_table(
+    dir: &Path,
+    table: &str,
+    key: &str,
+    value: Option<serde_json::Value>,
+) -> Result<bool> {
+    let file = dir.join("rivet.json");
+    let text = std::fs::read_to_string(&file)
+        .with_context(|| format!("could not read {}", file.display()))?;
+    let stripped = rivet_manifest::strip_jsonc(&text);
+    let mut doc: serde_json::Value = serde_json::from_str(&stripped)
+        .with_context(|| format!("corrupt {} (fix the JSON first)", file.display()))?;
+    let obj = doc
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("manifest must be a JSON object"))?;
+    let deps = obj
+        .entry(table.to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let deps_obj = deps
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("`{table}` must be an object"))?;
+    match value {
+        Some(v) => {
+            if deps_obj.get(key) == Some(&v) {
+                return Ok(false);
+            }
+            deps_obj.insert(key.to_string(), v);
+        }
+        None => {
+            if deps_obj.remove(key).is_none() {
+                return Ok(false);
+            }
+        }
+    }
+    let out = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
+    std::fs::write(&file, format!("{out}\n"))
+        .with_context(|| format!("could not write {}", file.display()))?;
+    Ok(true)
+}
+
+/// Dependency keys across all three dep tables (for duplicate checks and
+/// `remove` misses).
+fn all_dep_keys(root: &rivet_manifest::Manifest) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    out.extend(root.dependencies.keys().cloned());
+    out.extend(root.dev_dependencies.keys().cloned());
+    out.extend(root.build_dependencies.keys().cloned());
+    out
+}
+
+/// Add a dependency: parse the spec, verify it (probe + resolve), edit
+/// the manifest, and re-resolve. The manifest and lockfile are restored
+/// when verification fails, so a failed `add` never leaves a broken tree.
+pub fn add_flow(ui: &Ui, root: &rivet_manifest::Manifest, spec: &str, verbose: bool) -> Result<()> {
+    let parsed = parse_add_spec(spec)?;
+    let key = parsed.key().to_string();
+    if all_dep_keys(root).contains(&key) {
+        bail!("already depends on `{key}`. Fix: `rivet remove {key}` first, or `rivet update -p {key}` to move it");
+    }
+    let manifest_file = root.dir.join("rivet.json");
+    let orig_manifest = std::fs::read_to_string(&manifest_file)
+        .with_context(|| format!("could not read {}", manifest_file.display()))?;
+    let lock_file = lock_path(&root.dir);
+    let orig_lock: Option<Vec<u8>> = if lock_file.is_file() {
+        Some(
+            std::fs::read(&lock_file)
+                .with_context(|| format!("could not read {}", lock_file.display()))?,
+        )
+    } else {
+        None
+    };
+    let restore = |manifest: &str, lock: &Option<Vec<u8>>| {
+        let _ = std::fs::write(&manifest_file, manifest);
+        match lock {
+            Some(bytes) => {
+                let _ = std::fs::write(&lock_file, bytes);
+            }
+            None => {
+                let _ = std::fs::remove_file(&lock_file);
+            }
+        }
+    };
+    let entry = match &parsed {
+        AddSpec::Registry { req, .. } => {
+            // A bare name resolves `*` (latest) at update below.
+            serde_json::Value::String(req.clone().unwrap_or_else(|| "*".to_string()))
+        }
+        AddSpec::Git { key, url, raw_ref } => {
+            let git = git_cache(verbose, false)?;
+            let (probed, sha) = probe_git_ref(&git, key, url, raw_ref.as_deref())?;
+            let describe = match &probed {
+                ProbedRef::Tag(t) => format!("tag \"{t}\""),
+                ProbedRef::Branch(b) => format!("branch \"{b}\""),
+                ProbedRef::Rev(s) => format!("rev \"{}\"", short7(s)),
+            };
+            ui.status(
+                "Resolved",
+                &format!("`{key}` {describe} ({})", short7(&sha)),
+            );
+            let checkout = git
+                .ensure_checkout(key, url, &sha, &rivet_git::CheckoutOpts::default())
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let layout = sniff_foreign_layout(&checkout);
+            if layout == ForeignLayout::Bare {
+                let sources = sample_sources(&checkout);
+                let found = if sources.is_empty() {
+                    "no C++ sources at the top level".to_string()
+                } else {
+                    format!("top-level sources: {}", sources.join(", "))
+                };
+                ui.warn(&format!("`{key}` has no rivet.json and no recognized build (no CMakeLists.txt/meson.build/Makefile); {found}. Added as a resolving-but-empty dep: vendor the sources with your own rivet.json, ask upstream for one, or set the entry's `adapter` yourself"));
+            } else if verbose {
+                ui.verbose(&format!("foreign layout: {layout:?}"));
+            }
+            git_dep_entry(key, url, &probed, layout)
+        }
+    };
+    edit_manifest_table(&root.dir, "dependencies", &key, Some(entry))?;
+    ui.warn("added the entry to rivet.json (formatting normalized)");
+    // Verify by resolving just this dep; revert both files on failure.
+    let fresh_root = rivet_manifest::load(&root.dir).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let flags = rivet_graph::FeatureFlags {
+        features: Vec::new(),
+        all: true,
+        no_default: false,
+    };
+    let opts = UpdateOpts {
+        package: Some(key.clone()),
+        precise: None,
+        offline: false,
+    };
+    if let Err(e) = update_flow(ui, &fresh_root, &flags, &opts, verbose) {
+        restore(&orig_manifest, &orig_lock);
+        return Err(e.context(format!(
+            "`rivet add {spec}` failed; manifest and lockfile restored"
+        )));
+    }
+    ui.status("Added", &format!("`{key}` (manifest + lockfile updated)"));
+    Ok(())
+}
+
+/// Remove a dependency from every dep table and drop its lock entry (no
+/// network, no re-resolution: run `rivet update` to prune orphans).
+pub fn remove_flow(
+    ui: &Ui,
+    root: &rivet_manifest::Manifest,
+    name: &str,
+    _verbose: bool,
+) -> Result<()> {
+    let mut table_of: Option<&str> = None;
+    if root.dependencies.contains_key(name) {
+        table_of = Some("dependencies");
+    } else if root.dev_dependencies.contains_key(name) {
+        table_of = Some("dev_dependencies");
+    } else if root.build_dependencies.contains_key(name) {
+        table_of = Some("build_dependencies");
+    }
+    let Some(table) = table_of else {
+        let mut available: Vec<String> = all_dep_keys(root).into_iter().collect();
+        available.sort();
+        bail!(
+            "package `{name}` not found in dependencies. Available: {}",
+            if available.is_empty() {
+                "<none>".to_string()
+            } else {
+                available.join(", ")
+            }
+        )
+    };
+    edit_manifest_table(&root.dir, table, name, None)?;
+    let lock_file = lock_path(&root.dir);
+    if lock_file.is_file() {
+        let lock = rivet_resolver::read_lockfile(&lock_file).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let before = lock.packages.len();
+        let kept: Vec<_> = lock
+            .packages
+            .into_iter()
+            .filter(|p| p.name != name)
+            .collect();
+        if kept.len() != before {
+            let next = rivet_resolver::Lockfile {
+                version: rivet_resolver::LOCK_VERSION,
+                packages: kept,
+            };
+            rivet_resolver::write_lockfile(&lock_file, &next)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
+    ui.warn("removed the entry from rivet.json (formatting normalized); run `rivet update` to prune orphaned transitive entries");
+    ui.status("Removed", &format!("`{name}` from {table}"));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Git cache commands
 // ---------------------------------------------------------------------------
 
@@ -1816,4 +2310,126 @@ pub fn search_flow(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry(name: &str, req: Option<&str>) -> AddSpec {
+        AddSpec::Registry {
+            name: name.to_string(),
+            req: req.map(str::to_string),
+        }
+    }
+
+    fn git(key: &str, url: &str, raw_ref: Option<&str>) -> AddSpec {
+        AddSpec::Git {
+            key: key.to_string(),
+            url: url.to_string(),
+            raw_ref: raw_ref.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn add_spec_registry_forms() {
+        assert_eq!(parse_add_spec("fmt").unwrap(), registry("fmt", None));
+        assert_eq!(
+            parse_add_spec("fmt@11").unwrap(),
+            registry("fmt", Some("11"))
+        );
+        assert_eq!(
+            parse_add_spec("nlohmann.json@3.11").unwrap(),
+            registry("nlohmann.json", Some("3.11"))
+        );
+        assert!(parse_add_spec("").is_err());
+        assert!(parse_add_spec("foo bar").is_err());
+        assert!(parse_add_spec("foo@").is_err());
+        assert!(parse_add_spec("@1.0").is_err());
+    }
+
+    #[test]
+    fn add_spec_shorthand_forms() {
+        assert_eq!(
+            parse_add_spec("ocornut/imgui").unwrap(),
+            git("imgui", "https://github.com/ocornut/imgui.git", None)
+        );
+        assert_eq!(
+            parse_add_spec("ocornut/imgui@1.91.4").unwrap(),
+            git(
+                "imgui",
+                "https://github.com/ocornut/imgui.git",
+                Some("1.91.4")
+            )
+        );
+        assert_eq!(
+            parse_add_spec("ocornut/imgui@v1.91.4").unwrap(),
+            git(
+                "imgui",
+                "https://github.com/ocornut/imgui.git",
+                Some("v1.91.4")
+            )
+        );
+        assert!(parse_add_spec("owner/").is_err());
+        assert!(parse_add_spec("/repo").is_err());
+        assert!(parse_add_spec("a/b/c").is_err());
+        assert!(parse_add_spec("a/b/c@v").is_err());
+    }
+
+    #[test]
+    fn add_spec_url_forms() {
+        assert_eq!(
+            parse_add_spec("https://github.com/madler/zlib.git").unwrap(),
+            git("zlib", "https://github.com/madler/zlib.git", None)
+        );
+        assert_eq!(
+            parse_add_spec("https://github.com/madler/zlib.git@v1.3.1").unwrap(),
+            git("zlib", "https://github.com/madler/zlib.git", Some("v1.3.1"))
+        );
+        // scp-like keeps `user@host` intact; `@ref` still splits.
+        assert_eq!(
+            parse_add_spec("git@github.com:ocornut/imgui.git").unwrap(),
+            git("imgui", "git@github.com:ocornut/imgui.git", None)
+        );
+        assert_eq!(
+            parse_add_spec("git@github.com:ocornut/imgui.git@v1.91.4").unwrap(),
+            git("imgui", "git@github.com:ocornut/imgui.git", Some("v1.91.4"))
+        );
+        assert!(parse_add_spec("https://github.com/").is_err());
+    }
+
+    #[test]
+    fn split_at_ref_edge_cases() {
+        assert_eq!(split_at_ref("a@b"), ("a", Some("b")));
+        assert_eq!(split_at_ref("a"), ("a", None));
+        // `@` before the last `/` is user/host info, not a ref.
+        assert_eq!(split_at_ref("git@h:o/r"), ("git@h:o/r", None));
+        assert_eq!(split_at_ref("git@h:o/r@v"), ("git@h:o/r", Some("v")));
+    }
+
+    #[test]
+    fn inline_version_rules() {
+        assert_eq!(
+            inline_version_for(&ProbedRef::Tag("v1.91.4".to_string())),
+            "1.91.4"
+        );
+        assert_eq!(
+            inline_version_for(&ProbedRef::Tag("release-2".to_string())),
+            "release-2"
+        );
+        assert_eq!(
+            inline_version_for(&ProbedRef::Branch("HEAD".to_string())),
+            "0.1.0"
+        );
+        assert_eq!(inline_version_for(&ProbedRef::Rev("a".repeat(40))), "0.1.0");
+    }
+
+    #[test]
+    fn sha_detection() {
+        assert!(is_full_sha(&"a".repeat(40)));
+        assert!(is_full_sha("ABCDEF1234567890ABCDEF1234567890ABCDEF12"));
+        assert!(!is_full_sha("v1.91.4"));
+        assert!(!is_full_sha(&"a".repeat(39)));
+        assert!(!is_full_sha(""));
+    }
 }

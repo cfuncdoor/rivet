@@ -181,9 +181,9 @@ pub enum Commands {
     },
     /// Syntax-check without producing binaries.
     Check {},
-    /// Add a dependency.
+    /// Add a dependency (`name[@version]`, `owner/repo[@ref]`, or git URL).
     Add {
-        /// Dependency name, optionally with `@version`.
+        /// Dependency spec, optionally with `@version`/`@ref`.
         pkg: String,
     },
     /// Remove a dependency.
@@ -500,6 +500,14 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             cli.verbose,
         ),
         Some(Commands::Git { command }) => cmd_git(&ui, command, cli.verbose),
+        Some(Commands::Add { pkg }) => {
+            let root = load_scope()?;
+            lockflow::add_flow(&ui, &root, pkg, cli.verbose)
+        }
+        Some(Commands::Remove { pkg }) => {
+            let root = load_scope()?;
+            lockflow::remove_flow(&ui, &root, pkg, cli.verbose)
+        }
         Some(Commands::Vendor { dry_run }) => {
             let root = load_scope()?;
             lockflow::vendor_flow(&ui, &root, *dry_run, cli.verbose)
@@ -666,8 +674,6 @@ fn use_color(when: &str) -> bool {
 fn unimplemented_message(cmd: &Commands) -> String {
     let name = match cmd {
         Commands::Check {} => "check",
-        Commands::Add { .. } => "add",
-        Commands::Remove { .. } => "remove",
         Commands::Doc => "doc",
         _ => "command",
     };

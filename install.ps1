@@ -7,7 +7,10 @@ $Version = if ($env:RIVET_VERSION) { $env:RIVET_VERSION } else { "latest" }
 $Dest = if ($env:DEST) { $env:DEST } else { "$HOME\.rivet\bin" }
 
 if ($Version -eq "latest") {
-  $Url = "https://github.com/$Repo/releases/latest/download/rivet-x86_64-pc-windows-msvc.zip"
+  # Rolling `latest` tag (works from the first published build,
+  # pre-release or not — unlike /releases/latest/..., which needs a
+  # stable release to exist).
+  $Url = "https://github.com/$Repo/releases/download/latest/rivet-x86_64-pc-windows-msvc.zip"
 } else {
   $Url = "https://github.com/$Repo/releases/download/$Version/rivet-x86_64-pc-windows-msvc.zip"
 }

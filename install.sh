@@ -16,7 +16,10 @@ case "$ARCH" in
 esac
 
 if [ "$VERSION" = "latest" ]; then
-  URL="https://github.com/$REPO/releases/latest/download/rivet-$ARCH-$OS.tar.gz"
+  # Rolling `latest` tag (works from the first published build,
+  # pre-release or not — unlike /releases/latest/..., which needs a
+  # stable release to exist).
+  URL="https://github.com/$REPO/releases/download/latest/rivet-$ARCH-$OS.tar.gz"
 else
   URL="https://github.com/$REPO/releases/download/$VERSION/rivet-$ARCH-$OS.tar.gz"
 fi

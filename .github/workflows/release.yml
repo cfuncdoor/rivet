@@ -1,9 +1,10 @@
 name: release
 
-# Every commit to main publishes fresh binaries to the Releases tab
-# (moving `continuous` pre-release), so install.sh / install.ps1 always
-# have something to download. Pushing a `v*` tag publishes a versioned
-# release instead (which becomes `latest`).
+# Every commit to main republishes rolling binaries under the `latest`
+# tag (a pre-release), so install.sh / install.ps1 always have something
+# to download via .../releases/download/latest/.... Pushing a `v*` tag
+# publishes a versioned (stable) release instead (which then also answers
+# .../releases/latest/download/...).
 on:
   push:
     branches: [main]
@@ -88,9 +89,9 @@ jobs:
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
             echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=continuous" >> "$GITHUB_OUTPUT"
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "name=continuous (${GITHUB_SHA:0:7})" >> "$GITHUB_OUTPUT"
+            echo "name=latest (${GITHUB_SHA:0:7})" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish release
         uses: softprops/action-gh-release@v2

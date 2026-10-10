@@ -115,6 +115,33 @@ pub fn strip_note_lines(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Drop a leading bare TU-echo line (`main.cpp`): cl prints the file it
+/// starts on, but rivet's summary error already names the TU. Drops only
+/// the first line, and only when it exactly names the TU (bare filename,
+/// relative, or absolute path); anything else passes through byte-identical.
+pub fn strip_tu_echo(bytes: &[u8], echo_names: &[&str]) -> Vec<u8> {
+    let mut parts = bytes.splitn(2, |&b| b == b'\n');
+    let first = parts.next().unwrap_or_default();
+    let rest = parts.next().unwrap_or_default();
+    let trimmed = trim_ascii(first);
+    if !trimmed.is_empty() && echo_names.iter().any(|n| trimmed == n.as_bytes()) {
+        return rest.to_vec();
+    }
+    bytes.to_vec()
+}
+
+/// Strip ASCII whitespace at both ends (byte-level; `trim_ascii` needs a
+/// newer Rust than the MSRV).
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.first(), Some(b) if b.is_ascii_whitespace()) {
+        bytes = &bytes[1..];
+    }
+    while matches!(bytes.last(), Some(b) if b.is_ascii_whitespace()) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
 /// Lexically normalize a path (resolve `.`/`..` without touching the fs).
 fn normalize(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -213,5 +240,28 @@ mod tests {
         // A near-miss prefix is not a note.
         let out = b"Note: including files: x\n";
         assert_eq!(&strip_note_lines(out), out);
+    }
+
+    #[test]
+    fn strip_tu_echo_drops_only_the_first_line_when_named() {
+        let names = ["main.cpp", "src/main.cpp", "D:/p/src/main.cpp"];
+        // Bare echo first: gone, rest byte-identical.
+        let out = b"main.cpp\nmain.cpp(3): error C1083: x\n";
+        assert_eq!(
+            &strip_tu_echo(out, &names),
+            b"main.cpp(3): error C1083: x\n"
+        );
+        // Absolute echo: gone too.
+        let out = b"D:/p/src/main.cpp\nerror C2059\n";
+        assert_eq!(&strip_tu_echo(out, &names), b"error C2059\n");
+        // Unknown first line: kept.
+        let out = b"other.cpp\nerror C2059\n";
+        assert_eq!(&strip_tu_echo(out, &names), out);
+        // Echo later than first: kept (only the head echo is rivet's to drop).
+        let out = b"error C2059\nmain.cpp\n";
+        assert_eq!(&strip_tu_echo(out, &names), out);
+        // Empty and whitespace-only: kept.
+        assert_eq!(&strip_tu_echo(b"", &names), b"");
+        assert_eq!(&strip_tu_echo(b"\n", &names), b"\n");
     }
 }

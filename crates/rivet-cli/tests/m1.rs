@@ -143,7 +143,7 @@ fn compiler_errors_reported() {
 }
 
 #[test]
-fn missing_header_suggests_help() {
+fn missing_header_reports_diagnostic_without_chatter() {
     if !toolchain_available() {
         eprintln!("SKIP: no C++ toolchain detected");
         return;
@@ -162,7 +162,13 @@ fn missing_header_suggests_help() {
         .arg("build")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("help:").and(predicate::str::contains("nope/missing.h")));
+        // The failure names the header; the bare TU echo (`main.cpp`)
+        // and `/showIncludes` notes are stripped from replayed stdout.
+        .stdout(
+            predicate::str::contains("nope/missing.h")
+                .and(predicate::str::starts_with("main.cpp\n").not()),
+        )
+        .stderr(predicate::str::contains("Note: including file:").not());
 }
 
 #[test]

@@ -27,7 +27,6 @@
 pub mod compile_commands;
 pub mod depfile;
 pub mod features;
-pub mod hints;
 pub mod schedule;
 pub mod script;
 pub mod state;
@@ -1098,6 +1097,12 @@ pub fn build_unit(
             .iter()
             .map(|stale| compile_task(manifest, toolchain, &compile_opts, stale))
             .collect();
+        // Outcome name → stale TU (for the bare TU-echo filter below).
+        let stale_by_name: BTreeMap<String, &StaleTu> = assessment
+            .stale_tus
+            .iter()
+            .map(|stale| (task_name(&stale.tag, &stale.job.src_rel), stale))
+            .collect();
         let outcomes = schedule::run(tasks, opts.jobs, opts.fail_fast);
         let mut failures: Vec<String> = Vec::new();
         for outcome in &outcomes {
@@ -1124,31 +1129,34 @@ pub fn build_unit(
                         eprintln!("       Running `{}`", outcome.display);
                     }
                     // Replay captured output (stdout→stdout, stderr→stderr).
-                    // `/showIncludes` tracking notes are stripped: rivet
-                    // already consumed them, they are not diagnostics.
+                    // `/showIncludes` tracking notes are stripped (rivet
+                    // already consumed them) as is cl's bare TU-echo first
+                    // line (the summary error already names the TU).
+                    let shown = match stale_by_name.get(outcome.name.as_str()) {
+                        Some(stale) => {
+                            let abs = stale.job.src_abs.display().to_string();
+                            let rel = stale.job.src_rel.clone();
+                            let back = rel.replace('/', "\\");
+                            let base = Path::new(&stale.job.src_rel)
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let names = [&abs[..], &rel[..], &back[..], &base[..]];
+                            depfile::strip_note_lines(&depfile::strip_tu_echo(
+                                &outcome.stdout,
+                                &names,
+                            ))
+                        }
+                        None => depfile::strip_note_lines(&outcome.stdout),
+                    };
                     let stdout = std::io::stdout();
                     let mut out = stdout.lock();
-                    let _ = out.write_all(&depfile::strip_note_lines(&outcome.stdout));
+                    let _ = out.write_all(&shown);
                     let _ = out.flush();
                     let stderr = std::io::stderr();
                     let mut err = stderr.lock();
                     let _ = err.write_all(&outcome.stderr);
                     let _ = err.flush();
-                    if let Some(hint) = hints::compile_hint(
-                        &format!(
-                            "{}\n{}",
-                            String::from_utf8_lossy(&outcome.stdout),
-                            String::from_utf8_lossy(&outcome.stderr)
-                        ),
-                        &compile_opts
-                            .include_dirs
-                            .iter()
-                            .chain(inputs.include_dirs.iter())
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    ) {
-                        eprintln!("help: {hint}");
-                    }
                     failures.push(format!("{} ({e})", outcome.name));
                 }
             }
@@ -1327,13 +1335,6 @@ pub fn build_unit(
         if !out.status.success() {
             let _ = std::io::stdout().lock().write_all(&out.stdout);
             let _ = std::io::stderr().lock().write_all(&out.stderr);
-            if let Some(hint) = hints::link_hint(&format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            )) {
-                eprintln!("help: {hint}");
-            }
             return Err(Error::CompileFailed {
                 what: format!(
                     "link failed for {} with {} (diagnostics above)",

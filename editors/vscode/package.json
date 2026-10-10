@@ -1,0 +1,58 @@
+{
+  "name": "rivet",
+  "displayName": "Rivet (Cargo for C++)",
+  "description": "Configures C/C++ IntelliSense from your rivet build, so project and dependency headers resolve with no squiggles.",
+  "version": "0.1.0",
+  "publisher": "cfuncdoor",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:cpp",
+    "onLanguage:c"
+  ],
+  "main": "./extension.js",
+  "extensionDependencies": [
+    "ms-vscode.cpptools"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "rivet.configureIntelliSense",
+        "title": "Rivet: Configure IntelliSense",
+        "category": "Rivet"
+      }
+    ],
+    "configuration": {
+      "title": "Rivet",
+      "properties": {
+        "rivet.binaryPath": {
+          "type": "string",
+          "default": "rivet",
+          "description": "rivet binary (PATH name or absolute path) used to generate compile_commands.json."
+        },
+        "rivet.profile": {
+          "type": "string",
+          "enum": [
+            "dev",
+            "release"
+          ],
+          "default": "dev",
+          "description": "Build profile whose flags feed IntelliSense."
+        },
+        "rivet.autoConfigure": {
+          "type": "boolean",
+          "default": true,
+          "description": "Point .vscode/c_cpp_properties.json at the compile database when missing (runs `rivet compile-commands` only if the database itself is missing)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "test": "node --test test/extension.test.js"
+  }
+}

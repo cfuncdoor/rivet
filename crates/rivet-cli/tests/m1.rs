@@ -125,9 +125,44 @@ fn compiler_errors_reported() {
     let dir = TempDir::new().unwrap();
     new_project(&dir, "hello");
     let pkg: PathBuf = dir.path().join("hello");
-    std::fs::write(pkg.join("src").join("main.cpp"), "this is not c++\n").unwrap();
+    std::fs::write(
+        pkg.join("src").join("main.cpp"),
+        "#include <iostream>\nthis is not c++\n",
+    )
+    .unwrap();
 
-    rivet().current_dir(&pkg).arg("build").assert().failure();
+    rivet()
+        .current_dir(&pkg)
+        .arg("build")
+        .assert()
+        .failure()
+        // Failure output replays diagnostics, never `/showIncludes`
+        // tracking notes (MSVC emits them before erroring).
+        .stdout(predicate::str::contains("Note: including file:").not())
+        .stderr(predicate::str::contains("Note: including file:").not());
+}
+
+#[test]
+fn missing_header_suggests_help() {
+    if !toolchain_available() {
+        eprintln!("SKIP: no C++ toolchain detected");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    new_project(&dir, "hello");
+    let pkg: PathBuf = dir.path().join("hello");
+    std::fs::write(
+        pkg.join("src").join("main.cpp"),
+        "#include <iostream>\n#include \"nope/missing.h\"\nint main() { return 0; }\n",
+    )
+    .unwrap();
+
+    rivet()
+        .current_dir(&pkg)
+        .arg("build")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("help:").and(predicate::str::contains("nope/missing.h")));
 }
 
 #[test]

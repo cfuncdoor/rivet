@@ -27,6 +27,7 @@
 pub mod compile_commands;
 pub mod depfile;
 pub mod features;
+pub mod hints;
 pub mod schedule;
 pub mod script;
 pub mod state;
@@ -1117,19 +1118,37 @@ pub fn build_unit(
                     summary.recompiled.push((tag, rel));
                 }
                 Err(e) => {
-                    // Show the failed command too: with parallel captured
-                    // output there is no other place it appears.
-                    eprintln!("       Running `{}`", outcome.display);
-                    // Replay captured output verbatim (stdout→stdout,
-                    // stderr→stderr) so diagnostics pass through unmodified.
+                    // Full command only at `-v` (it drowns the diagnostics;
+                    // the verbose log already records it for successes).
+                    if opts.verbose {
+                        eprintln!("       Running `{}`", outcome.display);
+                    }
+                    // Replay captured output (stdout→stdout, stderr→stderr).
+                    // `/showIncludes` tracking notes are stripped: rivet
+                    // already consumed them, they are not diagnostics.
                     let stdout = std::io::stdout();
                     let mut out = stdout.lock();
-                    let _ = out.write_all(&outcome.stdout);
+                    let _ = out.write_all(&depfile::strip_note_lines(&outcome.stdout));
                     let _ = out.flush();
                     let stderr = std::io::stderr();
                     let mut err = stderr.lock();
                     let _ = err.write_all(&outcome.stderr);
                     let _ = err.flush();
+                    if let Some(hint) = hints::compile_hint(
+                        &format!(
+                            "{}\n{}",
+                            String::from_utf8_lossy(&outcome.stdout),
+                            String::from_utf8_lossy(&outcome.stderr)
+                        ),
+                        &compile_opts
+                            .include_dirs
+                            .iter()
+                            .chain(inputs.include_dirs.iter())
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    ) {
+                        eprintln!("help: {hint}");
+                    }
                     failures.push(format!("{} ({e})", outcome.name));
                 }
             }
@@ -1138,7 +1157,7 @@ pub fn build_unit(
             failures.sort();
             return Err(Error::CompileFailed {
                 what: format!(
-                    "compile failed for {} (diagnostics above, unmodified)",
+                    "compile failed for {} (compiler diagnostics above)",
                     failures.join(", ")
                 ),
             });
@@ -1206,7 +1225,7 @@ pub fn build_unit(
                 let _ = std::io::stderr().lock().write_all(&out.stderr);
                 return Err(Error::CompileFailed {
                     what: format!(
-                        "archive failed for {} with exit {} (diagnostics above, unmodified)",
+                        "archive failed for {} with {} (diagnostics above)",
                         lib.name, out.status
                     ),
                 });
@@ -1308,9 +1327,16 @@ pub fn build_unit(
         if !out.status.success() {
             let _ = std::io::stdout().lock().write_all(&out.stdout);
             let _ = std::io::stderr().lock().write_all(&out.stderr);
+            if let Some(hint) = hints::link_hint(&format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )) {
+                eprintln!("help: {hint}");
+            }
             return Err(Error::CompileFailed {
                 what: format!(
-                    "link failed for {} with exit {} (diagnostics above, unmodified)",
+                    "link failed for {} with {} (diagnostics above)",
                     bin.name, out.status
                 ),
             });
@@ -1596,7 +1622,7 @@ fn compile_task(
                 return schedule::TaskOutcome {
                     name,
                     display,
-                    result: Err(format!("exit {}", out.status)),
+                    result: Err(format!("{}", out.status)),
                     stdout: out.stdout,
                     stderr: out.stderr,
                 };

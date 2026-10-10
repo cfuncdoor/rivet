@@ -30,7 +30,8 @@ pub struct TaskOutcome {
     pub display: String,
     /// `Ok` on success.
     pub result: Result<TaskSuccess, String>,
-    /// Raw captured stdout (replayed verbatim on failure).
+    /// Raw captured stdout (replayed on failure with `/showIncludes`
+    /// tracking notes stripped by the caller).
     pub stdout: Vec<u8>,
     /// Raw captured stderr (replayed verbatim on failure).
     pub stderr: Vec<u8>,

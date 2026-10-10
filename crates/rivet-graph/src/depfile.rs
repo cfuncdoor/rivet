@@ -101,6 +101,20 @@ fn join_pkg(pkg_dir: &Path, raw: &str) -> PathBuf {
     normalize(&abs)
 }
 
+/// Strip `/showIncludes` note lines for display: they are header-tracking
+/// metadata rivet already consumed, not diagnostics. Everything else
+/// passes through byte-identical (no UTF-8 conversion, newlines preserved).
+pub fn strip_note_lines(bytes: &[u8]) -> Vec<u8> {
+    const PREFIX: &[u8] = b"Note: including file:";
+    let mut out = Vec::with_capacity(bytes.len());
+    for line in bytes.split_inclusive(|&b| b == b'\n') {
+        if !line.starts_with(PREFIX) {
+            out.extend_from_slice(line);
+        }
+    }
+    out
+}
+
 /// Lexically normalize a path (resolve `.`/`..` without touching the fs).
 fn normalize(path: &Path) -> PathBuf {
     use std::path::Component;
@@ -183,5 +197,21 @@ mod tests {
         let out = "Note: including file: src/a.h\n";
         let deps = parse_show_includes(out, Path::new("/pkg"));
         assert_eq!(deps, vec![PathBuf::from("/pkg/src/a.h")]);
+    }
+
+    #[test]
+    fn strip_note_lines_keeps_diagnostics_byte_identical() {
+        let out = b"main.cpp\nNote: including file: C:\\SDK\\iostream\nsome warning C4000: x\nNote: including file: D:\\a.h\n";
+        let stripped = strip_note_lines(out);
+        assert_eq!(&stripped, b"main.cpp\nsome warning C4000: x\n");
+        // No trailing newline: preserved as-is, notes still gone.
+        let out = b"main.cpp\nNote: including file: C:\\SDK\\iostream";
+        assert_eq!(&strip_note_lines(out), b"main.cpp\n");
+        // All notes: empty output (caller prints nothing then).
+        let out = b"Note: including file: a.h\n";
+        assert!(strip_note_lines(out).is_empty());
+        // A near-miss prefix is not a note.
+        let out = b"Note: including files: x\n";
+        assert_eq!(&strip_note_lines(out), out);
     }
 }

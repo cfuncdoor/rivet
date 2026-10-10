@@ -1483,6 +1483,11 @@ fn build_single_unit(
         .map_err(|e| anyhow::anyhow!("{e}"))?
     {
         ui.status("Fresh", &format!("{name} v{version}"));
+        // `build_unit` never runs for fresh units, so refresh staged
+        // runtime files here (a DLL can change under an identical import
+        // library without tripping freshness).
+        rivet_graph::ensure_staged_outputs(&unit.manifest, &plan, &inputs)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     } else {
         ui.status("Compiling", &format!("{name} v{version} ({profile})"));
         let summary = rivet_graph::build_unit(

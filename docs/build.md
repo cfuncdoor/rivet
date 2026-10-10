@@ -46,6 +46,21 @@ cmake/meson adapters pin the static CRT (`MultiThreaded` /
 `b_vscrt=mt`, overridable via `options`) — otherwise their own
 `/MDd` default fails the link with LNK2038 against rivet objects.
 
+## Shared libraries
+
+`"lib": {"type": "shared"}` compiles position-independent objects and
+links a DLL / `.so` / `.dylib` (soname = file name; Linux bins get
+`rpath $ORIGIN`, macOS `@loader_path`). Only explicitly exported
+symbols travel on Windows (`__declspec(dllexport)`); when compiling
+the lib itself rivet defines `<name>_EXPORTS` CMake-style, so one
+header serves both sides — and an auto-generated DEF also exports
+every other global (matching Linux, where everything exports by
+default). Dependents link the import library (Windows) or the shared
+object itself; its directory joins no search path, because rivet
+stages a copy next to every linked binary (refreshed even when the
+binary itself stays `Fresh`). The `pic` flag joins the fingerprint, so
+a static/shared switch rebuilds.
+
 ## Caching and targets
 
 Whole-package artifacts cache content-keyed under

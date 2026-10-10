@@ -9,6 +9,7 @@
 //! candidate tried is recorded so `-v` can log the decision and failures can
 //! say exactly what was tried and how to fix it.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -153,6 +154,19 @@ pub enum DepStyle {
     MsvcShowIncludes,
 }
 
+/// Link outputs for [`CxxToolchain::link_dll_command`]: the dynamic
+/// library itself, its import library (Windows: linked, not loaded), and
+/// an optional export-definition file (Windows `/DEF:`).
+#[derive(Debug, Clone, Copy)]
+pub struct DllOutputs<'a> {
+    /// Dynamic library output (`.dll` / `.so` / `.dylib`).
+    pub dll: &'a Path,
+    /// Import library output (`.lib` beside the DLL; unused elsewhere).
+    pub implib: &'a Path,
+    /// Export definitions (`.def`), or `None` for default exports.
+    pub def: Option<&'a Path>,
+}
+
 impl CxxToolchain {
     /// Assemble a detected toolchain, probing for its static archiver.
     fn with_archiver(
@@ -206,12 +220,14 @@ impl CxxToolchain {
     /// defines, include dirs (in order — order is semantics for `-I`), lto,
     /// sanitizers, enabled features (sorted), and the `--target` selection
     /// (only when set — native `None` keeps the historic format byte for
-    /// byte, so native builds never rebuild spuriously).
+    /// byte, so native builds never rebuild spuriously). `pic` appends
+    /// `|pic=1` only when set, same trick: every existing build keeps its
+    /// exact fingerprint.
     ///
     /// Format (also consumed by `rivet-graph` link digests; lockfile
     /// readers must treat it as opaque but stable within a toolchain):
     /// `<kind>|<version>|std=<std>|opt=<n>|debug=<0|1>|defines=<;>|includes=<;>`
-    /// `|lto=<0|1>|sanitizers=<csv>|features=<csv>[|target=<triple>]`.
+    /// `|lto=<0|1>|sanitizers=<csv>|features=<csv>[|target=<triple>][|pic=1]`.
     pub fn fingerprint(&self, opts: &CompileOptions) -> String {
         let defines = opts.defines.join(";");
         let includes = opts
@@ -231,6 +247,11 @@ impl CxxToolchain {
             opts.sanitizers.join(","),
             opts.features.join(","),
         );
+        let base = if opts.pic {
+            format!("{base}|pic=1")
+        } else {
+            base
+        };
         match &self.target {
             Some(t) => format!("{base}|target={}", t.raw),
             None => base,
@@ -350,6 +371,24 @@ impl CxxToolchain {
         }
     }
 
+    /// Shared library file name (`hello.dll` on Windows incl. MinGW,
+    /// `libhello.dylib` on macOS, `libhello.so` elsewhere).
+    pub fn sharedlib_filename(&self, name: &str) -> String {
+        if cfg!(target_os = "macos") && !self.is_msvc_like() {
+            format!("lib{name}.dylib")
+        } else if self.is_msvc_like() || cfg!(windows) {
+            format!("{name}.dll")
+        } else {
+            format!("lib{name}.so")
+        }
+    }
+
+    /// Import library file name for a DLL (`hello.lib`, beside the DLL).
+    /// MSVC only; linking consumes this, the loader consumes the DLL.
+    pub fn importlib_filename(&self, name: &str) -> String {
+        format!("{name}.lib")
+    }
+
     /// Shared flag core for a compile-only step (no dep tracking, no env).
     ///
     /// LTO/sanitizer mapping: MSVC-like `/GL` + GNU/Clang
@@ -398,6 +437,9 @@ impl CxxToolchain {
             };
             args.push(OsString::from(format!("-std={std}")));
             args.push(OsString::from(format!("-O{}", opts.opt.min(3))));
+            if opts.pic {
+                args.push(OsString::from("-fPIC"));
+            }
             if opts.debug {
                 args.push(OsString::from("-g"));
             }
@@ -574,6 +616,25 @@ impl CxxToolchain {
             for name in sys_libs {
                 cmd.arg(format!("-l{name}"));
             }
+            // Shared inputs travel beside the binary (staged by the
+            // coordinator); the loader needs an rpath to find them there.
+            // Windows finds DLLs next to the exe without help, so MinGW
+            // (which lands in this branch) is excluded.
+            if !cfg!(windows)
+                && archives.iter().any(|a| {
+                    matches!(
+                        a.extension().and_then(|e| e.to_str()),
+                        Some(e) if e.eq_ignore_ascii_case("so")
+                            || e.eq_ignore_ascii_case("dylib")
+                    )
+                })
+            {
+                if cfg!(target_os = "macos") {
+                    cmd.arg("-Wl,-rpath,@loader_path");
+                } else {
+                    cmd.arg("-Wl,-rpath,$ORIGIN");
+                }
+            }
             if opts.lto {
                 cmd.arg("-flto");
             }
@@ -586,6 +647,173 @@ impl CxxToolchain {
         cmd.args(self.target_args());
         self.apply_env(&mut cmd);
         cmd
+    }
+
+    /// Build a shared-library `Command` for `objects` (+ `archives`) →
+    /// dynamic library, as described by `outputs`.
+    ///
+    /// - MSVC-like: `cl` objects… `/link /DLL /OUT:<dll>
+    ///   /IMPLIB:<implib> [/DEBUG] [/LTCG]` plus `/LIBPATH` and bare libs.
+    ///   Only `__declspec(dllexport)`-marked (or `.def`-listed) symbols
+    ///   export; anything else still links (verified: bare `/DLL` links
+    ///   clean and emits the import library).
+    /// - macOS: `<driver> … -dynamiclib -o <dylib>` (best-effort: no
+    ///   `install_name` magic, so moved trees break; local runs work).
+    /// - Elsewhere (Linux): `<driver> … -shared -Wl,-soname,<file> -o
+    ///   <so>`. The soname is the file name (no versioned symlinks).
+    ///
+    /// LTO/sanitizers ride along exactly like [`Self::link_exe_command`].
+    /// Sanity/current-dir handling is the caller's job, as with archives.
+    pub fn link_dll_command(
+        &self,
+        objects: &[PathBuf],
+        archives: &[PathBuf],
+        lib_dirs: &[PathBuf],
+        sys_libs: &[String],
+        outputs: &DllOutputs<'_>,
+        opts: &CompileOptions,
+    ) -> Command {
+        let mut cmd = Command::new(&self.cxx);
+        if self.is_msvc_like() {
+            cmd.arg("/nologo");
+            for o in objects {
+                cmd.arg(o);
+            }
+            for a in archives {
+                cmd.arg(a);
+            }
+            if !opts.sanitizers.is_empty() {
+                cmd.arg(format!("/fsanitize={}", opts.sanitizers.join(",")));
+            }
+            let mut link_opts: Vec<&str> = Vec::new();
+            if opts.debug {
+                link_opts.push("/DEBUG");
+            }
+            if opts.lto {
+                link_opts.push("/LTCG");
+            }
+            // Linker options always follow `/link` (D9002/D9024) — this
+            // includes `/DLL`, `/OUT`, and `/IMPLIB`, which the `cl`
+            // driver itself does not understand (misplaced, they are
+            // ignored and `cl` falls back to linking an exe).
+            // `/link` is unconditional: `/DLL` always needs it.
+            cmd.arg("/link");
+            cmd.arg("/DLL");
+            let mut out = OsString::from("/OUT:");
+            out.push(outputs.dll);
+            cmd.arg(out);
+            let mut implib = OsString::from("/IMPLIB:");
+            implib.push(outputs.implib);
+            cmd.arg(implib);
+            if let Some(def) = outputs.def {
+                let mut defflag = OsString::from("/DEF:");
+                defflag.push(def);
+                cmd.arg(defflag);
+            }
+            for o in link_opts {
+                cmd.arg(o);
+            }
+            for dir in lib_dirs {
+                let mut lp = OsString::from("/LIBPATH:");
+                lp.push(dir);
+                cmd.arg(lp);
+            }
+            for name in sys_libs {
+                cmd.arg(msvc_lib_name(name));
+            }
+        } else {
+            for o in objects {
+                cmd.arg(o);
+            }
+            for a in archives {
+                cmd.arg(a);
+            }
+            for dir in lib_dirs {
+                let mut l = OsString::from("-L");
+                l.push(dir);
+                cmd.arg(l);
+            }
+            for name in sys_libs {
+                cmd.arg(format!("-l{name}"));
+            }
+            if opts.lto {
+                cmd.arg("-flto");
+            }
+            if !opts.sanitizers.is_empty() {
+                cmd.arg(format!("-fsanitize={}", opts.sanitizers.join(",")));
+            }
+            if cfg!(target_os = "macos") {
+                cmd.arg("-dynamiclib");
+            } else {
+                cmd.arg("-shared");
+                if let Some(file) = outputs.dll.file_name().and_then(|n| n.to_str()) {
+                    cmd.arg(format!("-Wl,-soname,{file}"));
+                }
+            }
+            cmd.arg("-o");
+            cmd.arg(outputs.dll);
+        }
+        cmd.args(self.target_args());
+        self.apply_env(&mut cmd);
+        cmd
+    }
+
+    /// Generate a `.def` file exporting every global symbol defined in
+    /// `objects`, for shared links whose sources carry no export markup.
+    ///
+    /// MSVC-like only: other linkers export all globals by default, so
+    /// this returns `None` without touching anything there. On MSVC-like
+    /// toolchains without a usable `dumpbin` (beside the driver, else
+    /// `PATH`) it also returns `None` — the link proceeds and only
+    /// explicitly marked symbols export (dependents using unmarked ones
+    /// fail loudly at *their* link). `DATA` vs code comes from section
+    /// characteristics (`dumpbin /HEADERS`); file-static symbols (anything
+    /// but `External` class) and `__`-prefixed compiler internals never
+    /// export. Writes `def_path` (overwritten) and returns it when at
+    /// least one symbol was found; `None` (no file written) otherwise.
+    pub fn export_def_for(
+        &self,
+        objects: &[PathBuf],
+        def_path: &Path,
+    ) -> Result<Option<PathBuf>, Error> {
+        if !self.is_msvc_like() {
+            return Ok(None);
+        }
+        let dumpbin = match self.cxx.parent().map(|d| d.join("dumpbin.exe")) {
+            Some(p) if p.is_file() => p,
+            _ => match which::which("dumpbin.exe").or_else(|_| which::which("dumpbin")) {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
+            },
+        };
+        let mut entries: Vec<(String, bool)> = Vec::new();
+        for obj in objects {
+            let headers = run_dumpbin(&dumpbin, "/HEADERS", obj)?;
+            let code = dumpbin_code_sections(&headers);
+            let symbols = run_dumpbin(&dumpbin, "/SYMBOLS", obj)?;
+            entries.extend(dumpbin_defined_symbols(&symbols, &code));
+        }
+        // First occurrence wins (deterministic object order); a name in
+        // both code and data sections is an ODR violation upstream.
+        let mut seen = BTreeSet::new();
+        let mut text = String::from("EXPORTS\n");
+        let mut count = 0u32;
+        for (name, is_code) in &entries {
+            if !seen.insert(name) {
+                continue;
+            }
+            text.push_str(name);
+            if !is_code {
+                text.push_str(" DATA");
+            }
+            text.push('\n');
+            count += 1;
+        }
+        if count == 0 {
+            return Ok(None);
+        }
+        std::fs::write(def_path, text)?;
+        Ok(Some(def_path.to_path_buf()))
     }
 
     /// Build an archive `Command` for `objects` → static library `output`.
@@ -660,6 +888,9 @@ pub struct CompileOptions {
     pub include_dirs: Vec<PathBuf>,
     /// Link-time optimization.
     pub lto: bool,
+    /// Position-independent code (`-fPIC` on GNU/Clang; MSVC-like
+    /// toolchains need nothing). Set for shared-library objects.
+    pub pic: bool,
     /// Sanitizers, e.g. `["address"]` (MSVC supports only `address` — see
     /// [`CxxToolchain::validate_options`]).
     pub sanitizers: Vec<String>,
@@ -677,6 +908,7 @@ impl Default for CompileOptions {
             defines: Vec::new(),
             include_dirs: Vec::new(),
             lto: false,
+            pic: false,
             sanitizers: Vec::new(),
             features: Vec::new(),
         }
@@ -1110,6 +1342,105 @@ fn query_version_with_env(
 
 /// Accept a `cl.exe` found in `PATH`: the inherited environment is assumed
 /// to work (dev prompt). Verifies the binary executes.
+/// Run `dumpbin <flag> <obj>`, returning stdout (combined output in the
+/// error on failure).
+fn run_dumpbin(dumpbin: &Path, flag: &str, obj: &Path) -> Result<String, Error> {
+    let out = Command::new(dumpbin)
+        .arg(flag)
+        .arg(obj)
+        .output()
+        .map_err(|e| Error::CommandFailed {
+            what: format!("run dumpbin {flag} on {}", obj.display()),
+            message: format!(
+                "{e}. Fix: repair the Visual Studio install providing {}",
+                dumpbin.display()
+            ),
+        })?;
+    if !out.status.success() {
+        let mut combined = out.stdout;
+        combined.extend_from_slice(&out.stderr);
+        return Err(Error::CommandFailed {
+            what: format!("run dumpbin {flag} on {}", obj.display()),
+            message: format!(
+                "{}. Fix: check the object file is a valid COFF object",
+                String::from_utf8_lossy(&combined).trim()
+            ),
+        });
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Parse `dumpbin /HEADERS` output: section numbers whose characteristics
+/// mark code (`IMAGE_SCN_CNT_CODE`, bit `0x20` of the `<hex> flags` line).
+/// Both `SECTION HEADER #n` and `SECTn` number sections decimally.
+fn dumpbin_code_sections(text: &str) -> BTreeSet<u32> {
+    let mut out = BTreeSet::new();
+    let mut current: Option<u32> = None;
+    let mut is_code = false;
+    let flush = |current: &mut Option<u32>, is_code: &mut bool, out: &mut BTreeSet<u32>| {
+        if let Some(n) = current.take() {
+            if *is_code {
+                out.insert(n);
+            }
+        }
+        *is_code = false;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.trim_start().strip_prefix("SECTION HEADER #") {
+            flush(&mut current, &mut is_code, &mut out);
+            current = rest.split_whitespace().next().and_then(|n| n.parse().ok());
+        } else if current.is_some() {
+            if let Some(hex) = line.trim().strip_suffix("flags").map(str::trim) {
+                if let Ok(flags) = u32::from_str_radix(hex, 16) {
+                    if flags & 0x20 != 0 {
+                        is_code = true;
+                    }
+                }
+            }
+        }
+    }
+    flush(&mut current, &mut is_code, &mut out);
+    out
+}
+
+/// Parse `dumpbin /SYMBOLS` output into `(decorated name, defined-in-code)`
+/// for `External`-class symbols in real sections (`SECTn`, never `UNDEF`
+/// imports). Skips `__`-prefixed compiler internals (reserved names user
+/// code cannot define) and anything that is not a clean single token.
+fn dumpbin_defined_symbols(text: &str, code: &BTreeSet<u32>) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut halves = line.split('|');
+        let (Some(left), Some(name)) = (halves.next(), halves.next()) else {
+            continue;
+        };
+        // The name column may carry an undecorated suffix
+        // (`?f@@YAHXZ (int __cdecl f(void))`): cut at whitespace.
+        let name = name.split_whitespace().next().unwrap_or("");
+        if name.is_empty() || name.starts_with("__") || name.bytes().any(|b| b.is_ascii_control()) {
+            continue;
+        }
+        let mut fields = left.split_whitespace();
+        let (Some(_idx), Some(_val), Some(sect)) = (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        // The type column varies (`notype` vs `notype ()`), so the storage
+        // class reads as the last column.
+        if left.split_whitespace().last() != Some("External") {
+            continue;
+        }
+        let Some(num) = sect
+            .strip_prefix("SECT")
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        out.push((name.to_string(), code.contains(&num)));
+    }
+    out
+}
+
 fn probe_msvc_inherited_env(cl: &Path) -> Result<CxxToolchain, String> {
     let version = query_version(cl, &[]);
     if version.starts_with("<could not run") {
@@ -1623,6 +1954,149 @@ mod tests {
         cmd.get_args()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    #[test]
+    fn pic_maps_to_fpic_on_gnu_only() {
+        let opts = CompileOptions {
+            pic: true,
+            ..Default::default()
+        };
+        let gcc = fake(ToolchainKind::Gcc);
+        let args = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
+        assert!(args.iter().any(|a| a == "-fPIC"), "got: {args:?}");
+        let msvc = fake(ToolchainKind::Msvc);
+        let args = msvc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts);
+        assert!(!args.iter().any(|a| a == "-fPIC"), "got: {args:?}");
+        let plain = CompileOptions::default();
+        let args = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &plain);
+        assert!(!args.iter().any(|a| a == "-fPIC"), "got: {args:?}");
+    }
+
+    #[test]
+    fn fingerprint_pic_suffix_appends_without_changing_base() {
+        let tc = fake(ToolchainKind::Gcc);
+        let base = tc.fingerprint(&CompileOptions::default());
+        // Base format untouched (no spurious rebuilds for static builds).
+        assert!(!base.contains("|pic="), "got: {base}");
+        let pic = CompileOptions {
+            pic: true,
+            ..Default::default()
+        };
+        assert_eq!(tc.fingerprint(&pic), format!("{base}|pic=1"));
+    }
+
+    #[test]
+    fn shared_and_import_filenames() {
+        let msvc = fake(ToolchainKind::Msvc);
+        let gcc = fake(ToolchainKind::Gcc);
+        assert_eq!(msvc.importlib_filename("foo"), "foo.lib");
+        if cfg!(windows) {
+            assert_eq!(msvc.sharedlib_filename("foo"), "foo.dll");
+            assert_eq!(gcc.sharedlib_filename("foo"), "foo.dll");
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(gcc.sharedlib_filename("foo"), "libfoo.dylib");
+        } else {
+            assert_eq!(gcc.sharedlib_filename("foo"), "libfoo.so");
+        }
+    }
+
+    #[test]
+    fn dll_link_invocation_per_family() {
+        let opts = CompileOptions::default();
+        let msvc = fake(ToolchainKind::Msvc);
+        let outputs = DllOutputs {
+            dll: Path::new("a.dll"),
+            implib: Path::new("a.lib"),
+            def: Some(Path::new("a.def")),
+        };
+        let link = msvc.link_dll_command(&[PathBuf::from("a.obj")], &[], &[], &[], &outputs, &opts);
+        let args = args_of(&link);
+        assert!(args.iter().any(|a| a == "/DLL"), "got: {args:?}");
+        assert!(args.iter().any(|a| a.contains("/OUT:")), "got: {args:?}");
+        assert!(args.iter().any(|a| a.contains("/IMPLIB:")), "got: {args:?}");
+        assert!(args.iter().any(|a| a.contains("/DEF:")), "got: {args:?}");
+        // Linker-only options must follow `/link`: placed before it, `cl`
+        // ignores them and falls back to linking an exe.
+        let link_pos = args.iter().position(|a| a == "/link").unwrap();
+        let out_pos = args.iter().position(|a| a.contains("/OUT:")).unwrap();
+        let dll_pos = args.iter().position(|a| a == "/DLL").unwrap();
+        assert!(link_pos < out_pos && link_pos < dll_pos, "got: {args:?}");
+        let gcc = fake(ToolchainKind::Gcc);
+        let outputs = DllOutputs {
+            dll: Path::new("liba.so"),
+            implib: Path::new("liba.so"),
+            def: None,
+        };
+        let link = gcc.link_dll_command(&[PathBuf::from("a.o")], &[], &[], &[], &outputs, &opts);
+        let args = args_of(&link);
+        if cfg!(target_os = "macos") {
+            assert!(args.iter().any(|a| a == "-dynamiclib"), "got: {args:?}");
+        } else {
+            assert!(args.iter().any(|a| a == "-shared"), "got: {args:?}");
+            assert!(
+                args.iter().any(|a| a == "-Wl,-soname,liba.so"),
+                "got: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn exe_rpath_follows_shared_inputs() {
+        let gcc = fake(ToolchainKind::Gcc);
+        let opts = CompileOptions::default();
+        let plain = gcc.link_exe_command(
+            &[PathBuf::from("a.o")],
+            &[PathBuf::from("liba.a")],
+            &[],
+            &[],
+            Path::new("a"),
+            &opts,
+        );
+        let args = args_of(&plain);
+        assert!(!args.iter().any(|a| a.contains("rpath")), "got: {args:?}");
+        if cfg!(windows) {
+            return;
+        }
+        let linked = gcc.link_exe_command(
+            &[PathBuf::from("a.o")],
+            &[PathBuf::from("liba.so")],
+            &[],
+            &[],
+            Path::new("a"),
+            &opts,
+        );
+        let args = args_of(&linked);
+        if cfg!(target_os = "macos") {
+            assert!(
+                args.iter().any(|a| a == "-Wl,-rpath,@loader_path"),
+                "got: {args:?}"
+            );
+        } else {
+            assert!(
+                args.iter().any(|a| a == "-Wl,-rpath,$ORIGIN"),
+                "got: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dumpbin_parsers_read_real_output() {
+        // Captured from dumpbin 14.51 on a real object (dllexport fn).
+        let headers = "SECTION HEADER #1\n  100A00 flags\nSECTION HEADER #2\n42100040 flags\nSECTION HEADER #3\n60500020 flags\nSECTION HEADER #4\n     A00 flags\n";
+        let code = dumpbin_code_sections(headers);
+        assert_eq!(code, BTreeSet::from([3]));
+        let symbols = "008 00000000 SECT3  notype ()    External     | ?answer@@YAHXZ (int __cdecl answer(void))\n009 00000000 SECT4  notype       Static       | .chks64\n01A 00000000 UNDEF  notype ()    External     | __imp_foo\n";
+        assert_eq!(
+            dumpbin_defined_symbols(symbols, &code),
+            vec![("?answer@@YAHXZ".to_string(), true)]
+        );
+        // Data section → DATA export; dunder internals skipped.
+        let symbols = "010 00000004 SECT4  notype       External     | ?count@@3HA\n011 00000000 SECT4  notype       External     | ___security_cookie\n";
+        assert_eq!(
+            dumpbin_defined_symbols(symbols, &code),
+            vec![("?count@@3HA".to_string(), false)]
+        );
     }
 
     #[test]

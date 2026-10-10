@@ -1051,8 +1051,8 @@ pub fn resolve_bins(manifest: &Manifest) -> Vec<ResolvedBin> {
 pub struct ResolvedLib {
     /// Library name (explicit `lib.name`, else the package name).
     pub name: String,
-    /// `static` | `shared` | `header-only` (as written; `shared` is rejected
-    /// at build time — it needs an export story that does not exist yet).
+    /// `static` | `shared` | `header-only` (as written; `shared` links a
+    /// dynamic library — only explicitly exported symbols travel).
     pub lib_type: String,
     /// Absolute root sources (empty for header-only).
     pub roots: Vec<PathBuf>,

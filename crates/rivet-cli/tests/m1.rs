@@ -299,6 +299,28 @@ fn find_archive(pkg: &Path) -> Option<PathBuf> {
     found
 }
 
+/// First file under `target/` with file stem `stem` and one of `exts`.
+fn find_built(pkg: &Path, stem: &str, exts: &[&str]) -> Option<PathBuf> {
+    let mut stack = vec![pkg.join("target")];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_stem().and_then(|s| s.to_str()) == Some(stem)
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| exts.contains(&e))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn new_lib_scaffolds_and_builds() {
     if !toolchain_available() {
@@ -352,14 +374,26 @@ fn new_shared_and_init_lib() {
     let pkg: PathBuf = dir.path().join("shlib");
     let manifest = std::fs::read_to_string(pkg.join("rivet.json")).unwrap();
     assert!(manifest.contains("\"shared\""), "got: {manifest}");
-    // Shared linking needs the export/SONAME story (tracked): the build
-    // must fail actionably, not silently.
+    // Shared linking works: the DLL (plus import library on Windows)
+    // is produced. The sample exports nothing, so only the build
+    // succeeding (not running) is asserted here.
     rivet()
         .current_dir(&pkg)
         .arg("build")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("not supported yet"));
+        .success()
+        .stdout(predicate::str::contains("Finished"));
+    let exts: &[&str] = if cfg!(windows) {
+        &["dll"]
+    } else if cfg!(target_os = "macos") {
+        &["dylib"]
+    } else {
+        &["so"]
+    };
+    assert!(
+        find_built(&pkg, "shlib", exts).is_some(),
+        "shared library output missing"
+    );
 
     // `init --lib` scaffolds in the current directory.
     let init_dir = dir.path().join("initlib");

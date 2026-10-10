@@ -993,12 +993,24 @@ pub fn unit_inputs(
         let target = base.join("build");
         if dep.adapter.is_none() {
             if let Ok(Some(lib)) = m::resolve_lib(&dep.manifest) {
-                if rivet_manifest::lib_has_sources(&lib) && lib.lib_type == "static" {
-                    let archive = target.join(toolchain.staticlib_filename(&lib.name));
-                    // The archive may not exist yet on a fresh `is_fresh` probe;
-                    // link planning records it regardless, and the build creates
-                    // deps first (topo order), so it exists at link time.
-                    inputs.archives.push(archive);
+                if rivet_manifest::lib_has_sources(&lib) {
+                    if lib.lib_type == "static" {
+                        let archive = target.join(toolchain.staticlib_filename(&lib.name));
+                        // The archive may not exist yet on a fresh `is_fresh` probe;
+                        // link planning records it regardless, and the build creates
+                        // deps first (topo order), so it exists at link time.
+                        inputs.archives.push(archive);
+                    } else if lib.lib_type == "shared" {
+                        // Linkable form: the import library on Windows (the
+                        // DLL itself cannot link), the shared object itself
+                        // elsewhere. Same freshness reasoning as above.
+                        let file = if cfg!(windows) {
+                            target.join(toolchain.importlib_filename(&lib.name))
+                        } else {
+                            target.join(toolchain.sharedlib_filename(&lib.name))
+                        };
+                        inputs.archives.push(file);
+                    }
                 }
             }
             let inc = dep.dir.join("include");

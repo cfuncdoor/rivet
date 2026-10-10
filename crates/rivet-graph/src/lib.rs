@@ -168,12 +168,6 @@ pub enum Error {
         /// Available names, comma-joined.
         available: String,
     },
-    /// A shared library target was encountered (needs an export/SONAME story).
-    #[error("shared library `{name}` is not supported yet (needs an export/SONAME story). Fix: use `\"type\": \"static\"` or `\"header-only\"` for now")]
-    SharedLib {
-        /// Library name.
-        name: String,
-    },
     /// `--features` named a feature the manifest does not define.
     #[error("unknown feature `{name}`. Available: {available}. Fix: use `--features` with one of these or add it to the `features` table in rivet.json")]
     UnknownFeature {
@@ -235,6 +229,8 @@ pub enum TargetKind {
     Bin,
     /// Static archive.
     StaticLib,
+    /// Dynamic library (DLL/`.so`/`.dylib`).
+    SharedLib,
 }
 
 /// One translation-unit job: source → object (+ optional depfile).
@@ -361,7 +357,7 @@ fn make_target(
 ) -> TargetBuild {
     let tag = match kind {
         TargetKind::Bin => format!("bin-{name}"),
-        TargetKind::StaticLib => format!("lib-{name}"),
+        TargetKind::StaticLib | TargetKind::SharedLib => format!("lib-{name}"),
     };
     let objects_dir = target_dir.join("build").join(&tag);
     let depfiles_dir = target_dir.join("deps").join(&tag);
@@ -441,11 +437,6 @@ pub fn plan_with_target(
     check_profile(profile)?;
     let resolved_lib = m::resolve_lib(manifest)?;
     if let Some(lib) = &resolved_lib {
-        if lib.lib_type == "shared" {
-            return Err(Error::SharedLib {
-                name: lib.name.clone(),
-            });
-        }
         if lib.lib_type == "header-only" && m::lib_has_sources(lib) {
             return Err(m::Error::path_error(
                 "lib",
@@ -487,11 +478,22 @@ pub fn plan_with_target(
                     path: "lib sources (src/lib.cpp or `lib.path`)".to_string(),
                 });
             }
-            let output = target_dir
-                .join("build")
-                .join(toolchain.staticlib_filename(&lib.name));
+            let shared = lib.lib_type == "shared";
+            let output = if shared {
+                target_dir
+                    .join("build")
+                    .join(toolchain.sharedlib_filename(&lib.name))
+            } else {
+                target_dir
+                    .join("build")
+                    .join(toolchain.staticlib_filename(&lib.name))
+            };
             Some(make_target(
-                TargetKind::StaticLib,
+                if shared {
+                    TargetKind::SharedLib
+                } else {
+                    TargetKind::StaticLib
+                },
                 &lib.name,
                 sources,
                 manifest,
@@ -547,6 +549,7 @@ pub fn compile_options(
         lto: prof.lto,
         sanitizers: prof.sanitizers.clone(),
         features: features.iter().cloned().collect(),
+        pic: false,
     }
 }
 
@@ -574,6 +577,15 @@ fn full_compile_options(
     for inc in &script.includes {
         if !opts.include_dirs.contains(inc) {
             opts.include_dirs.push(inc.clone());
+        }
+    }
+    // Shared libraries need position-independent objects; the flag joins
+    // the toolchain fingerprint, so a static/shared switch rebuilds.
+    // The export macro (CMake-style) lets one header serve both sides.
+    opts.pic = manifest_lib_is_shared(manifest);
+    if let Some(export_macro) = shared_export_macro(manifest) {
+        if !opts.defines.contains(&export_macro) {
+            opts.defines.push(export_macro);
         }
     }
     opts
@@ -628,12 +640,52 @@ pub struct UnitSummary {
     pub cached: bool,
 }
 
+/// `true` when the manifest declares a shared library (position-independent
+/// objects + dynamic link). Unresolvable manifests never reach here (load
+/// validates first), so errors read as "not shared".
+fn manifest_lib_is_shared(manifest: &Manifest) -> bool {
+    m::resolve_lib(manifest)
+        .ok()
+        .flatten()
+        .is_some_and(|l| l.lib_type == "shared")
+}
+
+/// Export macro for a shared lib build (`<name>_EXPORTS`, CMake-style):
+/// compiling the lib itself defines it (so `__declspec(dllexport)`-style
+/// headers mark symbols exported), consumers see it undefined (so the
+/// same header declares them imported). Non-identifier characters become
+/// `_`; a leading digit gains a `_` prefix. `None` when not shared.
+fn shared_export_macro(manifest: &Manifest) -> Option<String> {
+    let lib = m::resolve_lib(manifest).ok().flatten()?;
+    if lib.lib_type != "shared" {
+        return None;
+    }
+    let mut macro_name: String = lib
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if macro_name.starts_with(|c: char| c.is_ascii_digit()) {
+        macro_name.insert(0, '_');
+    }
+    macro_name.push_str("_EXPORTS");
+    Some(macro_name)
+}
+
 /// Fingerprint for a package build.
 ///
 /// Covers toolchain + resolved flags + features + link-only inputs.
 /// `script` contributes its defines/includes through the options;
 /// `lib_dirs`/`sys_libs` (link-only, invisible to the compile fingerprint)
-/// join as a content hash so probe changes rebuild.
+/// join as a content hash so probe changes rebuild. A shared lib forces
+/// position-independent objects (`pic`), which joins the toolchain
+/// fingerprint and invalidates everything on a static/shared switch.
 fn fingerprint_for(
     manifest: &Manifest,
     profile: &str,
@@ -824,8 +876,15 @@ fn deps_changed(
 fn link_id(t: &TargetBuild) -> String {
     match t.kind {
         TargetKind::Bin => format!("bin:{}", t.name),
-        TargetKind::StaticLib => format!("lib:{}", t.name),
+        TargetKind::StaticLib | TargetKind::SharedLib => format!("lib:{}", t.name),
     }
+}
+
+/// Import library beside a shared output: link input on Windows (the DLL
+/// itself cannot link); elsewhere the shared object links directly, so
+/// callers only use this under `cfg!(windows)`.
+fn import_library_for(lib_output: &Path) -> PathBuf {
+    lib_output.with_extension("lib")
 }
 
 /// Digest over current link inputs for an output, or `None` when any input
@@ -959,16 +1018,97 @@ fn full_link_inputs(
 }
 
 /// Archives on a target's link line: own lib archive (bins only) plus
-/// dependency archives, in link order.
+/// dependency archives, in link order. A shared own lib contributes its
+/// import library on Windows (the DLL cannot link); elsewhere the shared
+/// object itself.
 fn link_archives(plan: &PackagePlan, t: &TargetBuild, inputs: &UnitInputs) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if t.kind == TargetKind::Bin {
         if let Some(lib) = &plan.lib {
-            out.push(lib.output.clone());
+            if lib.kind == TargetKind::SharedLib && cfg!(windows) {
+                out.push(import_library_for(&lib.output));
+            } else {
+                out.push(lib.output.clone());
+            }
         }
     }
     out.extend(inputs.archives.iter().cloned());
     out
+}
+
+/// Copy shared runtime files next to every bin output (fresh or not).
+/// The CLI calls this for units that probe `Fresh` (their `build_unit`
+/// never runs, so link-time staging alone would go stale when a DLL
+/// changes under a byte-identical import library).
+pub fn ensure_staged_outputs(
+    manifest: &Manifest,
+    plan: &PackagePlan,
+    inputs: &UnitInputs,
+) -> Result<(), Error> {
+    let (script, _) = script::peek_script(manifest, &plan.target_dir)?;
+    for bin in &plan.bins {
+        let (archives, _, _) = full_link_inputs(plan, bin, inputs, &script);
+        stage_shared_outputs(&archives, &bin.output)?;
+    }
+    Ok(())
+}
+
+/// Runtime file for a link input, if any: shared objects travel as-is; a
+/// `.lib` with a sibling `.dll` is an import library whose DLL must travel
+/// with the binary. Anything else (static archives, bare names resolved
+/// elsewhere) needs no staging.
+fn runtime_file_for(archive: &Path) -> Option<PathBuf> {
+    let ext = archive.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext.eq_ignore_ascii_case("so")
+        || ext.eq_ignore_ascii_case("dylib")
+        || ext.eq_ignore_ascii_case("dll")
+    {
+        return Some(archive.to_path_buf());
+    }
+    if ext.eq_ignore_ascii_case("lib") {
+        let dll = archive.with_extension("dll");
+        if dll.is_file() {
+            return Some(dll);
+        }
+    }
+    None
+}
+
+/// Copy shared runtime files next to a freshly linked binary so it runs
+/// from its own directory (Windows has no rpath; on Unix this keeps
+/// `rivet run` working without `LD_LIBRARY_PATH`). Copies when the
+/// destination is missing, smaller, or older.
+fn stage_shared_outputs(archives: &[PathBuf], bin_output: &Path) -> Result<(), Error> {
+    let Some(dir) = bin_output.parent() else {
+        return Ok(());
+    };
+    for archive in archives {
+        let Some(src) = runtime_file_for(archive) else {
+            continue;
+        };
+        let Some(name) = src.file_name() else {
+            continue;
+        };
+        let dst = dir.join(name);
+        if dst == src {
+            continue;
+        }
+        let fresh = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            (Ok(s), Ok(d)) => s.len() != d.len() || s.modified().ok() > d.modified().ok(),
+            (Ok(_), Err(_)) => true,
+            _ => continue,
+        };
+        if fresh {
+            std::fs::copy(&src, &dst).map_err(|e| Error::CompileFailed {
+                what: format!(
+                    "could not stage shared library {} next to {} ({e}). Fix: check disk space and permissions",
+                    src.display(),
+                    dst.display()
+                ),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Delete a file, ignoring not-found.
@@ -1200,43 +1340,97 @@ pub fn build_unit(
         }
     }
 
-    // 3. Archive the static lib (if its TUs were rebuilt or it is missing).
+    // 3. Link the lib: archive static libs, link shared libs (when its
+    // TUs were rebuilt or the output is missing).
     // One memo map serves the lib and bin digests below so shared
     // archives hash once.
     let mut build_hashes: HashMap<PathBuf, Option<String>> = HashMap::new();
     if let Some(lib) = &plan.lib {
         let lib_rebuilt = summary.recompiled.iter().any(|(tag, _)| tag == &lib.tag);
         if lib_rebuilt || !lib.output.is_file() {
-            let mut cmd = toolchain.archive_command(
-                &lib.jobs
-                    .iter()
-                    .map(|j| j.obj_abs.clone())
-                    .collect::<Vec<_>>(),
-                &lib.output,
-            )?;
-            cmd.current_dir(&manifest.dir);
-            if opts.verbose {
-                summary.log.push(format!("Running `{cmd:?}`"));
-            }
-            let out = cmd.output().map_err(|e| Error::CompileFailed {
-                what: format!(
-                    "could not execute {} ({e}). Fix: check `rivet toolchains` output",
-                    toolchain
-                        .ar
-                        .as_ref()
-                        .map(|a| a.display().to_string())
-                        .unwrap_or_else(|| "<archiver>".to_string())
-                ),
-            })?;
-            if !out.status.success() {
-                let _ = std::io::stdout().lock().write_all(&out.stdout);
-                let _ = std::io::stderr().lock().write_all(&out.stderr);
-                return Err(Error::CompileFailed {
+            if lib.kind == TargetKind::SharedLib {
+                let objects: Vec<PathBuf> = lib.jobs.iter().map(|j| j.obj_abs.clone()).collect();
+                let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, lib, inputs, &script);
+                // Export-all DEF so unmarked symbols travel (other linkers
+                // do this by default). Derived from the objects, never an
+                // input: no state impact.
+                let def_path = plan
+                    .target_dir
+                    .join("build")
+                    .join(format!("{}.def", lib.name));
+                let def = toolchain.export_def_for(&objects, &def_path)?;
+                if def.is_none() && toolchain.is_msvc_like() && opts.verbose {
+                    summary.log.push(format!(
+                        "no dumpbin for {}; linking without generated exports",
+                        lib.name
+                    ));
+                }
+                let implib = import_library_for(&lib.output);
+                let outputs = rivet_toolchain::DllOutputs {
+                    dll: &lib.output,
+                    implib: &implib,
+                    def: def.as_deref(),
+                };
+                let mut cmd = toolchain.link_dll_command(
+                    &objects,
+                    &archives,
+                    &lib_dirs,
+                    &sys_libs,
+                    &outputs,
+                    &compile_opts,
+                );
+                cmd.current_dir(&manifest.dir);
+                if opts.verbose {
+                    summary.log.push(format!("Running `{cmd:?}`"));
+                }
+                let out = cmd.output().map_err(|e| Error::CompileFailed {
                     what: format!(
-                        "archive failed for {} with {} (diagnostics above)",
-                        lib.name, out.status
+                        "could not execute {} ({e}). Fix: check `rivet toolchains` output",
+                        toolchain.cxx.display()
                     ),
-                });
+                })?;
+                if !out.status.success() {
+                    let _ = std::io::stdout().lock().write_all(&out.stdout);
+                    let _ = std::io::stderr().lock().write_all(&out.stderr);
+                    return Err(Error::CompileFailed {
+                        what: format!(
+                            "shared link failed for {} with {} (diagnostics above)",
+                            lib.name, out.status
+                        ),
+                    });
+                }
+            } else {
+                let mut cmd = toolchain.archive_command(
+                    &lib.jobs
+                        .iter()
+                        .map(|j| j.obj_abs.clone())
+                        .collect::<Vec<_>>(),
+                    &lib.output,
+                )?;
+                cmd.current_dir(&manifest.dir);
+                if opts.verbose {
+                    summary.log.push(format!("Running `{cmd:?}`"));
+                }
+                let out = cmd.output().map_err(|e| Error::CompileFailed {
+                    what: format!(
+                        "could not execute {} ({e}). Fix: check `rivet toolchains` output",
+                        toolchain
+                            .ar
+                            .as_ref()
+                            .map(|a| a.display().to_string())
+                            .unwrap_or_else(|| "<archiver>".to_string())
+                    ),
+                })?;
+                if !out.status.success() {
+                    let _ = std::io::stdout().lock().write_all(&out.stdout);
+                    let _ = std::io::stderr().lock().write_all(&out.stderr);
+                    return Err(Error::CompileFailed {
+                        what: format!(
+                            "archive failed for {} with {} (diagnostics above)",
+                            lib.name, out.status
+                        ),
+                    });
+                }
             }
             summary.relinked.push(lib.output.clone());
         }
@@ -1307,13 +1501,17 @@ pub fn build_unit(
                 }
             }
         };
+        let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, bin, inputs, &script);
         let needs =
             bin_rebuilt || !bin.output.is_file() || digest.as_ref() != st.link(&link_id(bin));
         if !needs {
+            // Fresh binaries still refresh staged runtime files: a DLL can
+            // change while its import library (the hashed link input) stays
+            // byte-identical, and only the staged copy would go stale.
+            stage_shared_outputs(&archives, &bin.output)?;
             continue;
         }
         let objects: Vec<PathBuf> = bin.jobs.iter().map(|j| j.obj_abs.clone()).collect();
-        let (archives, lib_dirs, sys_libs) = full_link_inputs(plan, bin, inputs, &script);
         let mut cmd = toolchain.link_exe_command(
             &objects,
             &archives,
@@ -1343,6 +1541,9 @@ pub fn build_unit(
             });
         }
         summary.relinked.push(bin.output.clone());
+        // Shared inputs must travel with the binary for it to run from
+        // its own directory.
+        stage_shared_outputs(&archives, &bin.output)?;
         if let Some(digest) = digest {
             st.record_link(&link_id(bin), digest);
         }
@@ -1363,11 +1564,16 @@ pub fn build_unit(
     Ok(summary)
 }
 
-/// All plan outputs (exes + archives).
+/// All plan outputs (exes + archives). A shared lib contributes its
+/// import library too on Windows, so cache restores keep dependents
+/// linkable.
 fn all_outputs(plan: &PackagePlan) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = plan.bins.iter().map(|b| b.output.clone()).collect();
     if let Some(lib) = &plan.lib {
         out.push(lib.output.clone());
+        if lib.kind == TargetKind::SharedLib && cfg!(windows) {
+            out.push(import_library_for(&lib.output));
+        }
     }
     out
 }
@@ -1774,9 +1980,8 @@ mod tests {
         // Distinct object dirs: no bin/lib collision.
         assert_ne!(lib.objects_dir, p.bins[0].objects_dir);
     }
-
     #[test]
-    fn shared_lib_is_an_m7_error() {
+    fn shared_lib_plans_dynamic_output() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.cpp"), "").unwrap();
@@ -1784,10 +1989,18 @@ mod tests {
             dir.path(),
             "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"lib\":{\"type\":\"shared\"}}",
         );
-        let err = plan_with(&m, "dev", &fake_toolchain())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("not supported"), "got: {err}");
+        let p = plan_with(&m, "dev", &fake_toolchain()).unwrap();
+        let lib = p.lib.as_ref().unwrap();
+        assert_eq!(lib.kind, TargetKind::SharedLib);
+        assert_eq!(lib.tag, "lib-a");
+        let output = lib.output.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            assert!(output.ends_with("a.dll"), "got: {output}");
+        } else if cfg!(target_os = "macos") {
+            assert!(output.ends_with("liba.dylib"), "got: {output}");
+        } else {
+            assert!(output.ends_with("liba.so"), "got: {output}");
+        }
     }
 
     #[test]
@@ -1846,5 +2059,88 @@ mod tests {
         assert_eq!(archives.len(), 2);
         assert_eq!(archives[0], p.lib.as_ref().unwrap().output);
         assert_eq!(archives[1], PathBuf::from("/dep/libd.a"));
+    }
+
+    #[test]
+    fn link_archives_shared_lib_uses_linkable_form() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        for f in ["main.cpp", "lib.cpp"] {
+            std::fs::write(dir.path().join("src").join(f), "").unwrap();
+        }
+        let m = manifest_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"lib\":{\"type\":\"shared\"}}",
+        );
+        let p = plan_with(&m, "dev", &fake_toolchain()).unwrap();
+        let inputs = UnitInputs::default();
+        let archives = link_archives(&p, &p.bins[0], &inputs);
+        assert_eq!(archives.len(), 1);
+        let linked = &archives[0];
+        if cfg!(windows) {
+            // Import library, never the DLL itself (LNK1107).
+            assert!(
+                linked.to_string_lossy().ends_with("a.lib"),
+                "got: {linked:?}"
+            );
+            assert_ne!(linked, &p.lib.as_ref().unwrap().output);
+        } else {
+            assert_eq!(linked, &p.lib.as_ref().unwrap().output);
+        }
+    }
+
+    #[test]
+    fn runtime_file_for_picks_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("libx.so"), b"x").unwrap();
+        std::fs::write(dir.path().join("x.lib"), b"x").unwrap();
+        std::fs::write(dir.path().join("x.dll"), b"x").unwrap();
+        std::fs::write(dir.path().join("y.lib"), b"x").unwrap();
+        assert_eq!(
+            runtime_file_for(&dir.path().join("libx.so")),
+            Some(dir.path().join("libx.so"))
+        );
+        // Import lib with a DLL sibling stages the DLL.
+        assert_eq!(
+            runtime_file_for(&dir.path().join("x.lib")),
+            Some(dir.path().join("x.dll"))
+        );
+        // Lone static archive: nothing to stage.
+        assert_eq!(runtime_file_for(&dir.path().join("y.lib")), None);
+    }
+
+    #[test]
+    fn fingerprint_flips_on_static_shared_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.cpp"), "").unwrap();
+        let tc = fake_toolchain();
+        let inputs = UnitInputs::default();
+        let features = BTreeSet::new();
+        let script = script::ScriptUse::default();
+        let static_fp = fingerprint_for(
+            &manifest_in(
+                dir.path(),
+                "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+            ),
+            "dev",
+            &inputs,
+            &tc,
+            &features,
+            &script,
+        );
+        let shared_fp = fingerprint_for(
+            &manifest_in(
+                dir.path(),
+                "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"lib\":{\"type\":\"shared\"}}",
+            ),
+            "dev",
+            &inputs,
+            &tc,
+            &features,
+            &script,
+        );
+        assert_ne!(static_fp, shared_fp);
+        assert!(shared_fp.contains("|pic=1"), "got: {shared_fp}");
     }
 }

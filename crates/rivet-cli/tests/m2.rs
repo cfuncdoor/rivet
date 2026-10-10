@@ -547,22 +547,9 @@ fn keep_going_reports_all_failures() {
 }
 
 #[test]
-fn shared_and_unindexed_deps_fail_actionably() {
-    // No compiler needed: both fail during planning, before detection.
+fn unindexed_deps_fail_actionably() {
+    // No compiler needed: fails during planning, before detection.
     let dir = TempDir::new().unwrap();
-    let pkg = dir.path().join("app");
-    write_pkg(
-        &pkg,
-        "{\"package\":{\"name\":\"app\",\"version\":\"0.1.0\"},\"lib\":{\"type\":\"shared\"}}",
-    );
-    write_src(&pkg, "src/lib.cpp", "int f() { return 0; }\n");
-    rivet()
-        .current_dir(&pkg)
-        .arg("build")
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("not supported"));
-
     let pkg2 = dir.path().join("app2");
     write_pkg(
         &pkg2,
@@ -575,4 +562,112 @@ fn shared_and_unindexed_deps_fail_actionably() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("not in the local index copy"));
+}
+
+fn find_built(pkg: &Path, stem: &str, exts: &[&str]) -> Option<PathBuf> {
+    let mut stack = vec![pkg.join("target")];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_stem().and_then(|s| s.to_str()) == Some(stem)
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| exts.contains(&e))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn shared_lib_links_runs_and_rebuilds() {
+    if !toolchain_available() {
+        eprintln!("SKIP: no C++ toolchain detected");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let lib = dir.path().join("shlib");
+    write_pkg(
+        &lib,
+        "{\"package\":{\"name\":\"shlib\",\"version\":\"0.1.0\"},\"lib\":{\"type\":\"shared\"}}",
+    );
+    // CMake-style export macro: rivet defines `shlib_EXPORTS` when
+    // compiling the lib itself, so one header serves both sides.
+    write_src(
+        &lib,
+        "include/shlib.h",
+        "#pragma once\n#if defined(_WIN32)\n#if defined(shlib_EXPORTS)\n#define SHLIB_API __declspec(dllexport)\n#else\n#define SHLIB_API __declspec(dllimport)\n#endif\n#else\n#define SHLIB_API __attribute__((visibility(\"default\")))\n#endif\nint SHLIB_API answer();\n",
+    );
+    write_src(
+        &lib,
+        "src/lib.cpp",
+        "#include \"shlib.h\"\nint SHLIB_API answer() { return 42; }\n",
+    );
+    let app = dir.path().join("app");
+    write_pkg(
+        &app,
+        "{\"package\":{\"name\":\"app\",\"version\":\"0.1.0\"},\"dependencies\":{\"shlib\":{\"path\":\"../shlib\"}}}",
+    );
+    write_src(
+        &app,
+        "src/main.cpp",
+        "#include <iostream>\n#include \"shlib.h\"\nint main() { std::cout << answer() << '\\n'; }\n",
+    );
+
+    // Full build: DLL/.so + import lib exist, the binary runs (proves the
+    // dep linked AND loads, with its runtime file staged beside the exe).
+    rivet()
+        .current_dir(&app)
+        .arg("build")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Finished"));
+    let dll_exts: &[&str] = if cfg!(windows) {
+        &["dll", "lib"]
+    } else if cfg!(target_os = "macos") {
+        &["dylib"]
+    } else {
+        &["so"]
+    };
+    let dynamic = find_built(&lib, "shlib", dll_exts).expect("shared output must exist");
+    assert!(
+        dynamic.exists(),
+        "shared output missing: {}",
+        dynamic.display()
+    );
+    if cfg!(windows) {
+        assert!(
+            find_built(&lib, "shlib", &["lib"]).is_some(),
+            "import library must exist beside the DLL"
+        );
+        assert!(
+            find_built(&app, "shlib", &["dll"]).is_some(),
+            "DLL must be staged next to the binary"
+        );
+    }
+    rivet()
+        .current_dir(&app)
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("42"));
+
+    // Touching the lib rebuilds + relinks both, still correct.
+    write_src(
+        &lib,
+        "src/lib.cpp",
+        "#include \"shlib.h\"\nint SHLIB_API answer() { return 43; }\n",
+    );
+    rivet()
+        .current_dir(&app)
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("43"));
 }

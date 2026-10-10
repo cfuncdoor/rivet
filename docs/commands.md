@@ -6,7 +6,7 @@ decisions), `--message-format=json`, `--color=auto|always|never`
 
 | Command | What it does |
 |---|---|
-| `rivet new <name> [--lib\|--shared]` / `rivet init [--name n] [--lib\|--shared]` | scaffold a binary, static lib (`src/lib.cpp` + `include/<name>.h`), or shared lib (`--shared` scaffolds only; `build` still needs the export/SONAME story) |
+| `rivet new <name> [--lib\|--shared]` / `rivet init [--name n] [--lib\|--shared]` | scaffold a binary, static lib (`src/lib.cpp` + `include/<name>.h`), or shared lib |
 | `rivet build` | compile + link the scope (incremental, parallel) |
 | `rivet run` | build if needed, run the binary (forwards trailing args) |
 | `rivet test` | build and run `tests/*.cpp` |

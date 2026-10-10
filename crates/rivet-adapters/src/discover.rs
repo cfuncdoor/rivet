@@ -200,10 +200,24 @@ fn is_lib_file_name(name: &str) -> bool {
 }
 
 /// `true` when `file_name` (a library file name) names adapter `target`:
-///-game suffixes (`lib` prefix, extensions, `.so` version suffixes) are
-/// stripped and the comparison is ASCII case-insensitive.
+/// `lib` prefix, extensions, and `.so` version suffixes are stripped from
+/// both sides and the comparison is ASCII case-insensitive. An exact
+/// (case-insensitive) filename match also counts, so `make` targets that
+/// name the archive file (`libmini.a`) match the built file byte-for-byte.
+/// A bare `target` (`mini`, `ma`) matches `libmini.a`/`libma.a` via the
+/// normalized stem, and a target carrying a relative path (`sub/libfoo.a`)
+/// matches on its file-name portion.
 fn stem_matches_target(file_name: &str, target: &str) -> bool {
-    normalize_lib_stem(file_name) == target.to_ascii_lowercase()
+    let file_lower = file_name.to_ascii_lowercase();
+    let mut target_lower = target.to_ascii_lowercase();
+    // A make target may carry a relative path; only its file name matters.
+    if let Some(pos) = target_lower.rfind(['/', '\\']) {
+        target_lower = target_lower[pos + 1..].to_string();
+    }
+    if file_lower == target_lower {
+        return true;
+    }
+    normalize_lib_stem(file_name) == normalize_lib_stem(&target_lower)
 }
 
 /// Strip version suffix, extensions, and a leading `lib`.
@@ -447,5 +461,11 @@ mod tests {
         assert_eq!(normalize_lib_stem("libbar.dylib"), "bar");
         assert!(stem_matches_target("libzlibstatic.a", "zlibstatic"));
         assert!(stem_matches_target("zlibstatic.lib", "ZLIBSTATIC"));
+        // Make-style targets name the archive file itself.
+        assert!(stem_matches_target("libmini.a", "libmini.a"));
+        assert!(stem_matches_target("libmini.a", "mini"));
+        assert!(stem_matches_target("libmini.a", "LIBMINI.A"));
+        assert!(stem_matches_target("libfoo.so.1.2", "libfoo.so.1.2"));
+        assert!(stem_matches_target("foo.lib", "sub/dir/foo.lib"));
     }
 }

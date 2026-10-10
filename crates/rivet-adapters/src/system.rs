@@ -120,12 +120,15 @@ pub(crate) fn probe_pkg_config_with(
 }
 
 /// Map any pkg-config query failure to [`Error::SystemNotFound`].
+/// The detail always names `PKG_CONFIG_PATH` so the fix is actionable even
+/// when pkg-config's own stderr wording changes (or the binary failed to
+/// spawn at all, e.g. a non-executable `pkg-config` shim on Windows).
 fn into_not_found(package: &str, err: Error) -> Error {
     match err {
         Error::CommandFailed { output, .. } => Error::SystemNotFound {
             package: package.to_string(),
             detail: format!(
-                "pkg-config does not know `{package}` ({output}). {}",
+                "pkg-config does not know `{package}` ({output}). Check `PKG_CONFIG_PATH` for its `.pc` file. {}",
                 search_hint(package)
             ),
         },
@@ -463,12 +466,27 @@ mod tests {
         .unwrap();
     }
 
+    /// `true` when `program` actually runs (`--version` succeeds).
+    /// `require_tool` only proves the file exists on `PATH`; on some
+    /// Windows runners that file is a non-executable shim (spawn fails
+    /// with OS error 193), so fixture tests must skip instead of failing.
+    fn pkg_config_runnable(program: &Path) -> bool {
+        std::process::Command::new(program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
     #[test]
     fn pkg_config_fixture_probed_with_path_override() {
         let Some(pc) = require_tool("pkg-config").ok() else {
             eprintln!("SKIP pkg_config_fixture_probed_with_path_override: pkg-config not on PATH");
             return;
         };
+        if !pkg_config_runnable(&pc) {
+            eprintln!("SKIP pkg_config_fixture_probed_with_path_override: pkg-config not runnable");
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         write_pc(dir.path(), "minifig");
         let pcp = dir.path().to_string_lossy().into_owned();
@@ -561,6 +579,10 @@ mod tests {
     fn system_with_real_pkg_config_prefers_it() {
         let Ok(pc) = require_tool("pkg-config") else {
             eprintln!("SKIP system_with_real_pkg_config_prefers_it: pkg-config not on PATH");
+            return;
+        };
+        if !pkg_config_runnable(&pc) {
+            eprintln!("SKIP system_with_real_pkg_config_prefers_it: pkg-config not runnable");
             return;
         };
         let dir = tempfile::tempdir().unwrap();

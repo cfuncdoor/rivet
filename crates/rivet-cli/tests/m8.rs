@@ -246,7 +246,7 @@ fn add_git_cmake_adapter_detected() {
 }
 
 #[test]
-fn add_git_bare_tree_warns_but_resolves() {
+fn add_git_sources_adapter_for_bare_tree() {
     let dir = TempDir::new().unwrap();
     let home = dir.path().join("home");
     let (bare, work) = make_origin(dir.path(), "stray");
@@ -264,15 +264,47 @@ fn add_git_bare_tree_warns_but_resolves() {
         .arg(&spec)
         .assert()
         .success()
-        .stderr(predicate::str::contains("no recognized build"));
+        .stderr(predicate::str::contains(
+            "top-level sources compile directly",
+        ));
     let dep = manifest_dep(&pkg, "stray");
-    assert!(dep.get("adapter").is_none(), "got: {dep}");
+    assert_eq!(
+        dep["adapter"]["tool"],
+        serde_json::Value::String("sources".to_string())
+    );
     assert_eq!(
         dep["package"]["name"],
         serde_json::Value::String("stray".to_string())
     );
-    // Still locked: the dep resolves and builds vacuously.
     assert!(!lock_package(&pkg, "stray").is_null());
+}
+
+#[test]
+fn add_git_bare_empty_warns_but_resolves() {
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let (bare, work) = make_origin(dir.path(), "docsy");
+    write(&work.join("README.md"), "docs only\n");
+    commit_all(&work, "docsy");
+    git(&work, &["tag", "v1.0.0"]);
+    push_all(&work);
+
+    let pkg = new_project(&home, &dir, "app");
+    let spec = format!("{}@v1.0.0", file_url(&bare));
+    rivet(&home)
+        .current_dir(&pkg)
+        .arg("add")
+        .arg(&spec)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("no recognized build"));
+    let dep = manifest_dep(&pkg, "docsy");
+    assert!(dep.get("adapter").is_none(), "got: {dep}");
+    assert_eq!(
+        dep["package"]["name"],
+        serde_json::Value::String("docsy".to_string())
+    );
+    assert!(!lock_package(&pkg, "docsy").is_null());
 }
 
 #[test]
@@ -479,6 +511,46 @@ fn remove_flow_prunes_manifest_and_lock() {
 }
 
 #[test]
+fn add_sources_dep_builds_with_the_program() {
+    if rivet_toolchain::detect().is_err() {
+        eprintln!("SKIP: no C++ toolchain detected");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    // Foreign lib: bare sources, no manifest, no build system.
+    let (bare, work) = make_origin(dir.path(), "calc");
+    write(&work.join("calc.h"), "int calc();\n");
+    write(
+        &work.join("calc.cpp"),
+        "#include \"calc.h\"\nint calc() { return 41; }\n",
+    );
+    commit_all(&work, "calc");
+    git(&work, &["tag", "v1.0.0"]);
+    push_all(&work);
+
+    let pkg = new_project(&home, &dir, "app");
+    let spec = format!("{}@v1.0.0", file_url(&bare));
+    rivet(&home)
+        .current_dir(&pkg)
+        .arg("add")
+        .arg(&spec)
+        .assert()
+        .success();
+    // The app uses the foreign header; the dep compiles + links with it.
+    write(
+        &pkg.join("src").join("main.cpp"),
+        "#include <iostream>\n#include \"calc.h\"\nint main() { std::cout << calc() + 1 << '\\n'; }\n",
+    );
+    rivet(&home)
+        .current_dir(&pkg)
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("42"));
+}
+
+#[test]
 fn add_github_shorthand_live() {
     if std::env::var("RIVET_TEST_NETWORK").as_deref() != Ok("1") {
         eprintln!("SKIP: needs network (RIVET_TEST_NETWORK=1)");
@@ -493,9 +565,15 @@ fn add_github_shorthand_live() {
         .arg("ocornut/imgui@1.91.4")
         .assert()
         .success()
-        .stderr(predicate::str::contains("no recognized build"));
+        .stderr(predicate::str::contains(
+            "top-level sources compile directly",
+        ));
     let dep = manifest_dep(&pkg, "imgui");
     assert_eq!(dep["tag"], serde_json::Value::String("v1.91.4".to_string()));
+    assert_eq!(
+        dep["adapter"]["tool"],
+        serde_json::Value::String("sources".to_string())
+    );
     assert_eq!(
         dep["package"]["version"],
         serde_json::Value::String("1.91.4".to_string())

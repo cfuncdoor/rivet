@@ -1620,71 +1620,6 @@ fn probe_git_ref(
     }
 }
 
-/// Foreign layout of a materialized checkout (top-level files only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForeignLayout {
-    /// Own `rivet.json`: plain git entry, nothing to generate.
-    Manifest,
-    Cmake,
-    Meson,
-    Make,
-    /// No manifest and no recognized build: inline package without an
-    /// adapter (resolves and builds vacuously; warned about).
-    Bare,
-}
-
-/// Adapter tool for a layout (`None` for manifest-carrying or bare trees).
-fn adapter_for_layout(layout: ForeignLayout) -> Option<&'static str> {
-    match layout {
-        ForeignLayout::Manifest | ForeignLayout::Bare => None,
-        ForeignLayout::Cmake => Some("cmake"),
-        ForeignLayout::Meson => Some("meson"),
-        ForeignLayout::Make => Some("make"),
-    }
-}
-
-fn sniff_foreign_layout(dir: &Path) -> ForeignLayout {
-    if dir.join("rivet.json").is_file() {
-        return ForeignLayout::Manifest;
-    }
-    if dir.join("CMakeLists.txt").is_file() {
-        return ForeignLayout::Cmake;
-    }
-    if dir.join("meson.build").is_file() {
-        return ForeignLayout::Meson;
-    }
-    if ["Makefile", "makefile", "GNUmakefile"]
-        .iter()
-        .any(|f| dir.join(f).is_file())
-    {
-        return ForeignLayout::Make;
-    }
-    ForeignLayout::Bare
-}
-
-/// Up to 8 top-level C++ source/header names (for the bare-tree warning).
-fn sample_sources(dir: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    let entries = std::fs::read_dir(dir)
-        .map(|r| r.collect::<Vec<_>>())
-        .unwrap_or_default();
-    for entry in entries {
-        let Ok(entry) = entry else { continue };
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if matches!(ext, "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hxx" | "hh") {
-            out.push(name.to_string());
-        }
-    }
-    out.sort();
-    out.truncate(8);
-    out
-}
-
 /// Inline `package.version` for a git dep: tags shed one leading `v`
 /// when a digit follows (`v1.91.4` → `1.91.4`, like the zlib example);
 /// branches and SHAs carry no version, so `0.1.0` (the same placeholder
@@ -1702,12 +1637,16 @@ fn inline_version_for(probed: &ProbedRef) -> String {
     }
 }
 
-/// Manifest entry JSON for a probed git dep over an inspected layout.
+/// Manifest entry JSON for a probed git dep: `{git, tag|branch|rev}`,
+/// plus an inline `package` block (and `adapter` when `Some`) for trees
+/// without their own `rivet.json`. Layout detection lives in
+/// `rivet_adapters` (single source of truth with the `sources` adapter).
 fn git_dep_entry(
     key: &str,
     url: &str,
     probed: &ProbedRef,
-    layout: ForeignLayout,
+    adapter: Option<&str>,
+    inline: bool,
 ) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert(
@@ -1721,8 +1660,8 @@ fn git_dep_entry(
         }
         ProbedRef::Rev(s) => entry.insert("rev".to_string(), serde_json::Value::String(s.clone())),
     };
-    if layout != ForeignLayout::Manifest {
-        if let Some(tool) = adapter_for_layout(layout) {
+    if inline {
+        if let Some(tool) = adapter {
             entry.insert("adapter".to_string(), serde_json::json!({"tool": tool}));
         }
         entry.insert(
@@ -1837,19 +1776,32 @@ pub fn add_flow(ui: &Ui, root: &rivet_manifest::Manifest, spec: &str, verbose: b
             let checkout = git
                 .ensure_checkout(key, url, &sha, &rivet_git::CheckoutOpts::default())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let layout = sniff_foreign_layout(&checkout);
-            if layout == ForeignLayout::Bare {
-                let sources = sample_sources(&checkout);
-                let found = if sources.is_empty() {
-                    "no C++ sources at the top level".to_string()
-                } else {
-                    format!("top-level sources: {}", sources.join(", "))
-                };
-                ui.warn(&format!("`{key}` has no rivet.json and no recognized build (no CMakeLists.txt/meson.build/Makefile); {found}. Added as a resolving-but-empty dep: vendor the sources with your own rivet.json, ask upstream for one, or set the entry's `adapter` yourself"));
-            } else if verbose {
-                ui.verbose(&format!("foreign layout: {layout:?}"));
+            let layout =
+                rivet_adapters::detect_layout(&checkout).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let adapter = rivet_adapters::adapter_for_layout(layout);
+            match layout {
+                rivet_adapters::ForeignLayout::BareEmpty => {
+                    ui.warn(&format!("`{key}` has no rivet.json, no recognized build (no CMakeLists.txt/meson.build/Makefile), and no compilable top-level sources. Added as a resolving-but-empty dep: vendor the sources with your own rivet.json, ask upstream for one, or set the entry's `adapter` yourself"));
+                }
+                rivet_adapters::ForeignLayout::BareSources => {
+                    ui.warn(&format!("`{key}` has no build system; its top-level sources compile directly (`sources` adapter, subdirectories ignored)"));
+                }
+                _ => {
+                    if verbose {
+                        ui.verbose(&format!(
+                            "foreign layout: {layout:?} (adapter `{}`)",
+                            adapter.unwrap_or("<none>")
+                        ));
+                    }
+                }
             }
-            git_dep_entry(key, url, &probed, layout)
+            git_dep_entry(
+                key,
+                url,
+                &probed,
+                adapter,
+                layout != rivet_adapters::ForeignLayout::Manifest,
+            )
         }
     };
     edit_manifest_table(&root.dir, "dependencies", &key, Some(entry))?;

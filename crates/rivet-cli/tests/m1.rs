@@ -2,7 +2,7 @@
 //! against a real C++ compiler in temp dirs.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::cargo::cargo_bin;
 use assert_cmd::Command;
@@ -233,4 +233,114 @@ fn rivet_cxx_bogus_override_fails_actionably() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("RIVET_CXX"));
+}
+
+fn find_archive(pkg: &Path) -> Option<PathBuf> {
+    let mut found = None;
+    let mut stack = vec![pkg.join("target")];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "lib" || e == "a") {
+                // Skip import libraries next to a DLL of the same stem.
+                if path.extension().is_some_and(|e| e == "lib")
+                    && path.with_extension("dll").is_file()
+                {
+                    continue;
+                }
+                found = Some(path);
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn new_lib_scaffolds_and_builds() {
+    if !toolchain_available() {
+        eprintln!("SKIP: no C++ toolchain detected");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    rivet()
+        .current_dir(dir.path())
+        .arg("new")
+        .arg("--lib")
+        .arg("mylib")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("library package"));
+    let pkg: PathBuf = dir.path().join("mylib");
+    assert!(pkg.join("src").join("lib.cpp").is_file());
+    assert!(pkg.join("include").join("mylib.h").is_file());
+    assert!(!pkg.join("src").join("main.cpp").exists());
+    let manifest = std::fs::read_to_string(pkg.join("rivet.json")).unwrap();
+    assert!(manifest.contains("\"lib\""), "got: {manifest}");
+    rivet()
+        .current_dir(&pkg)
+        .arg("build")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Finished"));
+    let archive = find_archive(&pkg).expect("static archive must be produced");
+    assert!(
+        archive.extension().is_some_and(|e| e == "lib" || e == "a"),
+        "got: {}",
+        archive.display()
+    );
+}
+
+#[test]
+fn new_shared_and_init_lib() {
+    if !toolchain_available() {
+        eprintln!("SKIP: no C++ toolchain detected");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    rivet()
+        .current_dir(dir.path())
+        .arg("new")
+        .arg("--shared")
+        .arg("shlib")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("shared-library package"));
+    let pkg: PathBuf = dir.path().join("shlib");
+    let manifest = std::fs::read_to_string(pkg.join("rivet.json")).unwrap();
+    assert!(manifest.contains("\"shared\""), "got: {manifest}");
+    // Shared linking needs the export/SONAME story (tracked): the build
+    // must fail actionably, not silently.
+    rivet()
+        .current_dir(&pkg)
+        .arg("build")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not supported yet"));
+
+    // `init --lib` scaffolds in the current directory.
+    let init_dir = dir.path().join("initlib");
+    std::fs::create_dir_all(&init_dir).unwrap();
+    rivet()
+        .current_dir(&init_dir)
+        .arg("init")
+        .arg("--lib")
+        .assert()
+        .success();
+    assert!(init_dir.join("src").join("lib.cpp").is_file());
+}
+
+#[test]
+fn new_lib_and_shared_conflict() {
+    let dir = TempDir::new().unwrap();
+    rivet()
+        .current_dir(dir.path())
+        .arg("new")
+        .arg("--lib")
+        .arg("--shared")
+        .arg("both")
+        .assert()
+        .failure();
 }

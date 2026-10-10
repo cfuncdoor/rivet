@@ -47,12 +47,24 @@ pub enum Commands {
     New {
         /// Package (and directory) name.
         name: String,
+        /// Scaffold a static library (`src/lib.cpp` + `include/<name>.h`).
+        #[arg(long, conflicts_with = "shared")]
+        lib: bool,
+        /// Scaffold a shared library (implies `--lib` with `type = "shared"`).
+        #[arg(long, conflicts_with = "lib")]
+        shared: bool,
     },
     /// Create a new C++ package in the current directory.
     Init {
         /// Package name (defaults to the directory name).
         #[arg(long)]
         name: Option<String>,
+        /// Scaffold a static library (`src/lib.cpp` + `include/<name>.h`).
+        #[arg(long, conflicts_with = "shared")]
+        lib: bool,
+        /// Scaffold a shared library (implies `--lib` with `type = "shared"`).
+        #[arg(long, conflicts_with = "lib")]
+        shared: bool,
     },
     /// Compile the current package (or workspace).
     Build {
@@ -370,8 +382,12 @@ pub fn dispatch(cli: &Cli) -> Result<()> {
             println!();
             Ok(())
         }
-        Some(Commands::New { name }) => cmd_new(&ui, name),
-        Some(Commands::Init { name }) => cmd_init(&ui, name.clone()),
+        Some(Commands::New { name, lib, shared }) => {
+            cmd_new(&ui, name, NewKind::resolve(*lib, *shared)?)
+        }
+        Some(Commands::Init { name, lib, shared }) => {
+            cmd_init(&ui, name.clone(), NewKind::resolve(*lib, *shared)?)
+        }
         Some(Commands::Build {
             release,
             package,
@@ -699,6 +715,87 @@ fn validate_package_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// What `new`/`init` scaffolds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewKind {
+    /// Binary (`src/main.cpp`).
+    Bin,
+    /// Static library (`src/lib.cpp` + `include/<name>.h`).
+    Lib,
+    /// Shared library (same layout, `lib.type = "shared"`).
+    Shared,
+}
+
+impl NewKind {
+    /// Resolve `--lib`/`--shared` (clap already rejects both at once, but
+    /// the test seam builds `Commands` by hand, so check again here).
+    fn resolve(lib: bool, shared: bool) -> Result<Self> {
+        match (lib, shared) {
+            (false, false) => Ok(Self::Bin),
+            (true, false) => Ok(Self::Lib),
+            (false, true) => Ok(Self::Shared),
+            (true, true) => {
+                bail!("`--lib` and `--shared` are mutually exclusive. Fix: pick one")
+            }
+        }
+    }
+
+    fn status_noun(self) -> &'static str {
+        match self {
+            Self::Bin => "binary package",
+            Self::Lib => "library package",
+            Self::Shared => "shared-library package",
+        }
+    }
+}
+
+/// Header-guard macro for a package name (`foo-bar` → `FOO_BAR_H`).
+fn header_guard(name: &str) -> String {
+    let mut guard: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    guard.push_str("_H");
+    guard
+}
+
+fn lib_header_template(name: &str) -> String {
+    let guard = header_guard(name);
+    format!("#ifndef {guard}\n#define {guard}\n\nint answer();\n\n#endif\n")
+}
+
+fn lib_cpp_template(name: &str) -> String {
+    format!("#include \"{name}.h\"\n\nint answer() {{ return 42; }}\n")
+}
+
+fn lib_manifest_template(name: &str, shared: bool) -> String {
+    let lib = if shared {
+        format!("\"name\": \"{name}\",\n    \"type\": \"shared\"")
+    } else {
+        format!("\"name\": \"{name}\"")
+    };
+    format!(
+        r#"{{
+  "$schema": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
+  "package": {{
+    "name": "{name}",
+    "version": "0.1.0",
+    "standard": "c++17"
+  }},
+  "lib": {{
+    {lib}
+  }}
+}}
+"#
+    )
+}
+
 fn manifest_template(name: &str) -> String {
     format!(
         r#"{{
@@ -723,7 +820,7 @@ int main() {
 
 const GITIGNORE_TEMPLATE: &str = "/target\n";
 
-fn scaffold_package(ui: &Ui, dir: &Path, name: &str) -> Result<()> {
+fn scaffold_package(ui: &Ui, dir: &Path, name: &str, kind: NewKind) -> Result<()> {
     validate_package_name(name)?;
     std::fs::create_dir_all(dir.join("src"))
         .with_context(|| format!("could not create {}", dir.join("src").display()))?;
@@ -734,12 +831,35 @@ fn scaffold_package(ui: &Ui, dir: &Path, name: &str) -> Result<()> {
             manifest_path.display()
         );
     }
-    std::fs::write(&manifest_path, manifest_template(name))
+    let manifest_text = match kind {
+        NewKind::Bin => manifest_template(name),
+        NewKind::Lib => lib_manifest_template(name, false),
+        NewKind::Shared => lib_manifest_template(name, true),
+    };
+    std::fs::write(&manifest_path, manifest_text)
         .with_context(|| format!("could not write {}", manifest_path.display()))?;
-    let main_cpp = dir.join("src").join("main.cpp");
-    if !main_cpp.exists() {
-        std::fs::write(&main_cpp, MAIN_CPP_TEMPLATE)
-            .with_context(|| format!("could not write {}", main_cpp.display()))?;
+    match kind {
+        NewKind::Bin => {
+            let main_cpp = dir.join("src").join("main.cpp");
+            if !main_cpp.exists() {
+                std::fs::write(&main_cpp, MAIN_CPP_TEMPLATE)
+                    .with_context(|| format!("could not write {}", main_cpp.display()))?;
+            }
+        }
+        NewKind::Lib | NewKind::Shared => {
+            std::fs::create_dir_all(dir.join("include"))
+                .with_context(|| format!("could not create {}", dir.join("include").display()))?;
+            let header = dir.join("include").join(format!("{name}.h"));
+            if !header.exists() {
+                std::fs::write(&header, lib_header_template(name))
+                    .with_context(|| format!("could not write {}", header.display()))?;
+            }
+            let lib_cpp = dir.join("src").join("lib.cpp");
+            if !lib_cpp.exists() {
+                std::fs::write(&lib_cpp, lib_cpp_template(name))
+                    .with_context(|| format!("could not write {}", lib_cpp.display()))?;
+            }
+        }
     }
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
@@ -747,12 +867,12 @@ fn scaffold_package(ui: &Ui, dir: &Path, name: &str) -> Result<()> {
     }
     ui.status(
         "Created",
-        &format!("binary package `{name}` in {}", dir.display()),
+        &format!("{} `{name}` in {}", kind.status_noun(), dir.display()),
     );
     Ok(())
 }
 
-fn cmd_new(ui: &Ui, name: &str) -> Result<()> {
+fn cmd_new(ui: &Ui, name: &str, kind: NewKind) -> Result<()> {
     validate_package_name(name)?;
     let dir = PathBuf::from(name);
     if dir.exists() {
@@ -766,10 +886,10 @@ fn cmd_new(ui: &Ui, name: &str) -> Result<()> {
             );
         }
     }
-    scaffold_package(ui, &dir, name)
+    scaffold_package(ui, &dir, name, kind)
 }
 
-fn cmd_init(ui: &Ui, name: Option<String>) -> Result<()> {
+fn cmd_init(ui: &Ui, name: Option<String>, kind: NewKind) -> Result<()> {
     let cwd = std::env::current_dir().context("could not read current directory")?;
     let default_name = cwd
         .file_name()
@@ -777,7 +897,7 @@ fn cmd_init(ui: &Ui, name: Option<String>) -> Result<()> {
         .unwrap_or("hello")
         .to_string();
     let name = name.unwrap_or(default_name);
-    scaffold_package(ui, &cwd, &name)
+    scaffold_package(ui, &cwd, &name, kind)
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,6 +2000,33 @@ mod tests {
         let text = manifest_template("hello");
         let m = rivet_manifest::parse_str(&text).unwrap();
         assert_eq!(rivet_manifest::package_name(&m), Some("hello"));
+    }
+
+    #[test]
+    fn new_kind_resolution() {
+        assert_eq!(NewKind::resolve(false, false).unwrap(), NewKind::Bin);
+        assert_eq!(NewKind::resolve(true, false).unwrap(), NewKind::Lib);
+        assert_eq!(NewKind::resolve(false, true).unwrap(), NewKind::Shared);
+        assert!(NewKind::resolve(true, true).is_err());
+    }
+
+    #[test]
+    fn lib_templates_parse_and_guard() {
+        assert_eq!(header_guard("foo-bar"), "FOO_BAR_H");
+        assert_eq!(header_guard("a1"), "A1_H");
+        for shared in [false, true] {
+            let text = lib_manifest_template("mylib", shared);
+            let m = rivet_manifest::parse_str(&text).unwrap();
+            assert_eq!(rivet_manifest::package_name(&m), Some("mylib"));
+            let lib = m.lib.expect("lib section");
+            assert_eq!(lib.name.as_deref(), Some("mylib"));
+            assert_eq!(
+                lib.lib_type.as_str(),
+                if shared { "shared" } else { "static" }
+            );
+        }
+        assert!(lib_cpp_template("mylib").contains("#include \"mylib.h\""));
+        assert!(lib_header_template("mylib").contains("int answer();"));
     }
 
     #[test]

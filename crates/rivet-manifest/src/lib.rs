@@ -352,7 +352,8 @@ pub struct DependencyDetail {
 /// system library instead of building anything.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdapterSpec {
-    /// Adapter tool: `cmake`, `meson`, `make`, `pkg-config`, or `system`.
+    /// Adapter tool: `cmake`, `meson`, `make`, `pkg-config`, `system`,
+    /// or `sources` (compile top-level C++ sources directly).
     #[serde(default)]
     pub tool: String,
     /// Build targets (meaning is tool-specific; empty = tool default).
@@ -860,11 +861,12 @@ fn validate_dependency(dep: &serde_json::Value, path: &str, stripped: &str) -> R
             )
         })?;
         match obj.get("tool").and_then(|v| v.as_str()) {
-            Some(t) if ["cmake", "meson", "make", "pkg-config", "system"].contains(&t) => {}
+            Some(t)
+                if ["cmake", "meson", "make", "pkg-config", "system", "sources"].contains(&t) => {}
             Some(t) => {
                 return Err(err(
                     &format!("{path}.adapter.tool"),
-                    format!("unknown adapter tool `{t}`. Hint: use cmake, meson, make, pkg-config, or system"),
+                    format!("unknown adapter tool `{t}`. Hint: use cmake, meson, make, pkg-config, system, or sources"),
                 ));
             }
             None => {

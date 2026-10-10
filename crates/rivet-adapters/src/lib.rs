@@ -15,6 +15,7 @@
 //! | `make` | `make -C src [targets…] [K=V…] [-j N]` (in-source). See [`make_`]. |
 //! | `pkg-config` | strict `pkg-config --cflags/--libs <name>` probe, no sources. See [`system`]. |
 //! | `system` | `pkg-config` when the binary exists (falling back to a well-known-dir search when the package is not known to pkg-config), else the dir search directly. See [`system`]. |
+//! | `sources` | compile top-level C++ sources with the rivet toolchain into a static archive (for schemaless trees with no build system; subdirs ignored). See [`sources`]. |
 //!
 //! Probing a foreign source never executes anything from that source except
 //! the adapter tool itself (`cmake`, `meson`, `make`). No configure scripts,
@@ -44,6 +45,7 @@ mod discover;
 mod fingerprint;
 mod make;
 mod meson;
+mod sources;
 mod system;
 mod util;
 
@@ -55,6 +57,7 @@ use thiserror::Error;
 
 pub use discover::{discover_include_dirs, discover_libs, dll_dirs, lib_dirs_of};
 pub use fingerprint::{fingerprint, needs_rebuild, source_dir_hash};
+pub use sources::{adapter_for_layout, detect_layout, source_files, ForeignLayout};
 pub use system::{parse_pkg_config, probe_pkg_config, probe_system, search_well_known};
 pub use util::tool_available;
 
@@ -68,7 +71,7 @@ pub use util::tool_available;
 pub enum Error {
     /// Unknown `adapter.tool` value.
     #[error(
-        "unknown adapter tool `{tool}`. Fix: use one of cmake, meson, make, pkg-config, system"
+        "unknown adapter tool `{tool}`. Fix: use one of cmake, meson, make, pkg-config, system, sources"
     )]
     UnknownTool {
         /// The rejected tool string.
@@ -201,6 +204,8 @@ pub enum AdapterKind {
     PkgConfig,
     /// `system`: pkg-config-then-dir-search installed-library probe.
     System,
+    /// `sources`: compile top-level C++ sources with the rivet toolchain.
+    Sources,
 }
 
 impl AdapterKind {
@@ -214,8 +219,9 @@ impl AdapterKind {
             "make" => Ok(Self::Make),
             "pkg-config" => Ok(Self::PkgConfig),
             "system" => Ok(Self::System),
+            "sources" => Ok(Self::Sources),
             "" => Err(Error::InvalidSpec {
-                message: "missing `adapter.tool`. Fix: add `\"tool\": \"cmake\"` (or meson, make, pkg-config, system)".to_string(),
+                message: "missing `adapter.tool`. Fix: add `\"tool\": \"cmake\"` (or meson, make, pkg-config, system, sources)".to_string(),
             }),
             other => Err(Error::UnknownTool {
                 tool: other.to_string(),
@@ -231,12 +237,13 @@ impl AdapterKind {
             Self::Make => "make",
             Self::PkgConfig => "pkg-config",
             Self::System => "system",
+            Self::Sources => "sources",
         }
     }
 
-    /// `true` for tools that build from sources (cmake/meson/make).
+    /// `true` for tools that build from sources (cmake/meson/make/sources).
     pub fn builds_sources(self) -> bool {
-        matches!(self, Self::Cmake | Self::Meson | Self::Make)
+        matches!(self, Self::Cmake | Self::Meson | Self::Make | Self::Sources)
     }
 }
 
@@ -333,6 +340,7 @@ pub fn build_adapter(
         AdapterKind::Cmake => cmake::build(source_dir, spec, ctx),
         AdapterKind::Meson => meson::build(source_dir, spec, ctx),
         AdapterKind::Make => make::build(source_dir, spec, ctx),
+        AdapterKind::Sources => sources::build(source_dir, spec, ctx),
         AdapterKind::PkgConfig | AdapterKind::System => Err(Error::InvalidSpec {
             message: format!(
                 "adapter tool `{}` probes an installed library and takes no sources. Fix: use `probe_installed(\"{}\", <package>)` instead of `build_adapter`",
@@ -378,6 +386,10 @@ mod tests {
         assert_eq!(AdapterKind::from_tool("cmake").unwrap(), AdapterKind::Cmake);
         assert_eq!(AdapterKind::from_tool("meson").unwrap(), AdapterKind::Meson);
         assert_eq!(AdapterKind::from_tool("make").unwrap(), AdapterKind::Make);
+        assert_eq!(
+            AdapterKind::from_tool("sources").unwrap(),
+            AdapterKind::Sources
+        );
         assert_eq!(
             AdapterKind::from_tool("pkg-config").unwrap(),
             AdapterKind::PkgConfig

@@ -6,7 +6,7 @@ decisions), `--message-format=json`, `--color=auto|always|never`
 
 | Command | What it does |
 |---|---|
-| `rivet new <name>` / `rivet init [--name n]` | scaffold a package (`rivet.json` + `src/main.cpp`) |
+| `rivet new <name> [--lib\|--shared]` / `rivet init [--name n] [--lib\|--shared]` | scaffold a binary, static lib (`src/lib.cpp` + `include/<name>.h`), or shared lib (`--shared` scaffolds only; `build` still needs the export/SONAME story) |
 | `rivet build` | compile + link the scope (incremental, parallel) |
 | `rivet run` | build if needed, run the binary (forwards trailing args) |
 | `rivet test` | build and run `tests/*.cpp` |
@@ -52,9 +52,11 @@ Git refs resolve against the shared mirror: exact tag, then
 resolves as a SHA pin; no ref tracks the default branch (`HEAD`).
 The materialized checkout is inspected: own `rivet.json` needs
 nothing; CMake/Meson/Makefile sources gain an inline `package` block
-plus the matching `adapter` (like the zlib example); anything else
-warns loudly (resolves and builds vacuously — vendor the sources with
-your own manifest, or set the entry's `adapter`).
+plus the matching `adapter` (like the zlib example); trees with
+compilable top-level sources but no build system get the `sources`
+adapter (they compile with the program); anything else warns loudly
+(resolves and builds vacuously — vendor the sources with your own
+manifest, or set the entry's `adapter`).
 
 `add` writes the manifest entry, then re-resolves just that dep
 (`update -p` semantics); on failure both manifest and lockfile are

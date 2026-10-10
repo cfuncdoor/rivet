@@ -31,8 +31,11 @@ are persisted so fresh builds never re-execute (D51).
 ## Foreign packages (adapters)
 
 Non-rivet sources build through adapters — `cmake`, `meson`, `make`,
-`pkg-config`, or `system` probes — into scratch dirs (never into
-immutable checkouts), gated by source+spec+toolchain fingerprints.
+`sources`, `pkg-config`, or `system` probes — into scratch dirs (never
+into immutable checkouts), gated by source+spec+toolchain fingerprints.
+The `sources` adapter compiles a schemaless tree's top-level C++
+sources with the rivet toolchain into a static archive (subdirectories
+are ignored; flags follow the profile like native builds).
 Adapter outputs (includes, archives, bare names, defines) feed
 dependents like native targets. Bare `.dll`s never link (only import
 libs do); on MSVC, linker inputs follow `/link` (D57).

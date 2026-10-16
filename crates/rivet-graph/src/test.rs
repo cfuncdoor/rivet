@@ -1,11 +1,12 @@
 //! `rivet test` support: discovery, test-target planning, execution.
 //!
-//! Discovery scans `<pkg>/tests/*.cpp` (top-level files only; no recursion,
-//! mirroring the `tests/*.cpp` convention). Each file becomes one test binary
-//! at `target/<prof>/tests/<stem>[.exe]`, compiled with the package flags
-//! and linked against the package lib archive (when any) plus dependency
-//! archives — reusing [`crate::build_unit`] with synthesized [`TargetBuild`]s
-//! (tag `test-<stem>`) so the shared incremental state covers them.
+//! Discovery scans `<pkg>/tests/*.{c,cpp}` (top-level files only; no
+//! recursion, mirroring the `tests/` convention). Each file becomes one test
+//! binary at `target/<prof>/tests/<stem>[.exe]`, compiled with the package
+//! flags and linked against the package lib archive (when any) plus
+//! dependency archives — reusing [`crate::build_unit`] with synthesized
+//! [`TargetBuild`]s (tag `test-<stem>`) so the shared incremental state
+//! covers them.
 //!
 //! `devDependencies` are parsed by the manifest but not wired into test
 //! inputs yet; test targets use the package's normal dependency closure.
@@ -28,7 +29,7 @@ pub struct DiscoveredTest {
     pub src: PathBuf,
 }
 
-/// Discover `tests/*.cpp` for a package (top-level files only, sorted by
+/// Discover `tests/*.{c,cpp}` for a package (top-level files only, sorted by
 /// stem). A missing `tests/` dir means no tests — not an error.
 pub fn discover_tests(manifest: &Manifest) -> Result<Vec<DiscoveredTest>, Error> {
     let dir = manifest.dir.join("tests");
@@ -41,7 +42,7 @@ pub fn discover_tests(manifest: &Manifest) -> Result<Vec<DiscoveredTest>, Error>
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
-        if !entry.file_type()?.is_file() || !m::is_cpp_source(&path) {
+        if !entry.file_type()?.is_file() || !m::is_source(&path) {
             continue;
         }
         let name = path

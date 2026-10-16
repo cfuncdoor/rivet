@@ -34,9 +34,10 @@ strict-JSON, sorted-key lockfile `rivet.lock.json`.
 - `package`: `name` (`[a-zA-Z0-9_-]+`), `version` (SemVer
   `major.minor.patch`), optional `standard` (`c++11` through `c++26`,
   plus `c++latest` for newest-the-toolchain-knows — `/std:c++latest`
-  MSVC-like, `-std=c++2b` on GNU/Clang; anything else passes through
-  verbatim, so naming one your compiler predates fails at the driver;
-  default `c++17`).
+  MSVC-like, `-std=c++2b` on GNU/Clang — or `c11`/`c17`/`c23` for C;
+  a C++ standard compiles `.c` files as the matching C standard and
+  vice versa; anything else passes through verbatim, so naming one
+  your compiler predates fails at the driver; default `c++17`).
 - `dependencies` / `build_dependencies`: map of name → requirement.
   A bare string is a registry semver requirement. The detail object
   supports `version` (registry), `path`, `git` + exactly one of
@@ -54,7 +55,9 @@ strict-JSON, sorted-key lockfile `rivet.lock.json`.
   only `address`). The toolchain maps them to flags; anything it
   cannot honor is a hard error naming the flag.
 - `bin`: explicit binaries (`name` + `path`); default is
-  `src/main.cpp`. `lib`: explicit library. Targets follow the
+  `src/main.cpp` (or `src/main.c` — one entry point per target).
+  `lib`: explicit library (`src/lib.cpp` or `src/lib.c` by default).
+  `.c` files compile as C, the rest as C++. Targets follow the
   `src/`+`include/` conventions when unlisted.
 - `workspace`: `members` (path deps built together, topological
   order, `--package` selects).

@@ -1,6 +1,6 @@
 # rivet documentation
 
-Single-binary, Cargo-like build system and package manager for C++:
+Single-binary, Cargo-like build system and package manager for C/C++:
 one declarative manifest, one lockfile, one command to build, run,
 and test. No CMake/Make/Ninja/Python/Conan needed to *use* rivet
 (CMake is only ever invoked as an *adapter* for foreign packages).
@@ -14,7 +14,7 @@ and test. No CMake/Make/Ninja/Python/Conan needed to *use* rivet
 
 ## Quickstart
 
-Requirements: a C++ toolchain (MSVC, clang, gcc, or MinGW), system
+Requirements: a C/C++ toolchain (MSVC, clang, gcc, or MinGW), system
 `git` (only for git deps), and the `rivet` binary itself
 ([install](../README.md#install) or `cargo build --release`).
 
@@ -22,12 +22,12 @@ Requirements: a C++ toolchain (MSVC, clang, gcc, or MinGW), system
 rivet new hello && cd hello
 rivet build     # Compiling hello v0.1.0 ... Finished dev profile in 0.4s
 rivet run       # builds if needed, then runs ./target/debug/hello
-rivet test      # builds and runs tests/*.cpp
+rivet test      # builds and runs tests/*.{c,cpp}
 ```
 
-Conventions (zero config): `src/main.cpp` → binary, `src/lib.cpp`
-or `include/` → library, `tests/*.cpp` → tests, `examples/` and
-`benches/` likewise. Public headers go in `include/`, private sources
+Conventions (zero config): `src/main.cpp` (or `src/main.c`) → binary,
+`src/lib.cpp` (or `src/lib.c`) or `include/` → library,
+`tests/*.{c,cpp}` → tests, `examples/` and `benches/` likewise. Public headers go in `include/`, private sources
 in `src/`. Build output lands in `target/debug|release/`
 (`dev` profile → `debug/`, Cargo convention); shared caches live in
 `~/.rivet/`.

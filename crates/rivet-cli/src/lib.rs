@@ -19,9 +19,9 @@ mod lockflow;
 // CLI definition
 // ---------------------------------------------------------------------------
 
-/// Cargo-like build system and package manager for C++.
+/// Cargo-like build system and package manager for C/C++.
 #[derive(Debug, Parser)]
-#[command(name = "rivet", version, about = "Cargo-like build system for C++")]
+#[command(name = "rivet", version, about = "Cargo-like build system for C/C++")]
 pub struct Cli {
     /// Verbose output (log toolchain candidates, full compiler commands).
     #[arg(short, long, global = true)]
@@ -43,7 +43,7 @@ pub struct Cli {
 /// successfully and fail with an actionable error.
 #[derive(Debug, Subcommand)]
 pub enum Commands {
-    /// Create a new C++ package in a new directory.
+    /// Create a new C/C++ package in a new directory.
     New {
         /// Package (and directory) name.
         name: String,
@@ -54,7 +54,7 @@ pub enum Commands {
         #[arg(long, conflicts_with = "lib")]
         shared: bool,
     },
-    /// Create a new C++ package in the current directory.
+    /// Create a new C/C++ package in the current directory.
     Init {
         /// Package name (defaults to the directory name).
         #[arg(long)]
@@ -718,9 +718,9 @@ fn validate_package_name(name: &str) -> Result<()> {
 /// What `new`/`init` scaffolds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewKind {
-    /// Binary (`src/main.cpp`).
+    /// Binary (`src/main.cpp` or `src/main.c`).
     Bin,
-    /// Static library (`src/lib.cpp` + `include/<name>.h`).
+    /// Static library (`src/lib.cpp` or `src/lib.c` + `include/<name>.h`).
     Lib,
     /// Shared library (same layout, `lib.type = "shared"`).
     Shared,
@@ -1135,7 +1135,7 @@ fn restrict_to_bin(
     // Candidate bins across the selection.
     let mut hits: Vec<String> = Vec::new();
     for unit in &units {
-        for target in rivet_manifest::resolve_bins(&unit.manifest) {
+        for target in rivet_manifest::resolve_bins(&unit.manifest)? {
             if target.name == *bin {
                 if let Some(name) = rivet_manifest::package_name(&unit.manifest) {
                     hits.push(name.to_string());
@@ -1145,7 +1145,7 @@ fn restrict_to_bin(
     }
     if hits.is_empty() {
         bail!(
-            "binary `{bin}` not found in the selected packages. Fix: check `bin` entries and `src/main.cpp` files"
+            "binary `{bin}` not found in the selected packages. Fix: check `bin` entries and `src/main.cpp`/`src/main.c` files"
         );
     }
     if hits.len() > 1 {
@@ -1161,6 +1161,7 @@ fn restrict_to_bin(
         .iter()
         .find(|u| {
             rivet_manifest::resolve_bins(&u.manifest)
+                .unwrap_or_default()
                 .iter()
                 .any(|t| t.name == *bin)
         })
@@ -1348,10 +1349,10 @@ fn build_adapter_unit(
         .ok_or_else(|| anyhow::anyhow!("adapter unit `{name}` lost its spec (internal error)"))?;
     // Guardrail: adapter units must be foreign. Explicit `bin`/`lib`
     // declarations plus an `adapter` are contradictory (one entry point
-    // would silently never build); lib *conventions* (`src/lib.cpp`,
+    // would silently never build); lib *conventions* (`src/lib.c`,
     // leftover sources, `include/` headers) cannot distinguish foreign
     // sources, so the adapter wins over them.
-    let bins = rivet_manifest::resolve_bins(&unit.manifest);
+    let bins = rivet_manifest::resolve_bins(&unit.manifest)?;
     if !bins.is_empty() || unit.manifest.lib.is_some() {
         bail!(
             "adapter dep `{name}` declares rivet targets (bin/lib) and an `adapter`. Fix: remove the `adapter` to build it as a rivet package, or drop `bin`/`lib` to build it as foreign"
@@ -1743,7 +1744,7 @@ fn cmd_run(ui: &Ui, flags: RunFlags) -> Result<()> {
     }
     if bins.is_empty() {
         bail!(
-            "no binary targets found. Fix: create src/main.cpp or add a `bin` entry to rivet.json"
+            "no binary targets found. Fix: create src/main.cpp or src/main.c, or add a `bin` entry to rivet.json"
         );
     }
     let (unit, bin) = if bins.len() == 1 {
@@ -1951,7 +1952,7 @@ fn cmd_fmt(ui: &Ui, root: &rivet_manifest::Manifest, check: bool) -> Result<()> 
     Ok(())
 }
 
-/// Collect C++ source/header paths under `dir` (recursive, best-effort).
+/// Collect C/C++ source/header paths under `dir` (recursive, best-effort).
 fn collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1960,7 +1961,7 @@ fn collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_cpp(&path, out);
-        } else if rivet_manifest::is_cpp_source(&path) || rivet_manifest::is_header(&path) {
+        } else if rivet_manifest::is_source(&path) || rivet_manifest::is_header(&path) {
             out.push(path);
         }
     }
@@ -1969,8 +1970,8 @@ fn collect_cpp(dir: &Path, out: &mut Vec<PathBuf>) {
 fn cmd_toolchains(ui: &Ui) -> Result<()> {
     let infos = rivet_toolchain::list_toolchains();
     if infos.is_empty() {
-        ui.error("no C++ toolchains detected. Install VS Build Tools, LLVM, or gcc; see `rivet build` error text");
-        bail!("no C++ toolchain found");
+        ui.error("no C/C++ toolchains detected. Install VS Build Tools, LLVM, or gcc; see `rivet build` error text");
+        bail!("no C/C++ toolchain found");
     }
     for info in &infos {
         let marker = if info.is_default { " (default)" } else { "" };

@@ -15,7 +15,7 @@
 //! | `make` | `make -C src [targets…] [K=V…] [-j N]` (in-source). See [`make_`]. |
 //! | `pkg-config` | strict `pkg-config --cflags/--libs <name>` probe, no sources. See [`system`]. |
 //! | `system` | `pkg-config` when the binary exists (falling back to a well-known-dir search when the package is not known to pkg-config), else the dir search directly. See [`system`]. |
-//! | `sources` | compile top-level C++ sources with the rivet toolchain into a static archive (for schemaless trees with no build system; subdirs ignored). See [`sources`]. |
+//! | `sources` | compile top-level C/C++ sources with the rivet toolchain into a static archive (for schemaless trees with no build system; subdirs ignored). See [`sources`]. |
 //!
 //! Probing a foreign source never executes anything from that source except
 //! the adapter tool itself (`cmake`, `meson`, `make`). No configure scripts,
@@ -204,7 +204,7 @@ pub enum AdapterKind {
     PkgConfig,
     /// `system`: pkg-config-then-dir-search installed-library probe.
     System,
-    /// `sources`: compile top-level C++ sources with the rivet toolchain.
+    /// `sources`: compile top-level C/C++ sources with the rivet toolchain.
     Sources,
 }
 

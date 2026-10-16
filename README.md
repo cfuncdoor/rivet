@@ -1,8 +1,8 @@
-# rivet — Cargo for C++
+# rivet — Cargo for C/C++
 
-rivet is a single-binary build system and package manager that gives C++
-the Cargo experience: one declarative manifest, one lockfile, and one
-command to build, run, and test.
+rivet is a single-binary build system and package manager that gives C
+and C++ the Cargo experience: one declarative manifest, one lockfile,
+and one command to build, run, and test.
 
 ```sh
 rivet new hello && cd hello
@@ -31,7 +31,7 @@ Or build from source (needs a Rust toolchain; no other build tools):
 cargo install --path .
 ```
 
-Requirements at build time: a C++ toolchain (MSVC, clang, or gcc — auto
+Requirements at build time: a C/C++ toolchain (MSVC, clang, or gcc — auto
 detected) and, only for git dependencies, the system `git` binary. No
 CMake, Make, Ninja, Python, or Conan.
 
@@ -51,9 +51,9 @@ Packages declare themselves in `rivet.json` (JSON with comments):
 }
 ```
 
-Conventions need no configuration: `src/main.cpp` is the binary,
-`src/lib.cpp` or `include/` the library, `tests/*.cpp` tests,
-`build.rivet.cpp` an optional pre-build script.
+Conventions need no configuration: `src/main.cpp` (or `src/main.c`) is
+the binary, `src/lib.cpp` (or `src/lib.c`) or `include/` the library,
+`tests/*.{c,cpp}` tests, `build.rivet.cpp` an optional pre-build script.
 
 ## Everyday commands
 
@@ -71,7 +71,7 @@ Conventions need no configuration: `src/main.cpp` is the binary,
 | `rivet dev <dep>` | writable clone of a git dep + auto `patch` |
 | `rivet tree` | dependency tree |
 | `rivet fmt` / `compile-commands` / `completions` | clang-format delegate, Clangd DB, shell completions |
-| `rivet toolchains` | detected C++ toolchains |
+| `rivet toolchains` | detected C/C++ toolchains |
 
 Output is Cargo-like (`Compiling`, `Fresh`/`Cached`, `Finished`), honors
 `NO_COLOR`, and supports `--message-format=json` for IDEs.
@@ -95,7 +95,7 @@ Output is Cargo-like (`Compiling`, `Fresh`/`Cached`, `Finished`), honors
 
 | Variable | Effect |
 |---|---|
-| `RIVET_CXX` | Pin the C++ driver (path or `PATH` name: `cl`, `clang-cl`, `clang++`, `g++`, …). Fails actionably instead of falling back. Unset (or empty) means auto-detection. |
+| `RIVET_CXX` | Pin the compiler driver (path or `PATH` name: `cl`, `clang-cl`, `clang++`, `g++`, …). Fails actionably instead of falling back. Unset (or empty) means auto-detection. |
 | `RIVET_HOME` | Override the cache root (default `~/.rivet`). Useful for tests and CI isolation. |
 | `RIVET_NO_TOOLCHAIN_CACHE` | Set (non-empty) to skip the `~/.rivet/toolchain.json` detection cache. |
 
@@ -105,4 +105,4 @@ Output is Cargo-like (`Compiling`, `Fresh`/`Cached`, `Finished`), honors
 - [`PLAN.md`](PLAN.md) — milestone checklist and frozen contracts
 - [`DECISIONS.md`](DECISIONS.md) — every non-trivial choice, with rationale
 - [`rivet.schema.json`](rivet.schema.json) — manifest JSON Schema
-- [`examples/`](examples/) — real C++ projects rivet builds in CI
+- [`examples/`](examples/) — real C/C++ projects rivet builds in CI

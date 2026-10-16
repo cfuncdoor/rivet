@@ -57,7 +57,7 @@ use workspace::UnitInputs;
 #[derive(Debug, Error)]
 pub enum Error {
     /// No buildable targets in the package.
-    #[error("no targets found in {dir}. Fix: create src/main.cpp (bin), src/lib.cpp (lib), or add `bin`/`lib` to rivet.json")]
+    #[error("no targets found in {dir}. Fix: create src/main.cpp or src/main.c (bin), src/lib.cpp or src/lib.c (lib), or add `bin`/`lib` to rivet.json")]
     NoTargets {
         /// Package directory searched.
         dir: String,
@@ -440,12 +440,12 @@ pub fn plan_with_target(
         if lib.lib_type == "header-only" && m::lib_has_sources(lib) {
             return Err(m::Error::path_error(
                 "lib",
-                "header-only lib must not list sources. Fix: remove `lib.path`/`src/lib.cpp` or use `\"type\": \"static\"`",
+                "header-only lib must not list sources. Fix: remove `lib.path`/convention sources or use `\"type\": \"static\"`",
             )
             .into());
         }
     }
-    let bins = m::resolve_bins(manifest);
+    let bins = m::resolve_bins(manifest)?;
     let compiled_lib = resolved_lib.as_ref().filter(|l| m::lib_has_sources(l));
     let header_only = resolved_lib
         .as_ref()
@@ -472,10 +472,10 @@ pub fn plan_with_target(
     }
     let plan_lib = match compiled_lib {
         Some(lib) => {
-            let sources = m::lib_full_sources(manifest, lib);
+            let sources = m::lib_full_sources(manifest, lib)?;
             if sources.is_empty() {
                 return Err(Error::MissingSource {
-                    path: "lib sources (src/lib.cpp or `lib.path`)".to_string(),
+                    path: "lib sources (src/lib.c, src/lib.cpp, or `lib.path`)".to_string(),
                 });
             }
             let shared = lib.lib_type == "shared";

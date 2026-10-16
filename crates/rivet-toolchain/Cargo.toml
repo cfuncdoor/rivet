@@ -2,7 +2,7 @@
 name = "rivet-toolchain"
 version = "0.1.0"
 edition = "2021"
-description = "C++ toolchain detection (MSVC, clang, gcc, clang-cl, MinGW)"
+description = "C/C++ toolchain detection (MSVC, clang, gcc, clang-cl, MinGW)"
 license = "MIT OR Apache-2.0"
 rust-version = "1.74"
 

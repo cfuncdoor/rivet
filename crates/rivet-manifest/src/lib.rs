@@ -254,7 +254,8 @@ pub struct Manifest {
     /// Per-target overrides (optional; used for cross-compilation).
     #[serde(default)]
     pub target: BTreeMap<String, TargetOverride>,
-    /// Explicit binary targets (optional; defaults to `src/main.cpp` convention).
+    /// Explicit binary targets (optional; defaults to the `src/main.cpp` /
+    /// `src/main.c` convention).
     #[serde(default)]
     pub bin: Vec<BinTarget>,
     /// Library target (optional).
@@ -281,7 +282,9 @@ pub struct Package {
     pub name: String,
     /// Version (`major.minor.patch`, SemVer 2.0).
     pub version: String,
-    /// C++ standard, e.g. `c++20`. Defaults to `c++17`.
+    /// Language standard, e.g. `c++20` or `c17`. Defaults to `c++17`.
+    /// A C standard (`c11`/`c17`/`c23`) compiles `.c` files as C and maps
+    /// back onto the matching C++ standard for C++ files (and vice versa).
     #[serde(default)]
     pub standard: Option<String>,
 }
@@ -353,7 +356,7 @@ pub struct DependencyDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdapterSpec {
     /// Adapter tool: `cmake`, `meson`, `make`, `pkg-config`, `system`,
-    /// or `sources` (compile top-level C++ sources directly).
+    /// or `sources` (compile top-level C/C++ sources directly).
     #[serde(default)]
     pub tool: String,
     /// Build targets (meaning is tool-specific; empty = tool default).
@@ -400,7 +403,7 @@ pub struct LibTarget {
     /// Library name (defaults to package name).
     #[serde(default)]
     pub name: Option<String>,
-    /// Entry source (defaults to `src/lib.cpp` convention).
+    /// Entry source (defaults to the `src/lib.cpp` / `src/lib.c` convention).
     #[serde(default)]
     pub path: Option<String>,
 }
@@ -488,6 +491,9 @@ const KNOWN_STANDARDS: &[&str] = &[
     "c++23",
     "c++26",
     "c++latest",
+    "c11",
+    "c17",
+    "c23",
 ];
 const KNOWN_LIB_TYPES: &[&str] = &["static", "shared", "header-only"];
 
@@ -927,7 +933,7 @@ pub fn package_version(manifest: &Manifest) -> Option<&str> {
 }
 
 /// Resolve effective binary targets: explicit `bin` entries, else the
-/// `src/main.cpp` convention (if the file exists).
+/// `src/main.cpp` / `src/main.c` convention (if the file exists).
 ///
 /// Kept for API compatibility; new code prefers [`resolve_bins`] +
 /// [`bin_full_sources`], which also partition helper sources.
@@ -935,12 +941,14 @@ pub fn effective_bins(manifest: &Manifest) -> Vec<BinTarget> {
     if !manifest.bin.is_empty() {
         return manifest.bin.clone();
     }
-    let candidate = manifest.dir.join("src").join("main.cpp");
-    if candidate.is_file() {
-        if let Some(pkg) = &manifest.package {
+    let Some(pkg) = &manifest.package else {
+        return Vec::new();
+    };
+    for name in ["src/main.cpp", "src/main.c"] {
+        if manifest.dir.join(name).is_file() {
             return vec![BinTarget {
                 name: pkg.name.clone(),
-                path: "src/main.cpp".to_string(),
+                path: name.to_string(),
             }];
         }
     }
@@ -954,6 +962,41 @@ pub fn is_cpp_source(path: &Path) -> bool {
         .is_some_and(|x| matches!(x, "cpp" | "cc" | "cxx" | "C"))
 }
 
+/// `true` for C source files (lowercase `c`; capital `C` is C++ by convention).
+pub fn is_c_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x, "c"))
+}
+
+/// `true` for any compilable source (C or C++).
+pub fn is_source(path: &Path) -> bool {
+    is_cpp_source(path) || is_c_source(path)
+}
+
+/// Convention entry: `src/<cpp_name>` when present, else `src/<c_name>`.
+/// Errors when both exist (a package has one entry point per target).
+fn convention_entry(
+    dir: &Path,
+    cpp_name: &str,
+    c_name: &str,
+    what: &str,
+) -> Result<Option<PathBuf>, Error> {
+    let cpp = dir.join("src").join(cpp_name);
+    let c = dir.join("src").join(c_name);
+    match (cpp.is_file(), c.is_file()) {
+        (true, true) => Err(Error::path_error(
+            what,
+            format!(
+                "both src/{cpp_name} and src/{c_name} exist. Fix: keep one entry point per target (or point `bin`/`lib` at each explicitly)"
+            ),
+        )),
+        (true, false) => Ok(Some(cpp)),
+        (false, true) => Ok(Some(c)),
+        (false, false) => Ok(None),
+    }
+}
+
 /// `true` for C/C++ header extensions.
 pub fn is_header(path: &Path) -> bool {
     path.extension()
@@ -961,7 +1004,7 @@ pub fn is_header(path: &Path) -> bool {
         .is_some_and(|x| matches!(x, "h" | "hpp" | "hxx" | "hh" | "H" | "tpp" | "ipp"))
 }
 
-/// All C++ sources under `<pkg>/src`, sorted, absolute.
+/// All C and C++ sources under `<pkg>/src`, sorted, absolute.
 pub fn all_src_cpps(pkg_dir: &Path) -> Vec<PathBuf> {
     let src = pkg_dir.join("src");
     if !src.is_dir() {
@@ -973,15 +1016,15 @@ pub fn all_src_cpps(pkg_dir: &Path) -> Vec<PathBuf> {
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .map(|e| e.path().to_path_buf())
-        .filter(|p| is_cpp_source(p))
+        .filter(|p| is_source(p))
         .collect();
     out.sort();
     out
 }
 
 /// Collect source files for an entry path: a file → itself; a directory →
-/// all C++ sources under it (recursive). Returns `None` when the entry does
-/// not exist or a directory holds no C++ sources.
+/// all C/C++ sources under it (recursive). Returns `None` when the entry does
+/// not exist or a directory holds no C/C++ sources.
 pub fn collect_sources(entry: &Path) -> Option<Vec<PathBuf>> {
     if entry.is_file() {
         return Some(vec![entry.to_path_buf()]);
@@ -993,7 +1036,7 @@ pub fn collect_sources(entry: &Path) -> Option<Vec<PathBuf>> {
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
             .map(|e| e.path().to_path_buf())
-            .filter(|p| is_cpp_source(p))
+            .filter(|p| is_source(p))
             .collect();
         out.sort();
         if out.is_empty() {
@@ -1015,11 +1058,12 @@ pub struct ResolvedBin {
     pub is_dir: bool,
 }
 
-/// Resolve binary targets: explicit `bin` entries, else the `src/main.cpp`
-/// convention. Returns an empty vec when the package has no bins.
-pub fn resolve_bins(manifest: &Manifest) -> Vec<ResolvedBin> {
+/// Resolve binary targets: explicit `bin` entries, else the
+/// `src/main.cpp` / `src/main.c` convention. Returns an empty vec when the
+/// package has no bins; errors when both convention entries exist.
+pub fn resolve_bins(manifest: &Manifest) -> Result<Vec<ResolvedBin>, Error> {
     if !manifest.bin.is_empty() {
-        return manifest
+        return Ok(manifest
             .bin
             .iter()
             .map(|b| {
@@ -1031,19 +1075,17 @@ pub fn resolve_bins(manifest: &Manifest) -> Vec<ResolvedBin> {
                     is_dir,
                 }
             })
-            .collect();
+            .collect());
     }
-    let candidate = manifest.dir.join("src").join("main.cpp");
-    if candidate.is_file() {
-        if let Some(pkg) = &manifest.package {
-            return vec![ResolvedBin {
-                name: pkg.name.clone(),
-                entry: candidate,
-                is_dir: false,
-            }];
-        }
+    let entry = convention_entry(&manifest.dir, "main.cpp", "main.c", "bin")?;
+    match (entry, &manifest.package) {
+        (Some(entry), Some(pkg)) => Ok(vec![ResolvedBin {
+            name: pkg.name.clone(),
+            entry,
+            is_dir: false,
+        }]),
+        _ => Ok(Vec::new()),
     }
-    Vec::new()
 }
 
 /// A library target with sources resolved to absolute paths.
@@ -1067,11 +1109,12 @@ pub fn lib_has_sources(lib: &ResolvedLib) -> bool {
 
 /// Resolve the library target.
 ///
-/// Precedence: explicit `lib` first; then `src/lib.cpp`; then — only when
-/// the package has no bins — a static lib from leftover `src/` sources, or
-/// a header-only lib from `include/` headers. A package WITH bins and an
-/// `include/` dir is a bin package (headers belong to its helpers), not a
-/// header-only lib: otherwise every multi-file bin would lose its helpers.
+/// Precedence: explicit `lib` first; then `src/lib.cpp` / `src/lib.c`; then —
+/// only when the package has no bins — a static lib from leftover `src/`
+/// sources, or a header-only lib from `include/` headers. A package WITH bins
+/// and an `include/` dir is a bin package (headers belong to its helpers),
+/// not a header-only lib: otherwise every multi-file bin would lose its
+/// helpers.
 /// Returns `Ok(None)` when the package has no lib.
 pub fn resolve_lib(manifest: &Manifest) -> Result<Option<ResolvedLib>, Error> {
     let include_dir = {
@@ -1104,9 +1147,9 @@ pub fn resolve_lib(manifest: &Manifest) -> Result<Option<ResolvedLib>, Error> {
                 include_dir,
             }));
         }
-        // No explicit path: `src/lib.cpp` convention, else header-only rules.
-        let candidate = manifest.dir.join("src").join("lib.cpp");
-        if candidate.is_file() {
+        // No explicit path: `src/lib.cpp` / `src/lib.c` convention, else
+        // header-only rules.
+        if let Some(candidate) = convention_entry(&manifest.dir, "lib.cpp", "lib.c", "lib")? {
             return Ok(Some(ResolvedLib {
                 name,
                 lib_type: lib.lib_type.clone(),
@@ -1125,7 +1168,7 @@ pub fn resolve_lib(manifest: &Manifest) -> Result<Option<ResolvedLib>, Error> {
         if lib.lib_type == "shared" || lib.lib_type == "static" {
             return Err(Error::path_error(
                 "lib.path",
-                "lib has no sources: src/lib.cpp is missing. Fix: create src/lib.cpp or set `lib.path`".to_string(),
+                "lib has no sources: src/lib.cpp is missing. Fix: create src/lib.cpp (or src/lib.c) or set `lib.path`".to_string(),
             ));
         }
         // Unreachable: `lib.type` is validated at parse time.
@@ -1134,11 +1177,10 @@ pub fn resolve_lib(manifest: &Manifest) -> Result<Option<ResolvedLib>, Error> {
             "unknown lib type. Hint: use static, shared, or header-only".to_string(),
         ));
     }
-    // Convention: `src/lib.cpp` → static lib. Without bins, leftover
-    // `src/` sources form a static lib, else `include/` headers form a
-    // header-only lib. With bins, there is no lib (see doc comment).
-    let candidate = manifest.dir.join("src").join("lib.cpp");
-    if candidate.is_file() {
+    // Convention: `src/lib.cpp` / `src/lib.c` → static lib. Without bins,
+    // leftover `src/` sources form a static lib, else `include/` headers form
+    // a header-only lib. With bins, there is no lib (see doc comment).
+    if let Some(candidate) = convention_entry(&manifest.dir, "lib.cpp", "lib.c", "lib")? {
         if let Some(name) = package_name {
             return Ok(Some(ResolvedLib {
                 name,
@@ -1148,7 +1190,7 @@ pub fn resolve_lib(manifest: &Manifest) -> Result<Option<ResolvedLib>, Error> {
             }));
         }
     }
-    if resolve_bins(manifest).is_empty() {
+    if resolve_bins(manifest)?.is_empty() {
         let srcs = all_src_cpps(&manifest.dir);
         if !srcs.is_empty() {
             if let Some(name) = package_name {
@@ -1190,9 +1232,9 @@ fn has_headers(dir: &Path) -> bool {
 /// Full source list for a binary target.
 ///
 /// Directory entries keep whole-directory semantics. File entries compile
-/// the entry plus every helper (`src/**/*.cpp` minus all target roots) when
-/// the package has no lib; with a lib, the bin is just its entry file and
-/// links the archive instead.
+/// the entry plus every helper (`src/**/*.{c,cpp}` minus all target roots)
+/// when the package has no lib; with a lib, the bin is just its entry file
+/// and links the archive instead.
 pub fn bin_full_sources(
     manifest: &Manifest,
     bin: &ResolvedBin,
@@ -1223,7 +1265,7 @@ pub fn bin_full_sources(
             return Err(Error::path_error(
                 format!("bin.{}", bin.name),
                 format!(
-                    "bin entry {} is also a lib source. Fix: use a separate entry file (e.g. src/main.cpp) and keep lib sources in src/lib.cpp + helpers",
+                    "bin entry {} is also a lib source. Fix: use a separate entry file (e.g. src/main.c) and keep lib sources in src/lib.c + helpers",
                     bin.entry.display()
                 ),
             ));
@@ -1232,12 +1274,13 @@ pub fn bin_full_sources(
         return Ok(vec![bin.entry.clone()]);
     }
     // No lib: multi-file bin — entry plus all helpers.
-    let mut bin_roots: Vec<PathBuf> = resolve_bins(manifest)
+    let mut bin_roots: Vec<PathBuf> = resolve_bins(manifest)?
         .into_iter()
         .filter(|b| !b.is_dir)
         .map(|b| b.entry)
         .collect();
     bin_roots.push(manifest.dir.join("src").join("lib.cpp"));
+    bin_roots.push(manifest.dir.join("src").join("lib.c"));
     let mut sources = vec![bin.entry.clone()];
     for cpp in all_src_cpps(&manifest.dir) {
         if cpp != bin.entry && !bin_roots.contains(&cpp) {
@@ -1249,12 +1292,12 @@ pub fn bin_full_sources(
 }
 
 /// Full source list for a library target: roots plus helpers
-/// (`src/**/*.cpp` minus all bin entry files).
-pub fn lib_full_sources(manifest: &Manifest, lib: &ResolvedLib) -> Vec<PathBuf> {
+/// (`src/**/*.{c,cpp}` minus all bin entry files).
+pub fn lib_full_sources(manifest: &Manifest, lib: &ResolvedLib) -> Result<Vec<PathBuf>, Error> {
     if !lib_has_sources(lib) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let bin_roots: Vec<PathBuf> = resolve_bins(manifest)
+    let bin_roots: Vec<PathBuf> = resolve_bins(manifest)?
         .into_iter()
         .filter(|b| !b.is_dir)
         .map(|b| b.entry)
@@ -1266,7 +1309,7 @@ pub fn lib_full_sources(manifest: &Manifest, lib: &ResolvedLib) -> Vec<PathBuf> 
         }
     }
     sources.sort();
-    sources
+    Ok(sources)
 }
 
 impl Dependency {
@@ -1447,12 +1490,12 @@ pub fn expand_members(root: &Path, members: &[String]) -> Result<Vec<PathBuf>, E
     Ok(out)
 }
 
-/// Default C++ standard when `package.standard` is absent.
+/// Default language standard when `package.standard` is absent.
 pub fn default_standard() -> &'static str {
     "c++17"
 }
 
-/// Effective C++ standard for a manifest (virtual roots use the default).
+/// Effective language standard for a manifest (virtual roots use the default).
 pub fn effective_standard(manifest: &Manifest) -> &str {
     manifest
         .package
@@ -1672,8 +1715,101 @@ mod tests {
         assert_eq!(lib.name, "mylib");
         assert_eq!(lib.lib_type, "static");
         // Helpers belong to the lib.
-        let sources = lib_full_sources(&m, &lib);
+        let sources = lib_full_sources(&m, &lib).unwrap();
         assert_eq!(sources.len(), 2, "got: {sources:?}");
+    }
+
+    #[test]
+    fn c_standards_parse() {
+        for std in ["c11", "c17", "c23"] {
+            let src = format!(
+                "{{\"package\":{{\"name\":\"a\",\"version\":\"0.1.0\",\"standard\":\"{std}\"}}}}"
+            );
+            let m = parse_str(&src).unwrap();
+            assert_eq!(m.package.as_ref().unwrap().standard.as_deref(), Some(std));
+            assert_eq!(effective_standard(&m), std);
+        }
+    }
+
+    #[test]
+    fn source_predicates_split_c_and_cpp() {
+        assert!(is_c_source(Path::new("src/main.c")));
+        assert!(is_cpp_source(Path::new("src/main.cpp")));
+        assert!(is_cpp_source(Path::new("src/main.C")));
+        assert!(!is_c_source(Path::new("src/main.C")));
+        assert!(!is_c_source(Path::new("src/main.cpp")));
+        assert!(!is_cpp_source(Path::new("src/main.c")));
+        assert!(is_source(Path::new("src/main.c")));
+        assert!(is_source(Path::new("src/util.cc")));
+        assert!(!is_source(Path::new("src/util.h")));
+    }
+
+    #[test]
+    fn bin_convention_from_src_main_c() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.c"), "").unwrap();
+        std::fs::write(dir.path().join("src/util.c"), "").unwrap();
+        std::fs::write(dir.path().join("src/extra.cpp"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        let bins = resolve_bins(&m).unwrap();
+        assert_eq!(bins.len(), 1);
+        assert!(bins[0].entry.ends_with(Path::new("src").join("main.c")));
+        // Mixed C/C++ helpers all belong to the bin.
+        let sources = bin_full_sources(&m, &bins[0], &None).unwrap();
+        assert_eq!(sources.len(), 3, "got: {sources:?}");
+        assert!(resolve_lib(&m).unwrap().is_none());
+    }
+
+    #[test]
+    fn lib_convention_from_src_lib_c() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.c"), "").unwrap();
+        std::fs::write(dir.path().join("src/util.c"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"mylib\",\"version\":\"0.1.0\"}}",
+        );
+        let lib = resolve_lib(&m).unwrap().unwrap();
+        assert_eq!(lib.lib_type, "static");
+        assert!(lib.roots[0].ends_with(Path::new("src").join("lib.c")));
+        let sources = lib_full_sources(&m, &lib).unwrap();
+        assert_eq!(sources.len(), 2, "got: {sources:?}");
+    }
+
+    #[test]
+    fn both_convention_entries_are_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.cpp"), "").unwrap();
+        std::fs::write(dir.path().join("src/main.c"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
+        );
+        let err = resolve_bins(&m).unwrap_err().to_string();
+        assert!(
+            err.contains("main.cpp") && err.contains("main.c"),
+            "got: {err}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.cpp"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.c"), "").unwrap();
+        let m = pkg_in(
+            dir.path(),
+            "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\",\"lib\":{\"type\":\"static\"}}}",
+        );
+        let err = resolve_lib(&m).unwrap_err().to_string();
+        assert!(
+            err.contains("lib.cpp") && err.contains("lib.c"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1706,7 +1842,7 @@ mod tests {
             "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
         );
         assert!(resolve_lib(&m).unwrap().is_none());
-        let bins = resolve_bins(&m);
+        let bins = resolve_bins(&m).unwrap();
         let sources = bin_full_sources(&m, &bins[0], &None).unwrap();
         assert_eq!(sources.len(), 2, "got: {sources:?}");
     }
@@ -1748,7 +1884,7 @@ mod tests {
             dir.path(),
             "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"}}",
         );
-        let bins = resolve_bins(&m);
+        let bins = resolve_bins(&m).unwrap();
         assert_eq!(bins.len(), 1);
         let sources = bin_full_sources(&m, &bins[0], &None).unwrap();
         assert_eq!(sources.len(), 3, "got: {sources:?}");
@@ -1767,7 +1903,7 @@ mod tests {
         );
         let lib = resolve_lib(&m).unwrap();
         assert!(lib.is_some());
-        let bins = resolve_bins(&m);
+        let bins = resolve_bins(&m).unwrap();
         let sources = bin_full_sources(&m, &bins[0], &lib).unwrap();
         assert_eq!(sources.len(), 1, "got: {sources:?}");
     }
@@ -1782,7 +1918,7 @@ mod tests {
             "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"bin\":[{\"name\":\"a\",\"path\":\"src/lib.cpp\"}]}",
         );
         let lib = resolve_lib(&m).unwrap();
-        let bins = resolve_bins(&m);
+        let bins = resolve_bins(&m).unwrap();
         let err = bin_full_sources(&m, &bins[0], &lib)
             .unwrap_err()
             .to_string();
@@ -1900,7 +2036,7 @@ mod tests {
             dir.path(),
             "{\"package\":{\"name\":\"a\",\"version\":\"0.1.0\"},\"bin\":[{\"name\":\"tool\",\"path\":\"tools\"}]}",
         );
-        let bins = resolve_bins(&m);
+        let bins = resolve_bins(&m).unwrap();
         assert_eq!(bins.len(), 1);
         assert!(bins[0].is_dir);
         let sources = bin_full_sources(&m, &bins[0], &None).unwrap();

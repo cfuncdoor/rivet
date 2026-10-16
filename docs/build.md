@@ -33,7 +33,7 @@ are persisted so fresh builds never re-execute (D51).
 Non-rivet sources build through adapters — `cmake`, `meson`, `make`,
 `sources`, `pkg-config`, or `system` probes — into scratch dirs (never
 into immutable checkouts), gated by source+spec+toolchain fingerprints.
-The `sources` adapter compiles a schemaless tree's top-level C++
+The `sources` adapter compiles a schemaless tree's top-level C/C++
 sources with the rivet toolchain into a static archive (subdirectories
 are ignored; flags follow the profile like native builds, always at
 the default `c++17` — a dep needing newer features needs a real build
@@ -80,7 +80,7 @@ in the fingerprint.
 
 ## Troubleshooting
 
-- `no C++ toolchain found`: install VS Build Tools / `build-essential`
+- `no C/C++ toolchain found`: install VS Build Tools / `build-essential`
   / `clang`; `rivet toolchains -v` shows every candidate tried.
 - `RIVET_CXX=…: not a file…`: fix the path/name or unset it.
 - Link errors after switching toolchains/flags: fingerprints normally

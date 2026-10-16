@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://raw.githubusercontent.com/cfuncdoor/rivet/main/rivet.schema.json",
   "title": "rivet.json manifest",
-  "description": "Cargo-like manifest for C++ packages",
+  "description": "Cargo-like manifest for C/C++ packages",
   "type": "object",
   "required": ["package"],
   "properties": {
@@ -23,7 +23,7 @@
         },
         "standard": {
           "type": "string",
-          "enum": ["c++11", "c++14", "c++17", "c++20", "c++23", "c++26"]
+          "enum": ["c++11", "c++14", "c++17", "c++20", "c++23", "c++26", "c11", "c17", "c23"]
         }
       },
       "additionalProperties": true

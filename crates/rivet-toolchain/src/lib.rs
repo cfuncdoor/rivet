@@ -1,4 +1,4 @@
-//! C++ toolchain detection and flag normalization.
+//! C/C++ toolchain detection and flag normalization.
 //!
 //! Detects MSVC (via `vswhere` / well-known VS install paths / `vcvars`
 //! environment capture), `clang-cl`, `clang`, `gcc`, and MinGW. All compiler
@@ -27,8 +27,8 @@ pub use target::{select_for_target, TargetSelection, TargetTriple};
 /// Toolchain errors. Always actionable: what was tried + how to fix.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// No usable C++ compiler found.
-    #[error("no C++ toolchain found.\nTried:\n{tried}\nFix: install one of:\n  - Windows: Visual Studio Build Tools (https://visualstudio.microsoft.com/downloads, check \"Desktop development with C++\"), or `winget install LLVM.LLVM`\n  - Linux: `sudo apt install build-essential clang` (or `dnf groupinstall \"Development Tools\"`)")]
+    /// No usable C/C++ compiler found.
+    #[error("no C/C++ toolchain found.\nTried:\n{tried}\nFix: install one of:\n  - Windows: Visual Studio Build Tools (https://visualstudio.microsoft.com/downloads, check \"Desktop development with C++\"), or `winget install LLVM.LLVM`\n  - Linux: `sudo apt install build-essential clang` (or `dnf groupinstall \"Development Tools\"`)")]
     NoToolchain {
         /// Human-readable list of candidates tried.
         tried: String,
@@ -121,12 +121,12 @@ impl std::fmt::Display for ToolchainKind {
     }
 }
 
-/// A detected C++ toolchain.
+/// A detected C/C++ toolchain.
 #[derive(Debug, Clone)]
 pub struct CxxToolchain {
     /// Compiler family.
     pub kind: ToolchainKind,
-    /// Path to the C++ driver (`cl.exe`, `clang++`, `g++`).
+    /// Path to the compiler driver (`cl.exe`, `clang++`, `g++`).
     pub cxx: PathBuf,
     /// Detected version string (first line of `--version` / `cl` banner).
     pub version: String,
@@ -165,6 +165,37 @@ pub struct DllOutputs<'a> {
     pub implib: &'a Path,
     /// Export definitions (`.def`), or `None` for default exports.
     pub def: Option<&'a Path>,
+}
+
+/// `true` for C translation units (lowercase `.c`; capital `C` is C++).
+fn is_c_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|x| x.to_str())
+        .is_some_and(|x| matches!(x, "c"))
+}
+
+/// Standard flag for one TU: a C++ standard compiles `.c` files as the
+/// matching C standard (and vice versa). `*latest` stays the compiler
+/// default in the other language (no flag — neither spelling parses in
+/// both modes). Unknown spellings pass through verbatim so the driver
+/// reports them.
+fn std_for_source(std: &str, is_c: bool) -> Option<String> {
+    if is_c {
+        match std {
+            "c++11" | "c++14" | "c11" => Some("c11".to_string()),
+            "c++17" | "c++20" | "c17" => Some("c17".to_string()),
+            "c++23" | "c++26" | "c23" => Some("c23".to_string()),
+            "c++latest" => None,
+            _ => Some(std.to_string()),
+        }
+    } else {
+        match std {
+            "c11" => Some("c++11".to_string()),
+            "c17" => Some("c++17".to_string()),
+            "c23" => Some("c++23".to_string()),
+            _ => Some(std.to_string()),
+        }
+    }
 }
 
 impl CxxToolchain {
@@ -390,20 +421,24 @@ impl CxxToolchain {
     }
 
     /// Shared flag core for a compile-only step (no dep tracking, no env).
-    ///
-    /// LTO/sanitizer mapping: MSVC-like `/GL` + GNU/Clang
-    /// `-flto`; sanitizers as `/fsanitize=<csv>` (MSVC-like, validated to
-    /// `address`-only by [`CxxToolchain::validate_options`]) or
-    /// `-fsanitize=<csv>` (GNU/Clang). `clang-cl` follows the MSVC mapping.
+    /// Flags follow the TU language: C sources skip `/EHsc` and use the
+    /// matching C standard (MSVC-like and GNU/Clang alike).
     /// `standard = "c++latest"` (newest the toolchain knows) maps to
     /// `/std:c++latest` MSVC-like and `-std=c++2b` on GNU/Clang (which
     /// have no `c++latest` spelling); every other standard passes through
-    /// verbatim, so naming one your compiler predates fails at the driver.
-    fn push_common_args(&self, args: &mut Vec<OsString>, opts: &CompileOptions) {
+    /// [`std_for_source`], so naming one your compiler predates fails at
+    /// the driver.
+    fn push_common_args(&self, source: &Path, args: &mut Vec<OsString>, opts: &CompileOptions) {
+        let is_c = is_c_source(source);
+        let std = std_for_source(&opts.std, is_c);
         if self.is_msvc_like() {
             args.push(OsString::from("/nologo"));
-            args.push(OsString::from("/EHsc"));
-            args.push(OsString::from(format!("/std:{}", opts.std)));
+            if !is_c {
+                args.push(OsString::from("/EHsc"));
+            }
+            if let Some(std) = std {
+                args.push(OsString::from(format!("/std:{std}")));
+            }
             match opts.opt {
                 0 => args.push(OsString::from("/Od")),
                 1 => args.push(OsString::from("/O1")),
@@ -430,12 +465,14 @@ impl CxxToolchain {
                 args.push(s);
             }
         } else {
-            let std = if opts.std == "c++latest" {
-                "c++2b".to_string()
-            } else {
-                opts.std.clone()
-            };
-            args.push(OsString::from(format!("-std={std}")));
+            // `c++latest` has no GNU spelling: newest `-std=` the driver
+            // knows. `None` (C TU under `c++latest`) keeps the default.
+            let std = std
+                .as_deref()
+                .map(|s| if s == "c++latest" { "c++2b" } else { s });
+            if let Some(std) = std {
+                args.push(OsString::from(format!("-std={std}")));
+            }
             args.push(OsString::from(format!("-O{}", opts.opt.min(3))));
             if opts.pic {
                 args.push(OsString::from("-fPIC"));
@@ -471,7 +508,7 @@ impl CxxToolchain {
         opts: &CompileOptions,
     ) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
-        self.push_common_args(&mut args, opts);
+        self.push_common_args(source, &mut args, opts);
         if self.is_msvc_like() {
             args.push(OsString::from("/c"));
             args.push(source.as_os_str().to_os_string());
@@ -507,7 +544,7 @@ impl CxxToolchain {
     ) -> Command {
         let mut cmd = Command::new(&self.cxx);
         let mut args: Vec<OsString> = Vec::new();
-        self.push_common_args(&mut args, opts);
+        self.push_common_args(source, &mut args, opts);
         if self.is_msvc_like() {
             args.push(OsString::from("/showIncludes"));
             args.push(OsString::from("/c"));
@@ -876,7 +913,8 @@ fn msvc_lib_name(name: &str) -> String {
 /// vs `g++` directly.
 #[derive(Debug, Clone)]
 pub struct CompileOptions {
-    /// C++ standard, e.g. `c++20`.
+    /// Language standard, e.g. `c++20` or `c17`. `.c` files compile
+    /// under the matching C standard (and vice versa).
     pub std: String,
     /// Optimization level 0–3.
     pub opt: u8,
@@ -1836,6 +1874,52 @@ mod tests {
         let gcc = fake(ToolchainKind::Gcc);
         let a = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &opts);
         assert!(a.iter().any(|a| a == "-std=c++2b"), "got: {a:?}");
+    }
+
+    #[test]
+    fn std_mapping_follows_tu_language() {
+        assert_eq!(std_for_source("c++11", true), Some("c11".to_string()));
+        assert_eq!(std_for_source("c++14", true), Some("c11".to_string()));
+        assert_eq!(std_for_source("c++17", true), Some("c17".to_string()));
+        assert_eq!(std_for_source("c++20", true), Some("c17".to_string()));
+        assert_eq!(std_for_source("c++23", true), Some("c23".to_string()));
+        assert_eq!(std_for_source("c++26", true), Some("c23".to_string()));
+        assert_eq!(std_for_source("c++latest", true), None);
+        assert_eq!(std_for_source("c17", true), Some("c17".to_string()));
+        assert_eq!(std_for_source("c11", false), Some("c++11".to_string()));
+        assert_eq!(std_for_source("c17", false), Some("c++17".to_string()));
+        assert_eq!(std_for_source("c23", false), Some("c++23".to_string()));
+        assert_eq!(std_for_source("c++20", false), Some("c++20".to_string()));
+    }
+
+    #[test]
+    fn c_sources_use_c_flags() {
+        let opts = CompileOptions {
+            std: "c++17".to_string(),
+            ..Default::default()
+        };
+        let msvc = fake(ToolchainKind::Msvc);
+        let a = msvc.compile_only_args(Path::new("a.c"), Path::new("a.obj"), &opts);
+        assert!(a.iter().any(|a| a == "/std:c17"), "got: {a:?}");
+        assert!(!a.iter().any(|a| a == "/EHsc"), "got: {a:?}");
+        assert!(!a.iter().any(|a| a == "/std:c++17"), "got: {a:?}");
+        let cpp = msvc.compile_only_args(Path::new("a.cpp"), Path::new("a.obj"), &opts);
+        assert!(cpp.iter().any(|cpp| cpp == "/EHsc"), "got: {cpp:?}");
+        assert!(cpp.iter().any(|cpp| cpp == "/std:c++17"), "got: {cpp:?}");
+
+        let gcc = fake(ToolchainKind::Gcc);
+        let a = gcc.compile_only_args(Path::new("a.c"), Path::new("a.o"), &opts);
+        assert!(a.iter().any(|a| a == "-std=c17"), "got: {a:?}");
+        assert!(!a.iter().any(|a| a == "-std=c++17"), "got: {a:?}");
+        // A C standard maps back onto C++ for C++ TUs.
+        let copts = CompileOptions {
+            std: "c17".to_string(),
+            ..Default::default()
+        };
+        let a = gcc.compile_only_args(Path::new("a.cpp"), Path::new("a.o"), &copts);
+        assert!(a.iter().any(|a| a == "-std=c++17"), "got: {a:?}");
+        let a = gcc.compile_only_args(Path::new("a.c"), Path::new("a.o"), &copts);
+        assert!(a.iter().any(|a| a == "-std=c17"), "got: {a:?}");
     }
 
     #[test]

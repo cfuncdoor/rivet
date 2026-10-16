@@ -2,7 +2,7 @@
 name = "rivet"
 version = "0.1.0"
 edition = "2021"
-description = "Cargo-like build system and package manager for C++"
+description = "Cargo-like build system and package manager for C/C++"
 license = "MIT OR Apache-2.0"
 rust-version = "1.74"
 

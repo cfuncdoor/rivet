@@ -1,6 +1,6 @@
 //! `sources` adapter: compile schemaless foreign sources directly.
 //!
-//! For foreign trees with C++ sources but no build system (no
+//! For foreign trees with C/C++ sources but no build system (no
 //! `rivet.json`, no `CMakeLists.txt`/`meson.build`/`Makefile`): compiles
 //! the **top-level** sources with the rivet toolchain into one static
 //! archive and exposes the source root (plus `include/` when present)
@@ -8,7 +8,7 @@
 //! (e.g. imgui's `backends/`) need platform wiring the adapter cannot
 //! guess, so they are ignored by design.
 //!
-//! Only the local C++ compiler runs here; no foreign code executes at
+//! Only the local C/C++ compiler runs here; no foreign code executes at
 //! build time (same guarantee as the other source-building adapters).
 //! Rebuilds are gated by the standard adapter fingerprint (whole-tree
 //! hash + spec + toolchain), so no dep tracking is needed: any source
@@ -28,7 +28,7 @@ use super::{AdapterCtx, AdapterOutput, Error};
 /// drivers pick C vs C++ by extension as usual).
 pub const SOURCE_EXTS: &[&str] = &["cpp", "cc", "cxx", "c"];
 
-/// Sorted top-level C++ sources in `source_dir` (files only; subdirs are
+/// Sorted top-level C/C++ sources in `source_dir` (files only; subdirs are
 /// never descended). Returns an empty vec when there is nothing to build
 /// (the caller turns that into [`Error::NoLibraries`]).
 pub fn source_files(source_dir: &Path) -> Result<Vec<PathBuf>, Error> {
@@ -134,7 +134,7 @@ pub fn build(
         });
     }
     let tc = ctx.toolchain.clone().ok_or_else(|| Error::InvalidSpec {
-        message: "sources adapter needs a C++ toolchain in `AdapterCtx`. Fix: attach one with `AdapterCtx::with_toolchain`".to_string(),
+        message: "sources adapter needs a C/C++ toolchain in `AdapterCtx`. Fix: attach one with `AdapterCtx::with_toolchain`".to_string(),
     })?;
     let sources = source_files(source_dir)?;
     if sources.is_empty() {

@@ -9,7 +9,7 @@ decisions), `--message-format=json`, `--color=auto|always|never`
 | `rivet new <name> [--lib\|--shared]` / `rivet init [--name n] [--lib\|--shared]` | scaffold a binary, static lib (`src/lib.cpp` + `include/<name>.h`), or shared lib |
 | `rivet build` | compile + link the scope (incremental, parallel) |
 | `rivet run` | build if needed, run the binary (forwards trailing args) |
-| `rivet test` | build and run `tests/*.cpp` |
+| `rivet test` | build and run `tests/*.{c,cpp}` |
 | `rivet clean [-p pkg]` | remove `target/` output |
 | `rivet toolchains` | list detected toolchains, marking the default |
 | `rivet update [-p pkg] [--precise v]` | re-resolve (branches move; tags/revs pin), rewrite lockfile |

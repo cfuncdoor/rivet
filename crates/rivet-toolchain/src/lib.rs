@@ -10,7 +10,9 @@
 //! say exactly what was tried and how to fix it.
 
 use std::collections::BTreeSet;
+use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -235,6 +237,26 @@ impl CxxToolchain {
     /// `true` for `cl.exe`-style drivers (MSVC and clang-cl).
     pub fn is_msvc_like(&self) -> bool {
         matches!(self.kind, ToolchainKind::Msvc | ToolchainKind::ClangCl)
+    }
+
+    /// Default Windows library search directories for MSVC-like toolchains.
+    ///
+    /// rivet invokes the compiler driver directly (it does not source
+    /// `vcvars`), so the linker would otherwise find none of the system
+    /// libraries (`user32.lib`, `legacy_stdio_definitions.lib`, …).  These
+    /// dirs are appended as `/LIBPATH` entries so bare `-l<name>` sys_libs
+    /// (e.g. from `rivet:lib -lname` build-script directives) resolve.
+    /// Returned empty on non-Windows / non-MSVC-like toolchains.
+    pub fn windows_default_lib_dirs(&self) -> Vec<PathBuf> {
+        if !self.is_msvc_like() {
+            return Vec::new();
+        }
+        let mut dirs = Vec::new();
+        if let Some(dir) = msvc_lib_dir(&self.cxx) {
+            dirs.push(dir);
+        }
+        dirs.extend(windows_sdk_lib_dirs());
+        dirs
     }
 
     /// Executable suffix for built binaries on this host.
@@ -635,6 +657,15 @@ impl CxxToolchain {
                 lp.push(dir);
                 cmd.arg(lp);
             }
+            // Default Windows system lib dirs (MSVC lib + Windows SDK) so
+            // bare `-l<name>` sys_libs resolve without hardcoding SDK paths.
+            for dir in self.windows_default_lib_dirs() {
+                if !lib_dirs.iter().any(|d| *d == dir) {
+                    let mut lp = OsString::from("/LIBPATH:");
+                    lp.push(dir);
+                    cmd.arg(lp);
+                }
+            }
             for name in sys_libs {
                 cmd.arg(msvc_lib_name(name));
             }
@@ -754,6 +785,15 @@ impl CxxToolchain {
                 let mut lp = OsString::from("/LIBPATH:");
                 lp.push(dir);
                 cmd.arg(lp);
+            }
+            // Default Windows system lib dirs (MSVC lib + Windows SDK) so
+            // bare `-l<name>` sys_libs resolve without hardcoding SDK paths.
+            for dir in self.windows_default_lib_dirs() {
+                if !lib_dirs.iter().any(|d| *d == dir) {
+                    let mut lp = OsString::from("/LIBPATH:");
+                    lp.push(dir);
+                    cmd.arg(lp);
+                }
             }
             for name in sys_libs {
                 cmd.arg(msvc_lib_name(name));
@@ -906,6 +946,69 @@ fn msvc_lib_name(name: &str) -> String {
     } else {
         format!("{name}.lib")
     }
+}
+
+/// MSVC library directory for the compiler driver: `<vc>\Tools\MSVC\<ver>\lib\<arch>`.
+/// Derived from the `cl.exe` path (`...\bin\Host<arch>\<arch>\cl.exe`).
+fn msvc_lib_dir(cxx: &Path) -> Option<PathBuf> {
+    let arch_dir = if cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64") {
+        "x64"
+    } else {
+        "x86"
+    };
+    // cl.exe lives at <root>\bin\Host<arch>\<arch>\cl.exe; the lib dir is
+    // <root>\lib\<arch>. Walk up three levels from cl.exe to <root>.
+    let mut cur = cxx;
+    for _ in 0..3 {
+        cur = cur.parent()?;
+    }
+    let lib_dir = cur.join("lib").join(arch_dir);
+    if lib_dir.is_dir() {
+        Some(lib_dir)
+    } else {
+        None
+    }
+}
+
+/// Windows SDK library directories:
+/// `<ProgramFiles(x86)>\Windows Kits\10\lib\10.0.*\{um,ucrt}\<arch>`.
+/// Picks the highest installed `10.0.*` version. Best-effort: absent if the
+/// SDK isn't laid out this way.
+fn windows_sdk_lib_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let Ok(pfx86) = env::var("ProgramFiles(x86)") else {
+        return dirs;
+    };
+    let arch_dir = if cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64") {
+        "x64"
+    } else {
+        "x86"
+    };
+    let kits_lib = Path::new(&pfx86).join("Windows Kits").join("10").join("lib");
+    let Ok(entries) = fs::read_dir(&kits_lib) else {
+        return dirs;
+    };
+    let mut versions: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            e.file_name()
+                .to_str()
+                .and_then(|s| s.strip_prefix("10.0."))
+                .and_then(|s| s.parse::<u32>().ok().map(|v| (v, e.path())))
+        })
+        .map(|(_, p)| p)
+        .collect();
+    versions.sort();
+    if let Some(latest) = versions.last() {
+        for sub in ["um", "ucrt"] {
+            let d = latest.join(sub).join(arch_dir);
+            if d.is_dir() {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs
 }
 
 /// Normalized per-build compile options. The toolchain maps these to

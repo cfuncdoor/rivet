@@ -1222,7 +1222,7 @@ pub fn build_unit(
     // Artifact cache: on a hit, restore outputs + state and skip the build.
     if !assessment.stale_tus.is_empty() || !assessment.stale_links.is_empty() {
         if let Some(root) = &opts.cache_dir {
-            let key = cache_key_for(manifest, plan, &fingerprint, features)?;
+            let key = cache_key_for(manifest, plan, &fingerprint, features, &inputs.archives)?;
             if try_cache_restore(root, &key, plan, &mut st, &mut summary)? {
                 summary.cached = true;
                 return Ok(summary);
@@ -1553,7 +1553,7 @@ pub fn build_unit(
     // Store fresh outputs in the artifact cache. Best-effort: a store
     // failure is logged, never fatal to an otherwise good build.
     if let Some(root) = &opts.cache_dir {
-        let key = cache_key_for(manifest, plan, &fingerprint, features)?;
+        let key = cache_key_for(manifest, plan, &fingerprint, features, &inputs.archives)?;
         if let Err(e) = cache_store(root, &key, plan, &st) {
             summary
                 .log
@@ -1598,11 +1598,19 @@ struct SidecarOutput {
 
 const SIDECAR_NAME: &str = "build-state.json";
 
-/// Cache key inputs: every source file, current content. Recorded headers
-/// are NOT part of the key (they may be unknown after a `target/` wipe);
-/// instead a lookup verifies stored dep hashes against current files and
-/// treats any drift as a miss (then the normal build runs).
-fn cache_inputs_hash(plan: &PackagePlan) -> Result<String, Error> {
+/// Cache key inputs: every source file, current content, plus the current
+/// content of every dependency archive linked into this package. Recorded
+/// headers are NOT part of the key (they may be unknown after a `target/`
+/// wipe); instead a lookup verifies stored dep hashes against current files
+/// and treats any drift as a miss (then the normal build runs).
+///
+/// Dependency archives must be in the key: a dependency rebuild that changes
+/// only its archive bytes (headers unchanged) leaves this package's own
+/// sources untouched, so a key built from sources alone would match the
+/// pre-change entry and restore a binary that predates the dependency
+/// change. A missing archive hashes as missing, which never matches a
+/// stored entry, so the build relinks.
+fn cache_inputs_hash(plan: &PackagePlan, dependency_archives: &[PathBuf]) -> Result<String, Error> {
     let mut files = BTreeSet::new();
     for t in plan.bins.iter().chain(plan.lib.iter()) {
         for job in &t.jobs {
@@ -1610,7 +1618,16 @@ fn cache_inputs_hash(plan: &PackagePlan) -> Result<String, Error> {
         }
     }
     let existing: Vec<PathBuf> = files.into_iter().filter(|p| p.is_file()).collect();
-    Ok(rivet_cache::inputs_hash(&existing)?)
+    let source_hash = rivet_cache::inputs_hash(&existing)?;
+    let mut parts = vec![format!("src:{source_hash}")];
+    for archive in dependency_archives {
+        let hash = state::hash_file(archive)?;
+        match hash {
+            Some(h) => parts.push(format!("{}={h}", archive.display())),
+            None => parts.push(format!("{}=<missing>", archive.display())),
+        }
+    }
+    Ok(state::hash_bytes(parts.join("\0").as_bytes()))
 }
 
 /// Full artifact-cache key for a package build.
@@ -1619,11 +1636,12 @@ fn cache_key_for(
     plan: &PackagePlan,
     fingerprint: &str,
     features: &BTreeSet<String>,
+    dependency_archives: &[PathBuf],
 ) -> Result<String, Error> {
     let name = m::package_name(manifest).unwrap_or("<unknown>");
     let version = m::package_version(manifest).unwrap_or("0.0.0");
     let features: Vec<String> = features.iter().cloned().collect();
-    let inputs_hash = cache_inputs_hash(plan)?;
+    let inputs_hash = cache_inputs_hash(plan, dependency_archives)?;
     // Flags ride inside the fingerprint already; pass none separately.
     Ok(rivet_cache::artifact_key(
         name,

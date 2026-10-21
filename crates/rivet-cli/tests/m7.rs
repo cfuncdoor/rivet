@@ -141,6 +141,83 @@ fn artifact_cache_hit_after_wipe() {
 }
 
 #[test]
+fn dependency_rebuild_relinks_dependent() {
+    if !toolchain_available() {
+        eprintln!("SKIP: no C++ toolchain detected");
+        return;
+    }
+    let dir = TempDir::new().unwrap();
+    let home = dir.path().join("home");
+    let work = dir.path().join("work");
+    let greet = work.join("crates").join("greet");
+    let hello = work.join("crates").join("hello");
+    std::fs::create_dir_all(greet.join("src")).unwrap();
+    std::fs::create_dir_all(greet.join("include")).unwrap();
+    std::fs::create_dir_all(hello.join("src")).unwrap();
+    std::fs::write(
+        work.join("rivet.json"),
+        "{\"workspace\":{\"members\":[\"crates/*\"]}}",
+    )
+    .unwrap();
+    std::fs::write(
+        greet.join("rivet.json"),
+        "{\"package\":{\"name\":\"greet\",\"version\":\"0.1.0\"}}",
+    )
+    .unwrap();
+    // The header stays the same across the rebuild: only the archive bytes
+    // change, which is exactly what the artifact-cache key must notice.
+    std::fs::write(greet.join("include").join("greet.h"), "const char* greet();\n").unwrap();
+    std::fs::write(
+        greet.join("src").join("lib.cpp"),
+        "const char* greet() { return \"one\"; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        hello.join("rivet.json"),
+        "{\"package\":{\"name\":\"hello\",\"version\":\"0.1.0\"},\"dependencies\":{\"greet\":{\"path\":\"../greet\"}}}",
+    )
+    .unwrap();
+    std::fs::write(
+        hello.join("src").join("main.cpp"),
+        "#include <iostream>\n#include \"greet.h\"\nint main() { std::cout << greet() << '\\n'; }\n",
+    )
+    .unwrap();
+
+    rivet(&home)
+        .current_dir(&work)
+        .arg("build")
+        .assert()
+        .success();
+    rivet(&home)
+        .current_dir(&work)
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("one"));
+
+    // Change only the library implementation.
+    std::fs::write(
+        greet.join("src").join("lib.cpp"),
+        "const char* greet() { return \"two\"; }\n",
+    )
+    .unwrap();
+
+    rivet(&home)
+        .current_dir(&work)
+        .arg("build")
+        .assert()
+        .success();
+    // The dependent must be relinked: a stale binary restored from the
+    // artifact cache would still print "one".
+    rivet(&home)
+        .current_dir(&work)
+        .arg("run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("two"));
+}
+
+#[test]
 fn target_native_builds_bogus_rejected() {
     if !toolchain_available() {
         eprintln!("SKIP: no C++ toolchain detected");

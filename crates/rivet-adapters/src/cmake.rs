@@ -119,14 +119,49 @@ pub(crate) fn configure_args(
     // pin the static CRT unless the spec overrides it. Inert for
     // non-MSVC generators (needs CMake 3.15+; older ones warn that the
     // variable was not used and keep their default).
+    let mut pinned_policy = false;
     if !spec_has_option(spec, "CMAKE_MSVC_RUNTIME_LIBRARY") {
         args.push(OsString::from("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded"));
+        // `CMAKE_MSVC_RUNTIME_LIBRARY` only takes effect with CMake policy
+        // version >= 3.15. Some foreign projects (e.g. bgfx.cmake) declare
+        // `cmake_minimum_required(VERSION 3.0)`, which would otherwise leave
+        // the runtime library at the generator default (`/MD`). Pin the
+        // policy version to 3.15 so our runtime selection applies. If the
+        // user set a lower value, raise it; if they set a higher one, keep
+        // theirs.
+        let user_policy = spec
+            .options
+            .iter()
+            .find(|(k, _)| k.strip_prefix("-D").unwrap_or(k) == "CMAKE_POLICY_VERSION_MINIMUM")
+            .map(|(_, v)| parse_cmake_version(v))
+            .unwrap_or(0);
+        let policy_min = user_policy.max(315);
+        args.push(OsString::from(format!(
+            "-DCMAKE_POLICY_VERSION_MINIMUM={}.{}",
+            policy_min / 100,
+            policy_min % 100
+        )));
+        pinned_policy = true;
     }
     for (key, value) in &spec.options {
         let key = key.strip_prefix("-D").unwrap_or(key);
+        // We emitted the effective policy version above; drop the user's
+        // duplicate so only one -D reaches cmake.
+        if pinned_policy && key == "CMAKE_POLICY_VERSION_MINIMUM" {
+            continue;
+        }
         args.push(OsString::from(format!("-D{key}={value}")));
     }
     args
+}
+
+/// Parse a CMake version string (`3`, `3.5`, `3.15`) into a comparable
+/// integer (`300`, `305`, `315`). Unparseable values yield 0.
+fn parse_cmake_version(value: &str) -> u32 {
+    let mut parts = value.split('.');
+    let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    major * 100 + minor
 }
 
 /// `true` when `spec.options` sets `key`, with or without a `-D` prefix
@@ -276,6 +311,47 @@ mod tests {
                 "got: {args:?}"
             );
         }
+    }
+
+    #[test]
+    fn configure_args_policy_version_raised_for_static_crt() {
+        // CMAKE_MSVC_RUNTIME_LIBRARY only takes effect with policy version
+        // >= 3.15; a project with `cmake_minimum_required(VERSION 3.0)` would
+        // otherwise keep the generator default (/MD).
+        let ctx = AdapterCtx::new(PathBuf::from("build"));
+        let s = spec(&[], &[]);
+        let args = args_to_strings(&configure_args(Path::new("src"), &s, &ctx));
+        assert!(
+            args.iter()
+                .any(|a| a == "-DCMAKE_POLICY_VERSION_MINIMUM=3.15"),
+            "got: {args:?}"
+        );
+    }
+
+    #[test]
+    fn configure_args_low_policy_version_overridden() {
+        let ctx = AdapterCtx::new(PathBuf::from("build"));
+        let s = spec(&[], &[("CMAKE_POLICY_VERSION_MINIMUM", "3.5")]);
+        let args = args_to_strings(&configure_args(Path::new("src"), &s, &ctx));
+        let policy: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("-DCMAKE_POLICY_VERSION_MINIMUM="))
+            .collect();
+        assert_eq!(policy.len(), 1, "got: {args:?}");
+        assert_eq!(policy[0], "-DCMAKE_POLICY_VERSION_MINIMUM=3.15");
+    }
+
+    #[test]
+    fn configure_args_high_policy_version_kept() {
+        let ctx = AdapterCtx::new(PathBuf::from("build"));
+        let s = spec(&[], &[("CMAKE_POLICY_VERSION_MINIMUM", "3.20")]);
+        let args = args_to_strings(&configure_args(Path::new("src"), &s, &ctx));
+        let policy: Vec<&String> = args
+            .iter()
+            .filter(|a| a.starts_with("-DCMAKE_POLICY_VERSION_MINIMUM="))
+            .collect();
+        assert_eq!(policy.len(), 1, "got: {args:?}");
+        assert_eq!(policy[0], "-DCMAKE_POLICY_VERSION_MINIMUM=3.20");
     }
 
     #[test]
